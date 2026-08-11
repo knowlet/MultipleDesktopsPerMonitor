@@ -13,6 +13,8 @@ application tracker.
 - launches two Explorer windows using `explorer.exe`;
 - attributes each launch against a pre-launch snapshot using HWND, PID, and
   process-creation-time identity;
+- accepts only processes whose complete normalized image path is the system
+  `%WINDIR%\explorer.exe`, not an arbitrary executable with the same basename;
 - moves only one newly observed top-level Explorer view from Carrier to
   Parking;
 - observes the sibling top-level window, owned descendants, and notification
@@ -36,6 +38,14 @@ The command emits machine-readable outcomes:
 | `INCONCLUSIVE-CONTAMINATED` | An unrelated `ViewVirtualDesktopChanged` callback entered the observation window; rerun in a quiet session. |
 | `ENVIRONMENT-BLOCKED` | ImmersiveShell access was denied before any Explorer window was launched (`mutation_started = no`, exit status `77`). |
 | `SEMANTICS-FAILED` | A target move, global-current-desktop invariant, callback contract, restoration, or cleanup assertion failed. |
+
+If a launch produces multiple plausible new primary windows, or otherwise
+cannot be uniquely attributed, the command reports
+`cleanup_scope = incomplete` and `unattributed_new_windows = N`. Those HWNDs
+are intentionally retained because ownership cannot be proven; the probe never
+closes ambiguous windows merely to make cleanup appear complete. A future
+Phase 4B-1.1 can strengthen attribution with folder identity via
+`IShellWindows`/Explorer location data.
 
 Owned Explorer windows are observation-only when they do not expose an
 independent `IApplicationView`; their HWND desktop state is still recorded to
