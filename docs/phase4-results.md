@@ -25,7 +25,7 @@ semantics failure. The owned popup is observation-only: it is not required to
 expose an independent `IApplicationView`; owner/group restoration is verified
 from its HWND-level desktop state.
 
-## Host result
+## Headless host result
 
 Build validation succeeded with:
 
@@ -67,6 +67,49 @@ commands on this host. Therefore this run performed no window mutation:
 This is recorded as **ENVIRONMENT-BLOCKED / SKIP**, not `GO-REAL-APPS`,
 `GO-WITH-LIMITATIONS`, or `NO-GO`. The test must be rerun in an interactive
 session with ImmersiveShell access before making a Phase 4A semantics claim.
+
+## Interactive Phase 4A rerun
+
+The same binary was then run from an elevated interactive Windows session:
+
+```powershell
+.\build\vdprobe.exe real-app-semantics-test --confirm-mutate
+```
+
+The controlled Win32 gate completed with exit status `0`:
+
+```text
+Register hr                 0x00000000 (S_OK)
+MoveViewToDesktop            Carrier -> Parking
+  HRESULT                    0x00000000 (S_OK)
+  current desktop            Carrier
+  window desktop              Parking
+  IsWindowOnCurrentVirtualDesktop false
+  ViewVirtualDesktopChanged observed
+  CurrentVirtualDesktopChanged count 0
+target moved to Parking       yes
+sibling top-level moved       no
+owned popup moved with owner  no (independent)
+callback HWND scope           probe-owned only
+Unregister hr                0x00000000 (S_OK)
+probe-owned child closed      yes
+result                        GROUPING-OBSERVED
+GO/NO-GO                      GO-WITH-LIMITATIONS
+```
+
+This is a **Phase 4A controlled Win32 result**, not a claim about the
+Phase 4B Edge/Chrome, Explorer, Terminal, Electron, or WinUI/UWP matrix.
+The result proves that a top-level ordinary Win32 view can move from Carrier
+to shared Parking while the sibling top-level window and session-global
+current desktop remain unchanged. The owned popup stayed independent in this
+run; grouped propagation remains a valid behavior to characterize for other
+application families.
+
+On this host the documented window-desktop API may report `GUID_NULL` for an
+owned popup even while `IsWindowOnCurrentVirtualDesktop` is true. The probe
+treats that as an observation-only popup state, uses the current-desktop
+boolean for movement/recovery correlation, and continues to require a real
+Carrier GUID for target and sibling top-level views.
 
 The broader Phase 4B matrix (Edge/Chrome, Explorer, Terminal, Electron,
 WinUI/UWP), lifecycle tracking, focus/Z-order behavior, and crash recovery are
