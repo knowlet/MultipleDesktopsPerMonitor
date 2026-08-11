@@ -1015,10 +1015,43 @@ bool RealAppWindowIdentityUnchanged(const RealAppWindowSnapshot& baseline,
 const char* DesktopRelationText(const RealAppWindowSnapshot& before,
                                 const RealAppWindowSnapshot& after) {
     if (!before.state_ok || !after.state_ok) return "unavailable";
-    if (::IsEqualGUID(before.desktop.desktop, after.desktop.desktop)) {
+    const bool guid_equal =
+        ::IsEqualGUID(before.desktop.desktop, after.desktop.desktop) != FALSE;
+    const bool current_equal = before.desktop.on_current == after.desktop.on_current;
+    static const GUID kZeroGuid{};
+    if (guid_equal && current_equal) {
         return "unchanged";
     }
+    if (::IsEqualGUID(before.desktop.desktop, kZeroGuid) &&
+        ::IsEqualGUID(after.desktop.desktop, kZeroGuid)) {
+        return "CHANGED (GUID_NULL; current status changed)";
+    }
     return "CHANGED";
+}
+
+bool IsWindowDesktopAssignmentChanged(const RealAppWindowSnapshot& before,
+                                      const RealAppWindowSnapshot& after) {
+    if (!before.state_ok || !after.state_ok) return false;
+    return ::IsEqualGUID(before.desktop.desktop, after.desktop.desktop) == FALSE ||
+           before.desktop.on_current != after.desktop.on_current;
+}
+
+bool IsWindowStateOnCarrier(const RealAppWindowInfo& info,
+                            const WindowDesktopState& state, bool state_ok,
+                            const GUID& carrier) {
+    if (!state_ok || !state.on_current) return false;
+    if (info.owner != nullptr) {
+        static const GUID kZeroGuid{};
+        return ::IsEqualGUID(state.desktop, carrier) ||
+               ::IsEqualGUID(state.desktop, kZeroGuid);
+    }
+    return ::IsEqualGUID(state.desktop, carrier) != FALSE;
+}
+
+bool IsRealAppWindowOnCarrier(const RealAppWindowSnapshot& snapshot,
+                              const GUID& carrier) {
+    return IsWindowStateOnCarrier(snapshot.info, snapshot.desktop,
+                                  snapshot.state_ok, carrier);
 }
 
 
@@ -3309,7 +3342,7 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
     if (baseline.size() != windows.size()) rc = 1;
     if (rc == 0) {
         for (const RealAppWindowSnapshot& snapshot : baseline) {
-            if (!::IsEqualGUID(snapshot.desktop.desktop, carrier.id)) {
+            if (!IsRealAppWindowOnCarrier(snapshot, carrier.id)) {
                 Field("initial native state", "FAIL (not all on Carrier)");
                 rc = 1;
                 break;
@@ -3386,9 +3419,7 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                 for (size_t i = 0; i < baseline.size() && i < current.size();
                      ++i) {
                     const bool moved =
-                        baseline[i].state_ok && current[i].state_ok &&
-                        !::IsEqualGUID(baseline[i].desktop.desktop,
-                                       current[i].desktop.desktop);
+                        IsWindowDesktopAssignmentChanged(baseline[i], current[i]);
                     if (moved) {
                         moved_windows.push_back(baseline[i].info.hwnd);
                     }
@@ -3478,8 +3509,8 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                         rc = 1;
                         continue;
                     }
-                    if (::IsEqualGUID(current[i].desktop.desktop,
-                                      baseline[i].desktop.desktop)) {
+                    if (!IsWindowDesktopAssignmentChanged(baseline[i],
+                                                           current[i])) {
                         continue;
                     }
                     if (!baseline[i].view) {
@@ -3522,10 +3553,11 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                 }
                 for (const RealAppWindowSnapshot& snapshot : baseline) {
                     WindowDesktopState state;
-                    if (!ReadWindowDesktopState(documented_manager.Get(),
-                                                snapshot.info.hwnd, state) ||
-                        !::IsEqualGUID(state.desktop, carrier.id) ||
-                        !state.on_current) {
+                    const bool state_ok =
+                        ReadWindowDesktopState(documented_manager.Get(),
+                                               snapshot.info.hwnd, state);
+                    if (!IsWindowStateOnCarrier(snapshot.info, state, state_ok,
+                                                carrier.id)) {
                         restored = false;
                     }
                 }
