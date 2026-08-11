@@ -60,6 +60,7 @@ Gated feasibility tests:
 | `vdprobe carrier-parking-test --confirm-mutate` | moves one probe-owned window Carrier -> Parking -> Carrier without `SwitchDesktop` |
 | `vdprobe logical-workspace-test --confirm-mutate` | creates three probe-owned windows, performs one monitor-local logical A1 -> A2 -> A1 round-trip, and verifies that the other monitor and global current desktop are unchanged |
 | `vdprobe real-app-semantics-test --confirm-mutate` | Phase 4A: launches a probe-owned ordinary Win32 child with two top-level windows and one owned popup, then characterizes view grouping/ownership for one Carrier -> Parking move |
+| `vdprobe explorer-semantics-test --confirm-mutate` | Phase 4B-1: launches two newly attributable Explorer top-level windows, moves one view Carrier -> Parking, observes sibling/owned-window behavior, and restores only probe-created HWNDs |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -154,13 +155,19 @@ research/
 
 ## Scope
 
-The current milestone is Phase 4A's controlled Win32 process semantics gate.
-It only operates a child process and windows created by `vdprobe`, and it does
-not create or remove native desktops. On hosts where ImmersiveShell access is
-denied, the test prints `result = ENVIRONMENT-BLOCKED`, reports
-`mutation_started = no`, and exits with status `77` (inconclusive/skip); that
-is not a semantics PASS or FAIL. The broader Phase 4B application matrix
-(Edge/Chrome, Explorer, Terminal, Electron, WinUI/UWP), lifecycle tracking,
-focus/Z-order recovery, persistence, GUI, tray icon, installer, Rust port,
-stress or latency benchmarking, automatic application tracking, and any form
-of faked or emulated native desktop lifecycle remain out of scope.
+Phase 4A's controlled Win32 process semantics gate is complete with a
+`GO-WITH-LIMITATIONS` result. Phase 4B-1 adds a narrowly scoped Explorer
+semantics probe, but its interactive runtime result remains pending until it
+can run in a session with ImmersiveShell access. The Explorer probe launches
+two new windows, attributes them by HWND/PID/process-creation-time, moves only
+one top-level view, and closes only those newly observed HWNDs with `WM_CLOSE`;
+it never terminates the shared `explorer.exe` process.
+
+On hosts where ImmersiveShell access is denied, either gated test prints
+`result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with
+status `77` (inconclusive/skip); that is not a semantics PASS or FAIL. The
+broader Phase 4B application matrix (Edge/Chrome, Terminal, Electron,
+WinUI/UWP), lifecycle tracking, focus/Z-order recovery, persistence, GUI, tray
+icon, installer, Rust port, stress or latency benchmarking, automatic
+application tracking, and any form of faked or emulated native desktop
+lifecycle remain out of scope.

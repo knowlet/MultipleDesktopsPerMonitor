@@ -111,6 +111,10 @@ treats that as an observation-only popup state, uses the current-desktop
 boolean for movement/recovery correlation, and continues to require a real
 Carrier GUID for target and sibling top-level views.
 
-The broader Phase 4B matrix (Edge/Chrome, Explorer, Terminal, Electron,
-WinUI/UWP), lifecycle tracking, focus/Z-order behavior, and crash recovery are
-separate follow-up gates.
+Phase 4B-1 now has a separate controlled Explorer probe documented in
+[`docs/phase4b-results.md`](phase4b-results.md). Its implementation is
+present, but the available non-interactive run is still
+`ENVIRONMENT-BLOCKED`; no Explorer runtime PASS is claimed here. The remaining
+Phase 4B matrix (Edge/Chrome, Terminal, Electron, WinUI/UWP), lifecycle
+tracking, focus/Z-order behavior, and crash recovery are separate follow-up
+gates.
