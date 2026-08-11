@@ -64,6 +64,17 @@ int CmdCarrierParkingTest(bool confirm_mutate);
 // --confirm-mutate.
 int CmdLogicalWorkspaceTest(bool confirm_mutate);
 
+// Phase 4: launch vdprobe-owned real Win32 child applications and characterize
+// top-level/owned-window grouping when one application view is moved between
+// the existing Carrier and Parking desktops.  Requires --confirm-mutate.
+int CmdRealAppSemanticsTest(bool confirm_mutate);
+
+// Internal child-process mode used only by CmdRealAppSemanticsTest.  It creates
+// controlled ordinary Win32 windows and is not part of the public probe
+// surface.
+int CmdRealAppChild(int window_count, bool create_owned_window,
+                    bool confirm_mutate);
+
 
 class NotifySink;
 

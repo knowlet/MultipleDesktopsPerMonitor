@@ -5,7 +5,8 @@
 // notify-watch self-trigger validates the callback pipeline,
 // carrier-parking-test validates the Carrier/Parking primitive, and
 // logical-workspace-test validates one deterministic per-monitor workspace
-// round-trip.
+// round-trip.  real-app-semantics-test characterizes grouping/ownership for
+// probe-owned ordinary Win32 child applications.
 #include <windows.h>
 
 #include <cstdlib>
@@ -53,6 +54,12 @@ void Usage() {
         "                      -> A1 while a control window on monitor B is\n"
         "                      untouched; requires --confirm-mutate\n"
         "\n"
+        "phase 4 (mutating: real application semantics)\n"
+        "  real-app-semantics-test\n"
+        "                      launch vdprobe-owned ordinary Win32 child apps,\n"
+        "                      characterize top-level/owned-window grouping when\n"
+        "                      moving one view; requires --confirm-mutate\n"
+        "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
         "\n"
@@ -61,8 +68,7 @@ void Usage() {
         "  --confirm-register  unlock notify-watch's Register/Unregister calls\n"
         "  --self-trigger      notify-watch: perform one existing-desktop round-trip\n"
         "                      original -> other -> original, with required restore\n"
-        "  --confirm-mutate    unlock notify-watch's self-trigger SwitchDesktop calls\n"
-        "                      and carrier-parking-test's window moves\n"
+        "  --confirm-mutate    unlock explicitly gated desktop/window mutations\n"
         "  --seconds N         'notify-watch': how long to watch (default 20)\n"
         "  --help, -h          this text\n"
         "\n"
@@ -151,6 +157,25 @@ int main(int argc, char** argv) {
         rc = vd::CmdCarrierParkingTest(confirm_mutate);
     } else if (cmd == "logical-workspace-test") {
         rc = vd::CmdLogicalWorkspaceTest(confirm_mutate);
+    } else if (cmd == "real-app-semantics-test") {
+        rc = vd::CmdRealAppSemanticsTest(confirm_mutate);
+    } else if (cmd == "real-app-child") {
+        // Internal helper launched by real-app-semantics-test.  It is not
+        // documented as a standalone probe command.
+        int window_count = 2;
+        bool owned = true;
+        bool child_confirm_mutate = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--windows" && i + 1 < argc) {
+                window_count = std::atoi(argv[++i]);
+            } else if (a == "--no-owned") {
+                owned = false;
+            } else if (a == "--confirm-mutate") {
+                child_confirm_mutate = true;
+            }
+        }
+        rc = vd::CmdRealAppChild(window_count, owned, child_confirm_mutate);
     } else if (cmd == "matrix") {
         rc = vd::CmdMatrix();
     } else {

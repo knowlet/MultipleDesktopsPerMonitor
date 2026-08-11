@@ -759,6 +759,266 @@ struct SpawnedProbeWindow {
     HWND hwnd = nullptr;
 };
 
+// ---------------------------------------------------------------------------
+// Phase 4 controlled ordinary Win32 child application
+//
+// The first real-application semantics gate intentionally uses a process we
+// own rather than an existing user application.  It gives the probe two
+// independent top-level windows plus one owned popup, so ordinary
+// MoveViewToDesktop grouping/ownership behavior can be observed without
+// touching user state.
+
+constexpr wchar_t kRealAppChildClassName[] = L"vdprobe.RealAppChild";
+LONG g_real_app_child_window_count = 0;
+
+LRESULT CALLBACK RealAppChildWindowProc(HWND hwnd, UINT message, WPARAM wparam,
+                                        LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        ::InterlockedIncrement(&g_real_app_child_window_count);
+    } else if (message == WM_CLOSE) {
+        ::DestroyWindow(hwnd);
+        return 0;
+    } else if (message == WM_NCDESTROY) {
+        if (::InterlockedDecrement(&g_real_app_child_window_count) == 0) {
+            ::PostQuitMessage(0);
+        }
+    }
+    return ::DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool EnsureRealAppChildClass() {
+    static bool registered = false;
+    if (registered) return true;
+
+    WNDCLASSEXW klass{};
+    klass.cbSize = sizeof(klass);
+    klass.hInstance = ::GetModuleHandleW(nullptr);
+    klass.lpfnWndProc = &RealAppChildWindowProc;
+    klass.lpszClassName = kRealAppChildClassName;
+    klass.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+    klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    if (::RegisterClassExW(&klass) == 0 &&
+        ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+    registered = true;
+    return true;
+}
+
+HWND CreateRealAppChildWindow(const std::wstring& title, DWORD style,
+                              DWORD ex_style, HWND owner, int x, int y) {
+    HWND hwnd = ::CreateWindowExW(
+        ex_style, kRealAppChildClassName, title.c_str(), style, x, y, 560, 340,
+        owner, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+    if (hwnd != nullptr) {
+        ::ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ::UpdateWindow(hwnd);
+    }
+    return hwnd;
+}
+
+struct SpawnedRealApp {
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    FILETIME process_creation_time{};
+    bool process_creation_time_ok = false;
+};
+
+std::wstring CurrentExecutablePath() {
+    std::vector<wchar_t> buffer(32768);
+    DWORD length = ::GetModuleFileNameW(nullptr, buffer.data(),
+                                        static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) return {};
+    return std::wstring(buffer.data(), length);
+}
+
+bool ReadProcessCreationTime(HANDLE process, FILETIME& out) {
+    if (process == nullptr) return false;
+    FILETIME exit_time{}, kernel_time{}, user_time{};
+    return ::GetProcessTimes(process, &out, &exit_time, &kernel_time, &user_time) !=
+           FALSE;
+}
+
+bool SpawnRealAppChild(SpawnedRealApp& out) {
+    out = {};
+    const std::wstring exe = CurrentExecutablePath();
+    if (exe.empty()) return false;
+
+    std::wstring command =
+        L"\"" + exe + L"\" real-app-child --windows 2 --confirm-mutate";
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr,
+                          FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                          &pi)) {
+        return false;
+    }
+    ::CloseHandle(pi.hThread);
+
+    out.process = pi.hProcess;
+    out.pid = pi.dwProcessId;
+    out.process_creation_time_ok =
+        ReadProcessCreationTime(out.process, out.process_creation_time);
+    (void)::WaitForInputIdle(out.process, 2000);
+    return out.process_creation_time_ok;
+}
+
+struct RealAppWindowInfo {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    std::wstring title;
+    WindowIdentity identity;
+};
+
+struct RealAppEnumContext {
+    DWORD pid = 0;
+    FILETIME process_creation_time{};
+    std::vector<RealAppWindowInfo>* out = nullptr;
+};
+
+BOOL CALLBACK EnumerateRealAppWindowsProc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<RealAppEnumContext*>(lparam);
+    if (context == nullptr || context->out == nullptr || !::IsWindow(hwnd)) {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != context->pid || !::IsWindowVisible(hwnd)) return TRUE;
+
+    LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) return TRUE;
+
+    WindowIdentity identity;
+    if (!ReadWindowIdentity(hwnd, identity) ||
+        !identity.process_creation_time_ok ||
+        !SameFileTime(identity.process_creation_time,
+                       context->process_creation_time)) {
+        return TRUE;
+    }
+
+    wchar_t title[512]{};
+    int length = ::GetWindowTextW(hwnd, title, 512);
+    RealAppWindowInfo info;
+    info.hwnd = hwnd;
+    info.owner = ::GetWindow(hwnd, GW_OWNER);
+    info.title.assign(title, static_cast<size_t>(std::max(length, 0)));
+    info.identity = identity;
+    context->out->push_back(std::move(info));
+    return TRUE;
+}
+
+std::vector<RealAppWindowInfo> EnumerateRealAppWindows(
+    const SpawnedRealApp& child) {
+    std::vector<RealAppWindowInfo> out;
+    if (child.pid == 0 || !child.process_creation_time_ok) return out;
+    RealAppEnumContext context{child.pid, child.process_creation_time, &out};
+    ::EnumWindows(&EnumerateRealAppWindowsProc,
+                  reinterpret_cast<LPARAM>(&context));
+    std::sort(out.begin(), out.end(),
+              [](const RealAppWindowInfo& a, const RealAppWindowInfo& b) {
+                  return a.title < b.title;
+              });
+    return out;
+}
+
+bool WaitForRealAppWindows(const SpawnedRealApp& child,
+                           std::vector<RealAppWindowInfo>& out,
+                           DWORD timeout_ms = 5000) {
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        out = EnumerateRealAppWindows(child);
+        size_t top_level = 0;
+        size_t owned = 0;
+        for (const RealAppWindowInfo& info : out) {
+            if (info.owner == nullptr) {
+                ++top_level;
+            } else {
+                ++owned;
+            }
+        }
+        if (top_level >= 2 && owned >= 1) return true;
+        ::Sleep(25);
+    } while (::GetTickCount64() < deadline);
+    return false;
+}
+
+struct CloseRealAppEnumContext {
+    DWORD pid = 0;
+};
+
+BOOL CALLBACK CloseRealAppWindowsProc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<CloseRealAppEnumContext*>(lparam);
+    if (context == nullptr) return TRUE;
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == context->pid) (void)::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    return TRUE;
+}
+
+bool CloseRealAppChild(SpawnedRealApp& child) {
+    if (child.process == nullptr) return true;
+    CloseRealAppEnumContext context{child.pid};
+    ::EnumWindows(&CloseRealAppWindowsProc, reinterpret_cast<LPARAM>(&context));
+    DWORD wait = ::WaitForSingleObject(child.process, 2000);
+    bool closed = wait == WAIT_OBJECT_0;
+    if (!closed) {
+        // The process was created by this probe, so terminating it is a
+        // bounded cleanup fallback and cannot affect an existing user app.
+        closed = ::TerminateProcess(child.process, 1) != FALSE;
+        (void)::WaitForSingleObject(child.process, 2000);
+    }
+    ::CloseHandle(child.process);
+    child = {};
+    return closed;
+}
+
+struct RealAppWindowSnapshot {
+    RealAppWindowInfo info;
+    RawObject view;
+    RECT rect{};
+    HMONITOR monitor = nullptr;
+    WindowDesktopState desktop{};
+    bool state_ok = false;
+};
+
+bool CaptureRealAppWindowSnapshot(const RealAppWindowInfo& info,
+                                  IVirtualDesktopManager* documented_manager,
+                                  RealAppWindowSnapshot& out) {
+    out = {};
+    out.info = info;
+    out.monitor = ::MonitorFromWindow(info.hwnd, MONITOR_DEFAULTTONULL);
+    out.state_ok =
+        ReadWindowDesktopState(documented_manager, info.hwnd, out.desktop) &&
+        ::GetWindowRect(info.hwnd, &out.rect);
+    return out.state_ok && out.monitor != nullptr &&
+           ::GetWindow(info.hwnd, GW_OWNER) == info.owner;
+}
+
+bool RealAppWindowIdentityUnchanged(const RealAppWindowSnapshot& baseline,
+                                   const RealAppWindowSnapshot& current) {
+    return baseline.info.hwnd == current.info.hwnd &&
+           baseline.info.identity.pid == current.info.identity.pid &&
+           baseline.info.identity.process_creation_time_ok &&
+           current.info.identity.process_creation_time_ok &&
+           SameFileTime(baseline.info.identity.process_creation_time,
+                        current.info.identity.process_creation_time);
+}
+
+const char* DesktopRelationText(const RealAppWindowSnapshot& before,
+                                const RealAppWindowSnapshot& after) {
+    if (!before.state_ok || !after.state_ok) return "unavailable";
+    if (::IsEqualGUID(before.desktop.desktop, after.desktop.desktop)) {
+        return "unchanged";
+    }
+    return "CHANGED";
+}
+
+
 LRESULT CALLBACK ProbeWindowProc(HWND hwnd, UINT message, WPARAM wparam,
                                  LPARAM lparam) {
     if (message == WM_CLOSE) {
@@ -888,6 +1148,22 @@ bool ViewEventsOnlyExpected(const std::vector<NotifyEvent>& events,
     return true;
 }
 
+bool ViewEventsWithinScope(const std::vector<NotifyEvent>& events,
+                           ULONGLONG not_before_qpc,
+                           const std::vector<HWND>& allowed_hwnds) {
+    for (const NotifyEvent& event : events) {
+        if (event.timestamp_qpc < not_before_qpc ||
+            event.kind != NotifyEventKind::ViewVirtualDesktopChanged) {
+            continue;
+        }
+        if (std::find(allowed_hwnds.begin(), allowed_hwnds.end(), event.hwnd) ==
+            allowed_hwnds.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool HasMatchingViewCallback(const std::vector<NotifyEvent>& events,
                              ULONGLONG not_before_qpc, HWND hwnd) {
     for (const NotifyEvent& event : events) {
@@ -1007,6 +1283,7 @@ struct WindowMoveObservation {
     size_t current_changed_count = 0;
     NotifyEvent matching_view_event{};
     bool matching_view_event_ok = false;
+    bool view_callback_scope_ok = true;
     std::vector<NotifyEvent> events;
 };
 
@@ -2748,6 +3025,499 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
     } else {
         Print("  sink retained because Unregister failed; avoiding possible late-callback UAF.\n");
     }
+    return rc;
+}
+
+// ------------------------------------------------ real-app-semantics-test
+
+int CmdRealAppChild(int window_count, bool create_owned_window,
+                    bool confirm_mutate) {
+    if (!confirm_mutate) {
+        Print(
+            "real-app-child: refusing to create windows without "
+            "--confirm-mutate\n");
+        return 1;
+    }
+    if (window_count < 2) window_count = 2;
+    window_count = std::min(window_count, 3);
+    if (!EnsureRealAppChildClass()) {
+        Print("real-app-child: RegisterClassExW failed: {}\n",
+              HrToString(HRESULT_FROM_WIN32(::GetLastError())));
+        return 1;
+    }
+
+    std::vector<HWND> roots;
+    roots.reserve(static_cast<size_t>(window_count));
+    for (int i = 0; i < window_count; ++i) {
+        const std::wstring title =
+            L"vdprobe real app top-level " + std::to_wstring(i + 1);
+        HWND hwnd = CreateRealAppChildWindow(
+            title, WS_OVERLAPPEDWINDOW, WS_EX_APPWINDOW, nullptr,
+            160 + i * 70, 140 + i * 55);
+        if (hwnd == nullptr) {
+            for (HWND root : roots) {
+                if (::IsWindow(root)) ::DestroyWindow(root);
+            }
+            return 1;
+        }
+        roots.push_back(hwnd);
+    }
+
+    HWND owned = nullptr;
+    if (create_owned_window && !roots.empty()) {
+        owned = CreateRealAppChildWindow(
+            L"vdprobe real app owned popup",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU, WS_EX_TOOLWINDOW, roots.front(),
+            240, 520);
+        if (owned == nullptr) {
+            for (HWND root : roots) {
+                if (::IsWindow(root)) ::DestroyWindow(root);
+            }
+            return 1;
+        }
+    }
+
+    Print("real-app-child pid={} top_level_windows={} owned_window={}\n",
+          ::GetCurrentProcessId(), roots.size(), owned != nullptr ? "yes" : "no");
+    MSG message{};
+    while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
+        ::TranslateMessage(&message);
+        ::DispatchMessageW(&message);
+    }
+
+    if (owned != nullptr && ::IsWindow(owned)) ::DestroyWindow(owned);
+    for (HWND root : roots) {
+        if (::IsWindow(root)) ::DestroyWindow(root);
+    }
+    return 0;
+}
+
+int CmdRealAppSemanticsTest(bool confirm_mutate) {
+    Heading("real-app-semantics-test");
+    Field("what this does",
+          "moves one top-level window in a probe-owned ordinary Win32 app and "
+          "records sibling/owned-window grouping");
+    Field("scope", "ordinary Win32 child app; no existing user windows");
+    Field("native model", "one current Carrier + one shared inactive Parking");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print(
+            "\n  Refusing to launch or move a real-app child without "
+            "--confirm-mutate.\n"
+            "  Only a vdprobe-owned child process/window set is affected.\n\n"
+            "      vdprobe real-app-semantics-test --confirm-mutate\n");
+        return 1;
+    }
+
+    Com<IServiceProvider> sp;
+    HRESULT hr = GetImmersiveShell(sp);
+    if (FAILED(hr)) {
+        Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        return 1;
+    }
+
+    ManagerInternal mi = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(mi);
+    if (mi.candidate == nullptr || mi.layout == nullptr) {
+        Print("\n  real-app semantics refused: usable VDMI layout unavailable.\n");
+        return 1;
+    }
+
+    DesktopSnapshot carrier;
+    if (!ReadCurrentDesktop(mi, carrier)) {
+        Print("\n  real-app semantics refused: current Carrier unavailable.\n");
+        return 1;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    if (!ReadDesktopList(mi, desktops) || desktops.size() < 2) {
+        Print(
+            "\n  real-app semantics refused: at least two existing desktops are "
+            "required.\n  No desktop will be created.\n");
+        return 1;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.object || !parking.id_ok) {
+        Print("\n  real-app semantics refused: no existing Parking desktop found.\n");
+        return 1;
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        Print(
+            "\n  real-app semantics refused: IApplicationViewCollection "
+            "unavailable.\n");
+        return 1;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager,
+        documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("IVirtualDesktopManager", HrToString(documented_hr));
+        return 1;
+    }
+
+    SpawnedRealApp child;
+    if (!SpawnRealAppChild(child)) {
+        Print("\n  real-app semantics failed: could not launch vdprobe-owned "
+              "child.\n");
+        (void)CloseRealAppChild(child);
+        return 1;
+    }
+    Field("spawned child PID", std::format("{}", child.pid));
+    Field("spawned child creation time",
+          child.process_creation_time_ok ? "captured" : "unavailable");
+
+    int rc = 0;
+    std::vector<RealAppWindowInfo> windows;
+    if (!WaitForRealAppWindows(child, windows)) {
+        Print(
+            "\n  real-app semantics failed: child did not expose two top-level "
+            "and one owned window.\n");
+        rc = 1;
+    }
+
+    std::vector<RealAppWindowInfo> top_level;
+    std::vector<RealAppWindowInfo> owned;
+    for (const RealAppWindowInfo& info : windows) {
+        if (info.owner == nullptr) {
+            top_level.push_back(info);
+        } else {
+            owned.push_back(info);
+        }
+    }
+    if (top_level.size() < 2 || owned.empty()) {
+        Field("window shape", "FAIL");
+        rc = 1;
+    } else {
+        Field("window shape", "two top-level + one owned popup");
+    }
+
+    if (rc == 0) {
+        const MonitorRec* monitor_a = nullptr;
+        const std::vector<MonitorRec> monitors = EnumerateMonitors();
+        if (!monitors.empty()) monitor_a = &monitors.front();
+        if (monitor_a == nullptr) {
+            Print("\n  real-app semantics refused: no monitor available.\n");
+            rc = 1;
+        } else {
+            // Keep all controlled windows together on one monitor.  This is a
+            // grouping test, not the independent-monitor gate already covered
+            // by logical-workspace-test.
+            for (size_t i = 0; i < top_level.size(); ++i) {
+                (void)PlaceProbeWindowOnMonitor(
+                    top_level[i].hwnd, *monitor_a, static_cast<int>(i));
+            }
+            (void)PlaceProbeWindowOnMonitor(owned.front().hwnd, *monitor_a, 2);
+        }
+    }
+
+    std::vector<RealAppWindowSnapshot> baseline;
+    std::vector<RealAppWindowSnapshot> current;
+    baseline.reserve(windows.size());
+    current.reserve(windows.size());
+    auto acquire_view = [&](HWND hwnd, RawObject& out) -> bool {
+        const MethodEntry* method = FindMethod(*views.layout, "GetViewForHwnd");
+        if (method == nullptr) return false;
+        const ULONGLONG deadline = ::GetTickCount64() + 3000;
+        do {
+            PumpStaMessages();
+            Gate gate = Gate::Ok;
+            HRESULT view_hr =
+                InvokeSlot(views.object.Get(), *views.layout, *method, gate,
+                           false, hwnd, out.PutVoid());
+            if (gate == Gate::Ok && SUCCEEDED(view_hr) && out) return true;
+            ::Sleep(25);
+        } while (::GetTickCount64() < deadline);
+        return false;
+    };
+
+    for (const RealAppWindowInfo& info : windows) {
+        RealAppWindowSnapshot snapshot;
+        if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
+                                          snapshot) ||
+            !acquire_view(info.hwnd, snapshot.view)) {
+            Field(std::format("  view 0x{:X}", reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "FAIL");
+            rc = 1;
+            continue;
+        }
+        const MethodEntry* can_move =
+            FindMethod(*mi.layout, "CanViewMoveDesktops");
+        Gate gate = Gate::Ok;
+        BOOL can_move_value = FALSE;
+        HRESULT can_hr = E_ABORT;
+        if (can_move != nullptr) {
+            can_hr = InvokeSlot(mi.obj.Get(), *mi.layout, *can_move, gate, false,
+                                 snapshot.view.Get(), &can_move_value);
+        }
+        if (gate != Gate::Ok || FAILED(can_hr) || can_move_value == FALSE) {
+            Field(std::format("  CanViewMoveDesktops 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "FAIL");
+            rc = 1;
+        }
+        baseline.push_back(std::move(snapshot));
+    }
+
+    if (baseline.size() != windows.size()) rc = 1;
+    if (rc == 0) {
+        for (const RealAppWindowSnapshot& snapshot : baseline) {
+            if (!::IsEqualGUID(snapshot.desktop.desktop, carrier.id)) {
+                Field("initial native state", "FAIL (not all on Carrier)");
+                rc = 1;
+                break;
+            }
+        }
+    }
+
+    NotifySink* sink = new NotifySink();
+    bool release_sink = true;
+    if (rc == 0) {
+        NotificationRegistration reg(sp.Get(), sink, confirm_mutate);
+        Field("Register gate", GateText(reg.gate()));
+        Field("Register hr", HrToString(reg.hr()));
+        Field("Register cookie", std::format("{}", reg.cookie()));
+        if (!reg.ok()) {
+            Print("\n  real-app semantics refused: notification registration failed.\n");
+            rc = 1;
+        } else {
+            Field("watcher STA thread", std::format("{}", ::GetCurrentThreadId()));
+            PumpStaMessages();
+            std::vector<NotifyEvent> registration_events;
+            DrainAndPrintEvents(sink, 0, registration_events);
+
+            // Select the first independent top-level window as the target and
+            // leave the sibling top-level plus owned popup untouched by the
+            // caller.  Any movement observed on them is therefore genuine
+            // shell grouping/ownership behavior.
+            const HWND target_hwnd = top_level.front().hwnd;
+            auto target_it = std::find_if(
+                baseline.begin(), baseline.end(),
+                [target_hwnd](const RealAppWindowSnapshot& s) {
+                    return s.info.hwnd == target_hwnd;
+                });
+            if (target_it == baseline.end()) {
+                Print("\n  real-app semantics failed: target view snapshot missing.\n");
+                rc = 1;
+            } else {
+                ViewRestoreGuard restore_guard(
+                    mi, target_it->view.Get(), carrier.object.Get(),
+                    confirm_mutate);
+                restore_guard.Arm();
+                WindowMoveObservation outbound = MoveViewAndVerify(
+                    mi, target_it->view.Get(), parking.object.Get(), carrier.id,
+                    parking.id, carrier.id, target_hwnd, documented_manager.Get(),
+                    sink, confirm_mutate);
+
+                current.clear();
+                for (const RealAppWindowInfo& info : windows) {
+                    RealAppWindowSnapshot snapshot;
+                    if (!CaptureRealAppWindowSnapshot(info,
+                                                      documented_manager.Get(),
+                                                      snapshot)) {
+                        rc = 1;
+                    }
+                    current.push_back(std::move(snapshot));
+                }
+
+                size_t current_changed_count = outbound.current_changed_count;
+                std::vector<HWND> moved_windows;
+                std::vector<HWND> child_hwnds;
+                child_hwnds.reserve(windows.size());
+                for (const RealAppWindowInfo& info : windows) {
+                    child_hwnds.push_back(info.hwnd);
+                }
+                const bool callback_scope_ok =
+                    ViewEventsWithinScope(outbound.events,
+                                          outbound.call_start_qpc, child_hwnds);
+                outbound.view_callback_scope_ok = callback_scope_ok;
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    const bool moved =
+                        baseline[i].state_ok && current[i].state_ok &&
+                        !::IsEqualGUID(baseline[i].desktop.desktop,
+                                       current[i].desktop.desktop);
+                    if (moved) {
+                        moved_windows.push_back(baseline[i].info.hwnd);
+                    }
+                    const bool identity_ok =
+                        RealAppWindowIdentityUnchanged(baseline[i], current[i]);
+                    const bool owner_ok =
+                        ::GetWindow(current[i].info.hwnd, GW_OWNER) ==
+                        baseline[i].info.owner;
+                    const bool rect_ok =
+                        baseline[i].state_ok && current[i].state_ok &&
+                        SameRect(baseline[i].rect, current[i].rect);
+                    const bool monitor_ok =
+                        baseline[i].monitor == current[i].monitor;
+                    Field(std::format("  window 0x{:X} desktop",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          DesktopRelationText(baseline[i], current[i]));
+                    Field(std::format("    identity 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          identity_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    owner 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          owner_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    RECT 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          rect_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    monitor 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          monitor_ok ? "unchanged" : "CHANGED");
+                    if (!identity_ok || !owner_ok || !rect_ok || !monitor_ok) {
+                        rc = 1;
+                    }
+                }
+
+                const bool target_moved =
+                    std::find(moved_windows.begin(), moved_windows.end(),
+                              target_hwnd) != moved_windows.end();
+                const HWND sibling_hwnd = top_level.size() > 1
+                                               ? top_level[1].hwnd
+                                               : nullptr;
+                const bool sibling_moved =
+                    std::find(moved_windows.begin(), moved_windows.end(),
+                              sibling_hwnd) != moved_windows.end();
+                const HWND owned_hwnd = owned.front().hwnd;
+                const bool owned_moved =
+                    std::find(moved_windows.begin(), moved_windows.end(),
+                              owned_hwnd) != moved_windows.end();
+                const bool scope_ok = !sibling_moved;
+                Field("  target moved to Parking", target_moved ? "yes" : "NO");
+                Field("  sibling top-level moved",
+                      sibling_moved ? "yes (unexpected)" : "no");
+                Field("  owned popup moved with owner",
+                      owned_moved ? "yes (grouped)" : "no (independent)");
+                Field("  callback HWND scope",
+                      callback_scope_ok ? "probe-owned only" : "OUT OF SCOPE");
+                Field("  CurrentVirtualDesktopChanged count",
+                      std::format("{}", current_changed_count));
+                Field("  ViewVirtualDesktopChanged target",
+                      outbound.view_callback_ok ? "observed" : "missing");
+
+                const bool target_core =
+                    outbound.move_gate_ok && SUCCEEDED(outbound.move_hr) &&
+                    outbound.observed_current_ok &&
+                    ::IsEqualGUID(outbound.observed_current, carrier.id) &&
+                    outbound.observed_window_ok &&
+                    ::IsEqualGUID(outbound.observed_window.desktop, parking.id) &&
+                    !outbound.observed_window.on_current;
+                const bool target_callback = outbound.view_callback_ok;
+                const bool grouping_pass = target_core && target_callback &&
+                                           target_moved && scope_ok &&
+                                           callback_scope_ok &&
+                                           current_changed_count == 0;
+
+                // Restore every child window whose desktop changed.  The
+                // target guard covers the normal target path; explicit
+                // per-window restoration also handles owned-popup propagation.
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    if (!baseline[i].state_ok || !current[i].state_ok ||
+                        ::IsEqualGUID(current[i].desktop.desktop,
+                                      baseline[i].desktop.desktop)) {
+                        Gate gate = Gate::Ok;
+                        HRESULT restore_hr = E_ABORT;
+                        const bool restored_window = MoveViewToDesktopAndWait(
+                            mi, baseline[i].view.Get(), carrier.object.Get(),
+                            baseline[i].info.hwnd, documented_manager.Get(),
+                            carrier.id, carrier.id, confirm_mutate, gate,
+                            restore_hr);
+                        if (!restored_window) rc = 1;
+                    }
+                }
+                PumpStaMessages();
+                std::vector<NotifyEvent> restore_events;
+                DrainAndPrintEvents(sink, 0, restore_events);
+
+                bool restored = true;
+                GUID current_desktop{};
+                if (!ReadCurrentDesktopId(mi, current_desktop) ||
+                    !::IsEqualGUID(current_desktop, carrier.id)) {
+                    restored = false;
+                }
+                for (const RealAppWindowSnapshot& snapshot : baseline) {
+                    WindowDesktopState state;
+                    if (!ReadWindowDesktopState(documented_manager.Get(),
+                                                snapshot.info.hwnd, state) ||
+                        !::IsEqualGUID(state.desktop, carrier.id) ||
+                        !state.on_current) {
+                        restored = false;
+                    }
+                }
+                if (!restored) {
+                    Print("  CRITICAL REAL-APP RESTORE FAILURE\n");
+                    rc = 1;
+                } else {
+                    restore_guard.Disarm();
+                }
+
+                Heading("semantics verdict");
+                if (grouping_pass && restored) {
+                    Field("result", "GROUPING-OBSERVED");
+                    Field("GO/NO-GO", "GO-WITH-LIMITATIONS");
+                } else {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                }
+                Field("interpretation",
+                      owned_moved
+                          ? "ordinary MoveViewToDesktop propagated to the owned "
+                            "popup; keep owner-group behavior in the Phase 4 model"
+                          : "top-level move stayed independent from the owned popup");
+                Field("total events observed",
+                      std::format("{}", sink->TotalEventCount()));
+            }
+        }
+
+        if (reg.ok()) {
+            PumpStaMessages();
+            std::vector<NotifyEvent> pre_unregister_events;
+            DrainAndPrintEvents(sink, 0, pre_unregister_events);
+            const HRESULT unregister_hr = reg.UnregisterNow();
+            Field("Unregister gate", GateText(reg.unregister_gate()));
+            Field("Unregister hr", HrToString(unregister_hr));
+            if (FAILED(unregister_hr)) {
+                rc = 1;
+                release_sink = false;
+            }
+            PumpStaMessages();
+            std::vector<NotifyEvent> post_unregister_events;
+            DrainAndPrintEvents(sink, 0, post_unregister_events);
+        }
+    }
+
+    if (release_sink) {
+        sink->Release();
+    } else {
+        Print(
+            "  sink retained because Unregister failed; avoiding possible "
+            "late-callback UAF.\n");
+    }
+    const bool child_closed = CloseRealAppChild(child);
+    Field("probe-owned child closed", child_closed ? "yes" : "NO");
+    if (!child_closed) rc = 1;
     return rc;
 }
 
