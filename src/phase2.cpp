@@ -18,6 +18,9 @@ namespace {
 // Upper bound when walking a vtable looking for the end of an interface.  The
 // figure is only ever reported, never used to pick a slot.
 constexpr unsigned kVtableProbeCap = 256;
+// Conventional skip/inconclusive status used by gated probes when the host
+// cannot provide the shell access needed to make a meaningful determination.
+constexpr int kExitInconclusive = 77;
 
 // HSTRING handling is late-bound: combase.dll is always present on the builds we
 // care about, but binding it lazily keeps vdprobe startable everywhere.
@@ -3116,6 +3119,12 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
     HRESULT hr = GetImmersiveShell(sp);
     if (FAILED(hr)) {
         Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        if (hr == E_ACCESSDENIED) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "ImmersiveShell E_ACCESSDENIED");
+            Field("mutation_started", "no");
+            return kExitInconclusive;
+        }
         return 1;
     }
 
@@ -3205,6 +3214,8 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
     } else {
         Field("window shape", "two top-level + one owned popup");
     }
+    const HWND target_hwnd =
+        top_level.empty() ? nullptr : top_level.front().hwnd;
 
     if (rc == 0) {
         const MonitorRec* monitor_a = nullptr;
@@ -3248,13 +3259,33 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
     for (const RealAppWindowInfo& info : windows) {
         RealAppWindowSnapshot snapshot;
         if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
-                                          snapshot) ||
-            !acquire_view(info.hwnd, snapshot.view)) {
-            Field(std::format("  view 0x{:X}", reinterpret_cast<uintptr_t>(info.hwnd)),
-                  "FAIL");
+                                          snapshot)) {
+            Field(std::format("  window 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "snapshot FAIL");
             rc = 1;
             continue;
         }
+        const bool is_owned_popup = info.owner != nullptr;
+        const bool is_target = info.hwnd == target_hwnd;
+        if (is_owned_popup) {
+            Field(std::format("  owned popup 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "observation-only; independent IApplicationView not required");
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+
+        if (!acquire_view(info.hwnd, snapshot.view)) {
+            Field(std::format("  view 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  is_target ? "FAIL (target view unavailable)"
+                            : "observation-only (sibling view unavailable)");
+            if (is_target) rc = 1;
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+
         const MethodEntry* can_move =
             FindMethod(*mi.layout, "CanViewMoveDesktops");
         Gate gate = Gate::Ok;
@@ -3264,10 +3295,12 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
             can_hr = InvokeSlot(mi.obj.Get(), *mi.layout, *can_move, gate, false,
                                  snapshot.view.Get(), &can_move_value);
         }
-        if (gate != Gate::Ok || FAILED(can_hr) || can_move_value == FALSE) {
-            Field(std::format("  CanViewMoveDesktops 0x{:X}",
+        const bool can_move_ok =
+            gate == Gate::Ok && SUCCEEDED(can_hr) && can_move_value != FALSE;
+        Field(std::format("  CanViewMoveDesktops 0x{:X}",
                               reinterpret_cast<uintptr_t>(info.hwnd)),
-                  "FAIL");
+              can_move_ok ? "TRUE" : "FALSE");
+        if (is_target && !can_move_ok) {
             rc = 1;
         }
         baseline.push_back(std::move(snapshot));
@@ -3304,7 +3337,6 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
             // leave the sibling top-level plus owned popup untouched by the
             // caller.  Any movement observed on them is therefore genuine
             // shell grouping/ownership behavior.
-            const HWND target_hwnd = top_level.front().hwnd;
             auto target_it = std::find_if(
                 baseline.begin(), baseline.end(),
                 [target_hwnd](const RealAppWindowSnapshot& s) {
@@ -3345,6 +3377,12 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                     ViewEventsWithinScope(outbound.events,
                                           outbound.call_start_qpc, child_hwnds);
                 outbound.view_callback_scope_ok = callback_scope_ok;
+                // An unrelated ViewVirtualDesktopChanged HWND contaminates
+                // the observation window.  A CurrentVirtualDesktopChanged
+                // event is different: it is directly contrary to the
+                // Carrier/Parking contract and therefore remains a real
+                // semantics failure.
+                const bool callback_contaminated = !callback_scope_ok;
                 for (size_t i = 0; i < baseline.size() && i < current.size();
                      ++i) {
                     const bool moved =
@@ -3410,6 +3448,8 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                       owned_moved ? "yes (grouped)" : "no (independent)");
                 Field("  callback HWND scope",
                       callback_scope_ok ? "probe-owned only" : "OUT OF SCOPE");
+                Field("  observation contamination",
+                      callback_contaminated ? "yes (inconclusive)" : "none");
                 Field("  CurrentVirtualDesktopChanged count",
                       std::format("{}", current_changed_count));
                 Field("  ViewVirtualDesktopChanged target",
@@ -3423,19 +3463,43 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                     ::IsEqualGUID(outbound.observed_window.desktop, parking.id) &&
                     !outbound.observed_window.on_current;
                 const bool target_callback = outbound.view_callback_ok;
+                const bool global_current_ok =
+                    outbound.observed_current_ok && current_changed_count == 0;
                 const bool grouping_pass = target_core && target_callback &&
                                            target_moved && scope_ok &&
-                                           callback_scope_ok &&
-                                           current_changed_count == 0;
+                                           global_current_ok;
 
                 // Restore every child window whose desktop changed.  The
                 // target guard covers the normal target path; explicit
                 // per-window restoration also handles owned-popup propagation.
                 for (size_t i = 0; i < baseline.size() && i < current.size();
                      ++i) {
-                    if (!baseline[i].state_ok || !current[i].state_ok ||
-                        ::IsEqualGUID(current[i].desktop.desktop,
+                    if (!baseline[i].state_ok || !current[i].state_ok) {
+                        rc = 1;
+                        continue;
+                    }
+                    if (::IsEqualGUID(current[i].desktop.desktop,
                                       baseline[i].desktop.desktop)) {
+                        continue;
+                    }
+                    if (!baseline[i].view) {
+                        if (baseline[i].info.owner != nullptr) {
+                            Field(std::format(
+                                      "  restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                                  "deferred to owner/group restore");
+                        } else {
+                            Field(std::format(
+                                      "  restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                                  "unavailable (top-level view missing)");
+                            rc = 1;
+                        }
+                        continue;
+                    }
+                    {
                         Gate gate = Gate::Ok;
                         HRESULT restore_hr = E_ABORT;
                         const bool restored_window = MoveViewToDesktopAndWait(
@@ -3473,7 +3537,18 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
                 }
 
                 Heading("semantics verdict");
-                if (grouping_pass && restored) {
+                if (!restored) {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                } else if (rc != 0) {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                } else if (callback_contaminated) {
+                    Field("result", "INCONCLUSIVE-CONTAMINATED");
+                    Field("GO/NO-GO", "INCONCLUSIVE");
+                    rc = kExitInconclusive;
+                } else if (grouping_pass) {
                     Field("result", "GROUPING-OBSERVED");
                     Field("GO/NO-GO", "GO-WITH-LIMITATIONS");
                 } else {

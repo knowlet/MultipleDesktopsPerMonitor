@@ -59,7 +59,7 @@ Gated feasibility tests:
 | `vdprobe notify-watch --confirm-register [--self-trigger --confirm-mutate]` | registers the notification sink; the optional one-shot self-trigger validates `CurrentVirtualDesktopChanged` against a real switch |
 | `vdprobe carrier-parking-test --confirm-mutate` | moves one probe-owned window Carrier -> Parking -> Carrier without `SwitchDesktop` |
 | `vdprobe logical-workspace-test --confirm-mutate` | creates three probe-owned windows, performs one monitor-local logical A1 -> A2 -> A1 round-trip, and verifies that the other monitor and global current desktop are unchanged |
-| `vdprobe real-app-semantics-test --confirm-mutate` | launches a probe-owned ordinary Win32 child with two top-level windows and one owned popup, then characterizes view grouping/ownership for one Carrier -> Parking move |
+| `vdprobe real-app-semantics-test --confirm-mutate` | Phase 4A: launches a probe-owned ordinary Win32 child with two top-level windows and one owned popup, then characterizes view grouping/ownership for one Carrier -> Parking move |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -154,11 +154,12 @@ research/
 
 ## Scope
 
-The current milestone is Phase 4's narrow real-application semantics gate. It
-only operates a child process and windows created by `vdprobe`, and it does not
-create or remove native desktops. On hosts where ImmersiveShell access is
-denied, the test records an environment-blocked result before launching the
-child; that is not a semantics PASS or FAIL. The broader application matrix
+The current milestone is Phase 4A's controlled Win32 process semantics gate.
+It only operates a child process and windows created by `vdprobe`, and it does
+not create or remove native desktops. On hosts where ImmersiveShell access is
+denied, the test prints `result = ENVIRONMENT-BLOCKED`, reports
+`mutation_started = no`, and exits with status `77` (inconclusive/skip); that
+is not a semantics PASS or FAIL. The broader Phase 4B application matrix
 (Edge/Chrome, Explorer, Terminal, Electron, WinUI/UWP), lifecycle tracking,
 focus/Z-order recovery, persistence, GUI, tray icon, installer, Rust port,
 stress or latency benchmarking, automatic application tracking, and any form
