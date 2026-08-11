@@ -60,6 +60,13 @@ void Usage() {
         "                      characterize top-level/owned-window grouping when\n"
         "                      moving one view; requires --confirm-mutate\n"
         "\n"
+        "phase 4B-1 (mutating: Explorer semantics)\n"
+        "  explorer-semantics-test\n"
+        "                      launch two probe-owned Explorer windows and move\n"
+        "                      one view Carrier -> Parking while observing the\n"
+        "                      sibling, owned popups, callbacks, and restore;\n"
+        "                      requires --confirm-mutate\n"
+        "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
         "\n"
@@ -159,6 +166,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdLogicalWorkspaceTest(confirm_mutate);
     } else if (cmd == "real-app-semantics-test") {
         rc = vd::CmdRealAppSemanticsTest(confirm_mutate);
+    } else if (cmd == "explorer-semantics-test") {
+        rc = vd::CmdExplorerSemanticsTest(confirm_mutate);
     } else if (cmd == "real-app-child") {
         // Internal helper launched by real-app-semantics-test.  It is not
         // documented as a standalone probe command.

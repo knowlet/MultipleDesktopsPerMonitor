@@ -2,6 +2,7 @@
 
 #include <objectarray.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -978,6 +979,257 @@ bool CloseRealAppChild(SpawnedRealApp& child) {
     ::CloseHandle(child.process);
     child = {};
     return closed;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4B-1 Explorer application probe
+//
+// Explorer is commonly hosted by the user's long-lived shell process.  The
+// probe therefore owns HWNDs, not a process: launch requests are correlated
+// against a pre-launch HWND snapshot and cleanup sends WM_CLOSE only to the
+// newly observed windows.  The shared explorer.exe process is never
+// terminated.
+
+struct ExplorerWindowInfo {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    DWORD pid = 0;
+    std::wstring title;
+    std::wstring class_name;
+    WindowIdentity identity;
+    RECT rect{};
+    HMONITOR monitor = nullptr;
+};
+
+bool IsExplorerProcess(DWORD pid) {
+    if (pid == 0) return false;
+    HANDLE process =
+        ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) return false;
+    std::vector<wchar_t> path(32768);
+    DWORD length = static_cast<DWORD>(path.size());
+    const BOOL ok =
+        ::QueryFullProcessImageNameW(process, 0, path.data(), &length);
+    ::CloseHandle(process);
+    if (!ok || length == 0) return false;
+    std::wstring full(path.data(), length);
+    const size_t slash = full.find_last_of(L"\\/");
+    const std::wstring base =
+        slash == std::wstring::npos ? full : full.substr(slash + 1);
+    return _wcsicmp(base.c_str(), L"explorer.exe") == 0;
+}
+
+bool IsExplorerPrimaryWindow(const ExplorerWindowInfo& info) {
+    return info.class_name == L"CabinetWClass" ||
+           info.class_name == L"ExploreWClass";
+}
+
+struct ExplorerEnumContext {
+    std::vector<ExplorerWindowInfo>* out = nullptr;
+    bool include_invisible = false;
+};
+
+BOOL CALLBACK EnumerateExplorerWindowsProc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<ExplorerEnumContext*>(lparam);
+    if (context == nullptr || context->out == nullptr || !::IsWindow(hwnd) ||
+        (!context->include_invisible && !::IsWindowVisible(hwnd))) {
+        return TRUE;
+    }
+    const LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) return TRUE;
+
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    if (!IsExplorerProcess(pid)) return TRUE;
+
+    WindowIdentity identity;
+    if (!ReadWindowIdentity(hwnd, identity)) return TRUE;
+
+    wchar_t title[512]{};
+    wchar_t class_name[256]{};
+    const int title_length = ::GetWindowTextW(hwnd, title, 512);
+    const int class_length = ::GetClassNameW(hwnd, class_name, 256);
+
+    ExplorerWindowInfo info;
+    info.hwnd = hwnd;
+    info.owner = ::GetWindow(hwnd, GW_OWNER);
+    info.pid = pid;
+    info.title.assign(title, static_cast<size_t>(std::max(title_length, 0)));
+    info.class_name.assign(class_name,
+                           static_cast<size_t>(std::max(class_length, 0)));
+    info.identity = identity;
+    (void)::GetWindowRect(hwnd, &info.rect);
+    info.monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    context->out->push_back(std::move(info));
+    return TRUE;
+}
+
+std::vector<ExplorerWindowInfo> EnumerateExplorerWindows(
+    bool include_invisible = false) {
+    std::vector<ExplorerWindowInfo> out;
+    ExplorerEnumContext context{&out, include_invisible};
+    ::EnumWindows(&EnumerateExplorerWindowsProc,
+                  reinterpret_cast<LPARAM>(&context));
+    std::sort(out.begin(), out.end(),
+              [](const ExplorerWindowInfo& a, const ExplorerWindowInfo& b) {
+                  return reinterpret_cast<uintptr_t>(a.hwnd) <
+                         reinterpret_cast<uintptr_t>(b.hwnd);
+              });
+    return out;
+}
+
+bool SameExplorerIdentity(const ExplorerWindowInfo& a,
+                          const ExplorerWindowInfo& b) {
+    return a.hwnd == b.hwnd && a.identity.pid == b.identity.pid &&
+           a.identity.process_creation_time_ok &&
+           b.identity.process_creation_time_ok &&
+           SameFileTime(a.identity.process_creation_time,
+                        b.identity.process_creation_time);
+}
+
+std::vector<ExplorerWindowInfo> NewExplorerWindows(
+    const std::vector<ExplorerWindowInfo>& before,
+    const std::vector<ExplorerWindowInfo>& after) {
+    std::vector<ExplorerWindowInfo> out;
+    for (const ExplorerWindowInfo& candidate : after) {
+        if (std::none_of(before.begin(), before.end(),
+                         [&](const ExplorerWindowInfo& old) {
+                             return SameExplorerIdentity(old, candidate);
+                         })) {
+            out.push_back(candidate);
+        }
+    }
+    return out;
+}
+
+bool LaunchExplorerWindow(const std::wstring& path) {
+    std::wstring parameters = L"/n,\"" + path + L"\"";
+    SHELLEXECUTEINFOW execute{};
+    execute.cbSize = sizeof(execute);
+    execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    execute.lpVerb = L"open";
+    execute.lpFile = L"explorer.exe";
+    execute.lpParameters = parameters.c_str();
+    execute.nShow = SW_SHOWNOACTIVATE;
+    if (!::ShellExecuteExW(&execute)) {
+        Print("  ShellExecuteExW(explorer) failed: {}\n",
+              HrToString(HRESULT_FROM_WIN32(::GetLastError())));
+        return false;
+    }
+    if (execute.hProcess != nullptr) {
+        (void)::WaitForInputIdle(execute.hProcess, 1500);
+        ::CloseHandle(execute.hProcess);
+    }
+    return true;
+}
+
+bool WaitForNewExplorerPrimary(
+    const std::vector<ExplorerWindowInfo>& before,
+    std::vector<ExplorerWindowInfo>& new_windows,
+    ExplorerWindowInfo& selected, bool& ambiguous,
+    DWORD timeout_ms = 5000) {
+    new_windows.clear();
+    selected = {};
+    ambiguous = false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        const std::vector<ExplorerWindowInfo> current =
+            EnumerateExplorerWindows();
+        new_windows = NewExplorerWindows(before, current);
+        std::vector<ExplorerWindowInfo> primary;
+        for (const ExplorerWindowInfo& info : new_windows) {
+            if (info.owner == nullptr && IsExplorerPrimaryWindow(info)) {
+                primary.push_back(info);
+            }
+        }
+        if (primary.size() == 1) {
+            selected = primary.front();
+            return true;
+        }
+        if (primary.size() > 1) {
+            ambiguous = true;
+            return false;
+        }
+        ::Sleep(50);
+    } while (::GetTickCount64() < deadline);
+    return false;
+}
+
+bool IsOwnedByOrThrough(HWND hwnd, HWND owner) {
+    HWND current = hwnd;
+    for (unsigned depth = 0; current != nullptr && depth < 8; ++depth) {
+        if (current == owner) return true;
+        current = ::GetWindow(current, GW_OWNER);
+    }
+    return false;
+}
+
+std::vector<ExplorerWindowInfo> CollectProbeExplorerWindows(
+    const std::vector<ExplorerWindowInfo>& roots) {
+    std::vector<ExplorerWindowInfo> out;
+    const std::vector<ExplorerWindowInfo> all = EnumerateExplorerWindows(true);
+    for (const ExplorerWindowInfo& info : all) {
+        if (std::any_of(roots.begin(), roots.end(),
+                        [&](const ExplorerWindowInfo& root) {
+                            return SameExplorerIdentity(root, info);
+                        })) {
+            out.push_back(info);
+            continue;
+        }
+        if (std::any_of(roots.begin(), roots.end(),
+                        [&](const ExplorerWindowInfo& root) {
+                            return info.owner != nullptr &&
+                                   IsOwnedByOrThrough(info.hwnd, root.hwnd);
+                        })) {
+            out.push_back(info);
+        }
+    }
+    return out;
+}
+
+bool CloseExplorerWindow(HWND hwnd, DWORD timeout_ms = 3000) {
+    if (hwnd == nullptr || !::IsWindow(hwnd)) return true;
+    if (!::PostMessageW(hwnd, WM_CLOSE, 0, 0)) return false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        PumpStaMessages();
+        if (!::IsWindow(hwnd)) return true;
+        ::Sleep(25);
+    } while (::GetTickCount64() < deadline);
+    return !::IsWindow(hwnd);
+}
+
+bool CloseProbeOwnedExplorerWindows(
+    const std::vector<ExplorerWindowInfo>& created_roots) {
+    bool all_closed = true;
+    const std::vector<ExplorerWindowInfo> current =
+        CollectProbeExplorerWindows(created_roots);
+    std::vector<ExplorerWindowInfo> close_order;
+    close_order.reserve(current.size());
+    for (const ExplorerWindowInfo& info : current) {
+        close_order.push_back(info);
+    }
+    std::stable_sort(close_order.begin(), close_order.end(),
+                     [](const ExplorerWindowInfo& a,
+                        const ExplorerWindowInfo& b) {
+        return (a.owner != nullptr) > (b.owner != nullptr);
+    });
+    for (const ExplorerWindowInfo& info : close_order) {
+        const std::vector<ExplorerWindowInfo> latest =
+            EnumerateExplorerWindows(true);
+        const auto current_it =
+            std::find_if(latest.begin(), latest.end(),
+                         [&](const ExplorerWindowInfo& candidate) {
+                             return SameExplorerIdentity(candidate, info);
+                         });
+        if (current_it == latest.end()) continue;
+        if (!CloseExplorerWindow(info.hwnd)) {
+            Print("  cleanup Explorer HWND 0x{:X}: FAILED (window retained)\n",
+                  reinterpret_cast<uintptr_t>(info.hwnd));
+            all_closed = false;
+        }
+    }
+    return all_closed;
 }
 
 struct RealAppWindowSnapshot {
@@ -3625,6 +3877,531 @@ int CmdRealAppSemanticsTest(bool confirm_mutate) {
     const bool child_closed = CloseRealAppChild(child);
     Field("probe-owned child closed", child_closed ? "yes" : "NO");
     if (!child_closed) rc = 1;
+    return rc;
+}
+
+// ------------------------------------------------ explorer-semantics-test
+
+int CmdExplorerSemanticsTest(bool confirm_mutate) {
+    Heading("explorer-semantics-test");
+    Field("what this does",
+          "launches two newly observed Explorer windows and moves one "
+          "top-level view Carrier -> Parking");
+    Field("scope",
+          "only HWNDs created by this probe; shared explorer.exe is never "
+          "terminated");
+    Field("native model", "one current Carrier + one shared inactive Parking");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print(
+            "\n  Refusing to launch Explorer windows or move a view without "
+            "--confirm-mutate.\n"
+            "  Only newly observed Explorer HWNDs are eligible for cleanup.\n\n"
+            "      vdprobe explorer-semantics-test --confirm-mutate\n");
+        return 1;
+    }
+
+    Com<IServiceProvider> sp;
+    HRESULT hr = GetImmersiveShell(sp);
+    if (FAILED(hr)) {
+        Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        if (hr == E_ACCESSDENIED) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "ImmersiveShell E_ACCESSDENIED");
+            Field("mutation_started", "no");
+            return kExitInconclusive;
+        }
+        return 1;
+    }
+
+    ManagerInternal mi = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(mi);
+    if (mi.candidate == nullptr || mi.layout == nullptr) {
+        Print("\n  Explorer semantics refused: usable VDMI layout unavailable.\n");
+        return 1;
+    }
+
+    DesktopSnapshot carrier;
+    if (!ReadCurrentDesktop(mi, carrier)) {
+        Print("\n  Explorer semantics refused: current Carrier unavailable.\n");
+        return 1;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    if (!ReadDesktopList(mi, desktops) || desktops.size() < 2) {
+        Print(
+            "\n  Explorer semantics refused: at least two existing desktops "
+            "are required.\n  No desktop will be created.\n");
+        return 1;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.object || !parking.id_ok) {
+        Print("\n  Explorer semantics refused: no existing Parking desktop found.\n");
+        return 1;
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        Print(
+            "\n  Explorer semantics refused: IApplicationViewCollection "
+            "unavailable.\n");
+        return 1;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager,
+        documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("IVirtualDesktopManager", HrToString(documented_hr));
+        return 1;
+    }
+
+    const std::vector<MonitorRec> monitors = EnumerateMonitors();
+    if (monitors.empty()) {
+        Print("\n  Explorer semantics refused: no monitor available.\n");
+        return 1;
+    }
+    const MonitorRec& monitor_a = monitors.front();
+
+    std::vector<ExplorerWindowInfo> created_roots;
+    auto cleanup = [&]() {
+        const bool closed = CloseProbeOwnedExplorerWindows(created_roots);
+        Field("probe-owned Explorer cleanup", closed ? "passed" : "FAILED");
+        return closed;
+    };
+
+    const std::vector<std::wstring> explorer_paths = {
+        WindowsPath(L""), WindowsPath(L"System32")};
+    for (const std::wstring& path : explorer_paths) {
+        const std::vector<ExplorerWindowInfo> before =
+            EnumerateExplorerWindows(true);
+        Field("Explorer launch path", ToUtf8(path));
+        if (!LaunchExplorerWindow(path)) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "Explorer launch request failed");
+            Field("mutation_started", created_roots.empty() ? "no" : "yes");
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+
+        std::vector<ExplorerWindowInfo> new_windows;
+        ExplorerWindowInfo selected;
+        bool ambiguous = false;
+        if (!WaitForNewExplorerPrimary(before, new_windows, selected,
+                                       ambiguous)) {
+            Field("Explorer HWND discovery",
+                  ambiguous ? "ambiguous" : "no new primary window");
+            Field("result", "INCONCLUSIVE-ENVIRONMENT");
+            Field("reason",
+                  ambiguous
+                      ? "multiple new Explorer primary HWNDs appeared for one "
+                        "launch request"
+                      : "Explorer reused/redirected the launch request without "
+                        "one attributable new primary HWND");
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+        created_roots.push_back(selected);
+        Field("created Explorer HWND",
+              std::format("0x{:X}", reinterpret_cast<uintptr_t>(selected.hwnd)));
+        Field("created Explorer PID", std::format("{}", selected.pid));
+        Field("created Explorer class", ToUtf8(selected.class_name));
+    }
+
+    if (created_roots.size() != 2) {
+        const bool closed = cleanup();
+        return closed ? kExitInconclusive : 1;
+    }
+    for (size_t i = 0; i < created_roots.size(); ++i) {
+        if (!PlaceProbeWindowOnMonitor(created_roots[i].hwnd, monitor_a,
+                                       static_cast<int>(i))) {
+            Print("\n  Explorer semantics refused: could not place probe "
+                  "windows on one monitor.\n");
+            const bool closed = cleanup();
+            return closed ? 1 : 1;
+        }
+    }
+
+    const std::vector<ExplorerWindowInfo> created_windows =
+        CollectProbeExplorerWindows(created_roots);
+    std::vector<RealAppWindowInfo> windows;
+    windows.reserve(created_windows.size());
+    for (const ExplorerWindowInfo& info : created_windows) {
+        RealAppWindowInfo converted;
+        converted.hwnd = info.hwnd;
+        converted.owner = info.owner;
+        converted.title = info.title;
+        converted.identity = info.identity;
+        windows.push_back(std::move(converted));
+    }
+    std::vector<RealAppWindowInfo> top_level;
+    std::vector<RealAppWindowInfo> owned;
+    for (const RealAppWindowInfo& info : windows) {
+        if (info.owner == nullptr) {
+            top_level.push_back(info);
+        } else {
+            owned.push_back(info);
+        }
+    }
+    Field("new Explorer top-level windows",
+          std::format("{}", top_level.size()));
+    Field("new Explorer owned windows", std::format("{}", owned.size()));
+    if (top_level.size() != 2) {
+        Field("result", "INCONCLUSIVE-ENVIRONMENT");
+        Field("reason",
+              "the two launch requests did not yield exactly two attributable "
+              "top-level Explorer HWNDs");
+        const bool closed = cleanup();
+        return closed ? kExitInconclusive : 1;
+    }
+
+    const HWND target_hwnd = created_roots.front().hwnd;
+    const HWND sibling_hwnd = created_roots.back().hwnd;
+    auto acquire_view = [&](HWND hwnd, RawObject& out) -> bool {
+        const MethodEntry* method = FindMethod(*views.layout, "GetViewForHwnd");
+        if (method == nullptr) return false;
+        const ULONGLONG deadline = ::GetTickCount64() + 4000;
+        do {
+            PumpStaMessages();
+            Gate gate = Gate::Ok;
+            HRESULT view_hr =
+                InvokeSlot(views.object.Get(), *views.layout, *method, gate,
+                           false, hwnd, out.PutVoid());
+            if (gate == Gate::Ok && SUCCEEDED(view_hr) && out) return true;
+            ::Sleep(25);
+        } while (::GetTickCount64() < deadline);
+        return false;
+    };
+
+    std::vector<RealAppWindowSnapshot> baseline;
+    baseline.reserve(windows.size());
+    int rc = 0;
+    for (const RealAppWindowInfo& info : windows) {
+        RealAppWindowSnapshot snapshot;
+        if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
+                                          snapshot)) {
+            Field(std::format("  window 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "snapshot FAIL");
+            rc = 1;
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        const bool is_owned = info.owner != nullptr;
+        const bool is_target = info.hwnd == target_hwnd;
+        if (is_owned) {
+            Field(std::format("  owned Explorer window 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "observation-only; independent IApplicationView not required");
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        if (!acquire_view(info.hwnd, snapshot.view)) {
+            Field(std::format("  Explorer view 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  is_target ? "FAIL (target view unavailable)"
+                            : "observation-only (sibling view unavailable)");
+            if (is_target) rc = 1;
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        const MethodEntry* can_move =
+            FindMethod(*mi.layout, "CanViewMoveDesktops");
+        Gate gate = Gate::Ok;
+        BOOL can_move_value = FALSE;
+        HRESULT can_hr = E_ABORT;
+        if (can_move != nullptr) {
+            can_hr = InvokeSlot(mi.obj.Get(), *mi.layout, *can_move, gate, false,
+                                 snapshot.view.Get(), &can_move_value);
+        }
+        const bool can_move_ok =
+            gate == Gate::Ok && SUCCEEDED(can_hr) && can_move_value != FALSE;
+        Field(std::format("  CanViewMoveDesktops 0x{:X}",
+                          reinterpret_cast<uintptr_t>(info.hwnd)),
+              can_move_ok ? "TRUE" : "FALSE");
+        if (is_target && !can_move_ok) rc = 1;
+        baseline.push_back(std::move(snapshot));
+    }
+
+    if (baseline.size() != windows.size()) rc = 1;
+    if (rc == 0) {
+        for (const RealAppWindowSnapshot& snapshot : baseline) {
+            if (!IsRealAppWindowOnCarrier(snapshot, carrier.id)) {
+                Field("initial native state", "FAIL (not all on Carrier)");
+                rc = 1;
+                break;
+            }
+        }
+    }
+
+    NotifySink* sink = new NotifySink();
+    bool release_sink = true;
+    {
+        NotificationRegistration reg(sp.Get(), sink, confirm_mutate);
+        Field("Register gate", GateText(reg.gate()));
+        Field("Register hr", HrToString(reg.hr()));
+        Field("Register cookie", std::format("{}", reg.cookie()));
+        if (!reg.ok()) {
+            Print("\n  Explorer semantics refused: notification registration failed.\n");
+            rc = 1;
+        } else if (rc == 0) {
+            Field("watcher STA thread",
+                  std::format("{}", ::GetCurrentThreadId()));
+            PumpStaMessages();
+            std::vector<NotifyEvent> registration_events;
+            DrainAndPrintEvents(sink, 0, registration_events);
+
+            auto target_it = std::find_if(
+                baseline.begin(), baseline.end(),
+                [target_hwnd](const RealAppWindowSnapshot& snapshot) {
+                    return snapshot.info.hwnd == target_hwnd;
+                });
+            if (target_it == baseline.end() || !target_it->view) {
+                Print("\n  Explorer semantics failed: target view snapshot missing.\n");
+                rc = 1;
+            } else {
+                ViewRestoreGuard restore_guard(
+                    mi, target_it->view.Get(), carrier.object.Get(),
+                    confirm_mutate);
+                restore_guard.Arm();
+                WindowMoveObservation outbound = MoveViewAndVerify(
+                    mi, target_it->view.Get(), parking.object.Get(), carrier.id,
+                    parking.id, carrier.id, target_hwnd, documented_manager.Get(),
+                    sink, confirm_mutate);
+
+                std::vector<RealAppWindowSnapshot> current;
+                current.reserve(windows.size());
+                for (const RealAppWindowInfo& info : windows) {
+                    RealAppWindowSnapshot snapshot;
+                    if (!CaptureRealAppWindowSnapshot(info,
+                                                      documented_manager.Get(),
+                                                      snapshot)) {
+                        rc = 1;
+                    }
+                    current.push_back(std::move(snapshot));
+                }
+
+                std::vector<HWND> allowed_hwnds;
+                for (const RealAppWindowInfo& info : windows) {
+                    allowed_hwnds.push_back(info.hwnd);
+                }
+                const bool callback_scope_ok =
+                    ViewEventsWithinScope(outbound.events,
+                                          outbound.call_start_qpc,
+                                          allowed_hwnds);
+                const bool callback_contaminated = !callback_scope_ok;
+                std::vector<HWND> moved_windows;
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    if (IsWindowDesktopAssignmentChanged(baseline[i],
+                                                          current[i])) {
+                        moved_windows.push_back(baseline[i].info.hwnd);
+                    }
+                    const bool identity_ok =
+                        RealAppWindowIdentityUnchanged(baseline[i], current[i]);
+                    const bool owner_ok =
+                        ::GetWindow(current[i].info.hwnd, GW_OWNER) ==
+                        baseline[i].info.owner;
+                    const bool rect_ok =
+                        baseline[i].state_ok && current[i].state_ok &&
+                        SameRect(baseline[i].rect, current[i].rect);
+                    const bool monitor_ok =
+                        baseline[i].monitor == current[i].monitor;
+                    Field(std::format("  window 0x{:X} desktop",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          DesktopRelationText(baseline[i], current[i]));
+                    Field(std::format("    identity 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          identity_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    owner 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          owner_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    RECT 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          rect_ok ? "unchanged" : "CHANGED");
+                    Field(std::format("    monitor 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          monitor_ok ? "unchanged" : "CHANGED");
+                    if (!identity_ok || !owner_ok || !rect_ok || !monitor_ok) {
+                        rc = 1;
+                    }
+                }
+
+                const bool target_moved =
+                    std::find(moved_windows.begin(), moved_windows.end(),
+                              target_hwnd) != moved_windows.end();
+                const bool sibling_moved =
+                    std::find(moved_windows.begin(), moved_windows.end(),
+                              sibling_hwnd) != moved_windows.end();
+                bool owned_moved = false;
+                for (const RealAppWindowInfo& info : owned) {
+                    owned_moved =
+                        owned_moved ||
+                        std::find(moved_windows.begin(), moved_windows.end(),
+                                  info.hwnd) != moved_windows.end();
+                }
+                Field("  target moved to Parking", target_moved ? "yes" : "NO");
+                Field("  sibling top-level moved",
+                      sibling_moved ? "yes (unexpected)" : "no");
+                Field("  owned popup moved with owner",
+                      owned.empty() ? "none observed"
+                                    : (owned_moved ? "yes (grouped)"
+                                                   : "no (independent)"));
+                Field("  callback HWND scope",
+                      callback_scope_ok ? "probe-owned only" : "OUT OF SCOPE");
+                Field("  observation contamination",
+                      callback_contaminated ? "yes (inconclusive)" : "none");
+                Field("  CurrentVirtualDesktopChanged count",
+                      std::format("{}", outbound.current_changed_count));
+                Field("  ViewVirtualDesktopChanged target",
+                      outbound.view_callback_ok ? "observed" : "missing");
+
+                const bool target_core =
+                    outbound.move_gate_ok && SUCCEEDED(outbound.move_hr) &&
+                    outbound.observed_current_ok &&
+                    ::IsEqualGUID(outbound.observed_current, carrier.id) &&
+                    outbound.observed_window_ok &&
+                    ::IsEqualGUID(outbound.observed_window.desktop, parking.id) &&
+                    !outbound.observed_window.on_current;
+                const bool global_current_ok =
+                    outbound.observed_current_ok &&
+                    outbound.current_changed_count == 0;
+                const bool explorer_pass =
+                    target_core && outbound.view_callback_ok && target_moved &&
+                    !sibling_moved && global_current_ok;
+
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    if (!baseline[i].state_ok || !current[i].state_ok) {
+                        rc = 1;
+                        continue;
+                    }
+                    if (!IsWindowDesktopAssignmentChanged(baseline[i],
+                                                          current[i])) {
+                        continue;
+                    }
+                    if (!baseline[i].view) {
+                        if (baseline[i].info.owner != nullptr) {
+                            Field(std::format(
+                                      "  restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                                  "deferred to owner/group restore");
+                        } else {
+                            Field(std::format(
+                                      "  restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                                  "unavailable (top-level view missing)");
+                            rc = 1;
+                        }
+                        continue;
+                    }
+                    Gate restore_gate = Gate::Ok;
+                    HRESULT restore_hr = E_ABORT;
+                    const bool restored_window = MoveViewToDesktopAndWait(
+                        mi, baseline[i].view.Get(), carrier.object.Get(),
+                        baseline[i].info.hwnd, documented_manager.Get(),
+                        carrier.id, carrier.id, confirm_mutate, restore_gate,
+                        restore_hr);
+                    Field(std::format("  restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          restored_window ? "PASS" : HrToString(restore_hr));
+                    if (!restored_window) rc = 1;
+                }
+                PumpStaMessages();
+                std::vector<NotifyEvent> restore_events;
+                DrainAndPrintEvents(sink, 0, restore_events);
+
+                bool restored = true;
+                GUID current_desktop{};
+                if (!ReadCurrentDesktopId(mi, current_desktop) ||
+                    !::IsEqualGUID(current_desktop, carrier.id)) {
+                    restored = false;
+                }
+                for (const RealAppWindowSnapshot& snapshot : baseline) {
+                    WindowDesktopState state;
+                    const bool state_ok =
+                        ReadWindowDesktopState(documented_manager.Get(),
+                                               snapshot.info.hwnd, state);
+                    if (!IsWindowStateOnCarrier(snapshot.info, state, state_ok,
+                                                carrier.id)) {
+                        restored = false;
+                    }
+                }
+                if (!restored) {
+                    Print("  CRITICAL EXPLORER RESTORE FAILURE\n");
+                    rc = 1;
+                } else {
+                    restore_guard.Disarm();
+                }
+
+                Heading("Explorer semantics verdict");
+                if (!restored || rc != 0) {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                } else if (callback_contaminated) {
+                    Field("result", "INCONCLUSIVE-CONTAMINATED");
+                    Field("GO/NO-GO", "INCONCLUSIVE");
+                    rc = kExitInconclusive;
+                } else if (explorer_pass) {
+                    Field("result", "EXPLORER-SEMANTICS-OBSERVED");
+                    Field("GO/NO-GO", "GO-WITH-LIMITATIONS");
+                } else {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                }
+                Field("total events observed",
+                      std::format("{}", sink->TotalEventCount()));
+            }
+        }
+
+        if (reg.ok()) {
+            PumpStaMessages();
+            std::vector<NotifyEvent> pre_unregister_events;
+            DrainAndPrintEvents(sink, 0, pre_unregister_events);
+            const HRESULT unregister_hr = reg.UnregisterNow();
+            Field("Unregister gate", GateText(reg.unregister_gate()));
+            Field("Unregister hr", HrToString(unregister_hr));
+            if (FAILED(unregister_hr)) {
+                rc = 1;
+                release_sink = false;
+            }
+            PumpStaMessages();
+            std::vector<NotifyEvent> post_unregister_events;
+            DrainAndPrintEvents(sink, 0, post_unregister_events);
+        }
+    }
+
+    if (release_sink) {
+        sink->Release();
+    } else {
+        Print(
+            "  sink retained because Unregister failed; avoiding possible "
+            "late-callback UAF.\n");
+    }
+    const bool explorer_closed = cleanup();
+    if (!explorer_closed) rc = 1;
     return rc;
 }
 

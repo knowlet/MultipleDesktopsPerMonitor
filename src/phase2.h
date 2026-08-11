@@ -69,6 +69,13 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate);
 // the existing Carrier and Parking desktops.  Requires --confirm-mutate.
 int CmdRealAppSemanticsTest(bool confirm_mutate);
 
+// Phase 4B-1: launch two probe-owned Explorer windows and characterize whether
+// one top-level Explorer view can move independently between Carrier/Parking.
+// Requires --confirm-mutate.  The test closes only the HWNDs it created; it
+// never terminates explorer.exe because that process may be shared with the
+// user's shell.
+int CmdExplorerSemanticsTest(bool confirm_mutate);
+
 // Internal child-process mode used only by CmdRealAppSemanticsTest.  It creates
 // controlled ordinary Win32 windows and is not part of the public probe
 // surface.
