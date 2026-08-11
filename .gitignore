@@ -1,0 +1,12 @@
+# build output
+/build/
+/out/
+
+# locally provisioned, no-admin toolchain (see README.md)
+/.toolchain/
+
+# downloaded PDBs are large and are reproducible from tools/vdsym.py fetch
+/research/symbols/
+
+__pycache__/
+*.pyc
