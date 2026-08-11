@@ -1013,10 +1013,30 @@ bool IsExplorerProcess(DWORD pid) {
     ::CloseHandle(process);
     if (!ok || length == 0) return false;
     std::wstring full(path.data(), length);
-    const size_t slash = full.find_last_of(L"\\/");
-    const std::wstring base =
-        slash == std::wstring::npos ? full : full.substr(slash + 1);
-    return _wcsicmp(base.c_str(), L"explorer.exe") == 0;
+
+    wchar_t windows_dir[MAX_PATH]{};
+    const UINT windows_dir_length =
+        ::GetWindowsDirectoryW(windows_dir, ARRAYSIZE(windows_dir));
+    if (windows_dir_length == 0 ||
+        windows_dir_length >= ARRAYSIZE(windows_dir)) {
+        return false;
+    }
+    std::wstring expected(windows_dir, windows_dir_length);
+    expected += L"\\explorer.exe";
+
+    auto normalize_path = [](std::wstring value) {
+        std::replace(value.begin(), value.end(), L'/', L'\\');
+        if (value.rfind(L"\\\\?\\", 0) == 0) {
+            value.erase(0, 4);
+        }
+        while (value.size() > 3 && value.back() == L'\\') {
+            value.pop_back();
+        }
+        return value;
+    };
+    const std::wstring normalized_full = normalize_path(std::move(full));
+    const std::wstring normalized_expected = normalize_path(std::move(expected));
+    return _wcsicmp(normalized_full.c_str(), normalized_expected.c_str()) == 0;
 }
 
 bool IsExplorerPrimaryWindow(const ExplorerWindowInfo& info) {
@@ -4010,6 +4030,18 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                         "launch request"
                       : "Explorer reused/redirected the launch request without "
                         "one attributable new primary HWND");
+            if (ambiguous || !new_windows.empty()) {
+                Field("cleanup_scope", "incomplete");
+                Field("unattributed_new_windows",
+                      std::format("{}", new_windows.size()));
+                Print(
+                    "  Newly observed Explorer HWNDs are intentionally retained "
+                    "because attribution is not proven; they will not be "
+                    "closed by this probe.\n");
+            } else {
+                Field("cleanup_scope", "attributable probe HWNDs only");
+                Field("unattributed_new_windows", "0");
+            }
             const bool closed = cleanup();
             return closed ? kExitInconclusive : 1;
         }
