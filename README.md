@@ -1,0 +1,160 @@
+# per-monitor-vd
+
+A gated feasibility probe that answers two related questions: **does current
+Windows 11 still contain a usable native per-monitor virtual desktop
+implementation, and can its ordinary desktops serve as Carrier/Parking storage
+for a logical per-monitor workspace model?**
+
+Short answer for build 10.0.26200.8875: **no — the monitor-aware interface
+revision was removed from the shipping binaries, not merely disabled.** Full
+reasoning and evidence in [`docs/findings.md`](docs/findings.md).
+
+This repository contains only the probe. It is deliberately *not* a complete
+virtual desktop manager: it has no GUI, hotkeys, persistence, automatic window
+tracking, or desktop lifecycle management.
+
+## Build
+
+Requires a C++20 compiler and CMake. A no-admin toolchain is provisioned into
+`.toolchain/` (portable CMake + winlibs MinGW-w64), which `build.ps1` uses:
+
+```powershell
+.\build.ps1              # -> build\vdprobe.exe
+.\build.ps1 -Clean
+.\build.ps1 -Msvc        # use an installed Visual Studio toolchain instead
+```
+
+The result is statically linked, so `vdprobe.exe` can be copied to another
+machine and run on its own.
+
+## Subcommands
+
+Phase 1 uses documented APIs only:
+
+| Command | What it shows |
+|---|---|
+| `vdprobe system` | exact build via `RtlGetVersion` + UBR, and shell module versions |
+| `vdprobe monitors` | `HMONITOR` enumeration with device name, bounds, work area, DPI |
+| `vdprobe windows` | top-level HWNDs, HWND→HMONITOR, desktop GUID via the documented `IVirtualDesktopManager`, and a desktop-GUID × monitor cross-tab |
+
+Phase 2 probes the private ImmersiveShell COM surface:
+
+| Command | What it shows |
+|---|---|
+| `vdprobe private-status` | which private interfaces and which per-build IIDs this machine accepts (QueryService/QueryInterface only — no method is called) |
+| `vdprobe desktops` | enumerates virtual desktops with GUID and name |
+| `vdprobe current-desktop` | identifies the current desktop and cross-checks it against the documented API |
+| `vdprobe per-monitor-status` | whether any monitor-aware desktop API still exists, including a raw scan of the shipped binaries for the removed IIDs |
+
+Plus one documentation helper:
+
+| Command | What it shows |
+|---|---|
+| `vdprobe matrix` | emits the vtable layout registry as markdown (this is how `docs/interface-matrix.md` is produced) |
+
+Gated feasibility tests:
+
+| Command | What it shows |
+|---|---|
+| `vdprobe notify-watch --confirm-register [--self-trigger --confirm-mutate]` | registers the notification sink; the optional one-shot self-trigger validates `CurrentVirtualDesktopChanged` against a real switch |
+| `vdprobe carrier-parking-test --confirm-mutate` | moves one probe-owned window Carrier -> Parking -> Carrier without `SwitchDesktop` |
+| `vdprobe logical-workspace-test --confirm-mutate` | creates three probe-owned windows, performs one monitor-local logical A1 -> A2 -> A1 round-trip, and verifies that the other monitor and global current desktop are unchanged |
+
+`--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
+the full usage text.
+
+## Safety model
+
+Undocumented COM methods are never reached by declaring a speculative C++
+interface and calling a member function. Every private call goes through
+`InvokeSlot()` in [`src/vdlayout.h`](src/vdlayout.h), which refuses unless all of
+the following hold:
+
+- the method is in the layout registry for the IID that was actually accepted;
+- the slot index is agreed (an entry whose sources disagree is stored as
+  `kUnknownSlot` and can be reported but never invoked);
+- confidence is `high` or `VERIFIED`;
+- the method is marked read-only, unless mutation is explicitly unlocked;
+- the vtable pointer is readable, and the slot holds an executable pointer inside
+  a mapped image (checked with `VirtualQuery` immediately before the call).
+
+On refusal it returns `E_ABORT` and a reason, which the subcommands print.
+`SwitchDesktop` is reachable only through the explicitly double-gated
+`notify-watch --self-trigger` path. The Carrier/Parking and logical-workspace
+tests unlock only `MoveViewToDesktop`; they never create/remove native desktops
+and never call `SwitchDesktop`.
+
+## Where the layout data comes from
+
+The registry in [`src/vdlayout.cpp`](src/vdlayout.cpp) records, per method: build
+family, IID, vtable index, signature, evidence, confidence and read-only status.
+`docs/interface-matrix.md` is generated from it, so the documentation cannot drift
+from what the binary will do.
+
+Slots marked `VERIFIED` were confirmed against the probe host's own binaries:
+
+```powershell
+# derive the PDB identity from the PE debug directory, fetch from the symbol server
+python tools\vdsym.py pdbid C:\Windows\System32\twinui.pcshell.dll
+python tools\vdsym.py fetch C:\Windows\System32\twinui.pcshell.dll
+
+# per-monitor symbol search for the running build
+python tools\vdsym.py report C:\Windows\System32\twinui.pcshell.dll <pdb>
+
+# dump a real vtable, slot -> public symbol
+python tools\vdsym.py vtable C:\Windows\System32\twinui.pcshell.dll <pdb> `
+    '\?\?_7CVirtualDesktopManager@@6B\?\$ImplementsHelper.*ChainInterfaces'
+
+# independent method count from the MIDL proxy
+python tools\vdsym.py proxyinfo C:\Windows\System32\actxprxy.dll `
+    '{53F5CA0B-158F-4124-900C-057158060B27}'
+
+# is a removed IID still in the binaries at all?
+python tools\vdsym.py findguid '{B2F925B9-5A0F-4D2E-9F4D-2B1507593C10}' `
+    C:\Windows\System32\twinui.pcshell.dll C:\Windows\explorer.exe
+```
+
+`tools/vdsym.py` implements its own PE parser and MSF/PDB reader, so no DIA SDK,
+dbghelp or Visual Studio installation is needed. `tools/extract_refs.py`
+summarises the downloaded reference implementations in `research/ref/`.
+
+## Regenerating the docs
+
+```powershell
+.\regen-docs.ps1
+```
+
+Rewrites `docs/interface-matrix.md` and `docs/test-results.md` from live runs.
+`docs/findings.md` is hand-written and is left alone.
+
+## Layout
+
+```
+CMakeLists.txt        build.ps1        regen-docs.ps1
+src/
+  main.cpp            subcommand dispatch
+  util.{h,cpp}        console, strings, GUID/HRESULT formatting, version info
+  comraw.{h,cpp}      COM pointer wrappers, pointer validation, raw slot dispatch
+  vdids.{h,cpp}       CLSIDs, service IDs, per-build IID candidate table
+  vdlayout.{h,cpp}    vtable layout registry + the invocation gate
+  phase1.{h,cpp}      system / monitors / windows
+  phase2.{h,cpp}      private COM probing
+tools/
+  vdsym.py            PE + PDB reader, vtable dumper, GUID scanner
+  extract_refs.py     per-build IID/slot extraction from reference sources
+docs/
+  findings.md         the feasibility report (hand-written)
+  interface-matrix.md generated from the layout registry
+  test-results.md     verbatim transcripts of every subcommand
+research/
+  ref/                downloaded reference implementations
+  symbols/            downloaded PDBs (not checked in)
+```
+
+## Scope
+
+The current milestone is the gated Carrier/Parking and logical-workspace
+feasibility proof. Out of scope: GUI, tray icon, installer, Rust port, desktop
+creation/removal, stress or latency benchmarking, persistence, automatic
+application tracking, and any form of faked or emulated native desktop
+lifecycle.

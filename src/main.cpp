@@ -1,0 +1,164 @@
+// vdprobe - feasibility probe for native per-monitor virtual desktops on
+// Windows 11.
+//
+// Scope discipline: the default commands observe.  The explicitly gated
+// notify-watch self-trigger validates the callback pipeline,
+// carrier-parking-test validates the Carrier/Parking primitive, and
+// logical-workspace-test validates one deterministic per-monitor workspace
+// round-trip.
+#include <windows.h>
+
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "phase1.h"
+#include "phase2.h"
+#include "util.h"
+
+namespace {
+
+void Usage() {
+    vd::Print(
+        "vdprobe - read-only probe of Windows virtual desktop interfaces\n"
+        "\n"
+        "usage: vdprobe <subcommand> [options]\n"
+        "\n"
+        "phase 1 (documented APIs only)\n"
+        "  system              exact Windows build, UBR and shell module versions\n"
+        "  monitors            HMONITOR enumeration with bounds, work area and DPI\n"
+        "  windows             top-level HWNDs, HWND->HMONITOR, desktop GUID via the\n"
+        "                      documented IVirtualDesktopManager\n"
+        "\n"
+        "phase 2 (private ImmersiveShell COM)\n"
+        "  private-status      which private interfaces and IIDs this build accepts\n"
+        "  desktops            enumerate virtual desktops\n"
+        "  current-desktop     identify the current virtual desktop\n"
+        "  per-monitor-status  whether a monitor-aware desktop API still exists\n"
+        "\n"
+        "phase 2A (mutating: registers a callback; optional one-shot validation)\n"
+        "  notify-watch        watch IVirtualDesktopNotification callbacks;\n"
+        "                      requires --confirm-register\n"
+        "\n"
+        "phase 2B (mutating: carrier/parking feasibility)\n"
+        "  carrier-parking-test\n"
+        "                      move one vdprobe-owned probe window carrier -> parking\n"
+        "                      -> carrier without SwitchDesktop; requires\n"
+        "                      --confirm-mutate\n"
+        "\n"
+        "phase 3 (mutating: logical workspace feasibility)\n"
+        "  logical-workspace-test\n"
+        "                      move one monitor's logical workspace A1 -> A2\n"
+        "                      -> A1 while a control window on monitor B is\n"
+        "                      untouched; requires --confirm-mutate\n"
+        "\n"
+        "documentation\n"
+        "  matrix              emit the vtable layout registry as markdown\n"
+        "\n"
+        "options\n"
+        "  --all               'windows': include invisible and untitled HWNDs\n"
+        "  --confirm-register  unlock notify-watch's Register/Unregister calls\n"
+        "  --self-trigger      notify-watch: perform one existing-desktop round-trip\n"
+        "                      original -> other -> original, with required restore\n"
+        "  --confirm-mutate    unlock notify-watch's self-trigger SwitchDesktop calls\n"
+        "                      and carrier-parking-test's window moves\n"
+        "  --seconds N         'notify-watch': how long to watch (default 20)\n"
+        "  --help, -h          this text\n"
+        "\n"
+        "This build never invokes a vtable slot that is not recorded with an agreed\n"
+        "index in src/vdlayout.cpp.  notify-watch --self-trigger is the only\n"
+        "command path that invokes SwitchDesktop; it requires both explicit\n"
+        "confirmation flags.  The Carrier/Parking and logical-workspace tests\n"
+        "never invoke SwitchDesktop or create/remove native desktops.\n");
+}
+
+// COM is initialised as an STA because that is what every public virtual desktop
+// implementation does, and the ImmersiveShell objects are apartment-sensitive.
+class ComScope {
+   public:
+    ComScope() { hr_ = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); }
+    ~ComScope() {
+        if (SUCCEEDED(hr_)) ::CoUninitialize();
+    }
+    HRESULT hr() const { return hr_; }
+
+   private:
+    HRESULT hr_ = E_FAIL;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    vd::InitConsole();
+
+    std::string cmd;
+    bool all = false;
+    bool confirm_register = false;
+    bool self_trigger = false;
+    bool confirm_mutate = false;
+    int seconds = 20;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--all") {
+            all = true;
+        } else if (a == "--confirm-register") {
+            confirm_register = true;
+        } else if (a == "--self-trigger") {
+            self_trigger = true;
+        } else if (a == "--confirm-mutate") {
+            confirm_mutate = true;
+        } else if (a == "--seconds" && i + 1 < argc) {
+            seconds = std::atoi(argv[++i]);
+            if (seconds <= 0) seconds = 20;
+        } else if (a == "--help" || a == "-h" || a == "/?") {
+            Usage();
+            return 0;
+        } else if (cmd.empty()) {
+            cmd = vd::ToLowerAscii(a);
+        }
+    }
+
+    if (cmd.empty()) {
+        Usage();
+        return 2;
+    }
+
+    ComScope com;
+    if (FAILED(com.hr())) {
+        vd::Print("CoInitializeEx failed: {}\n", vd::HrToString(com.hr()));
+        return 1;
+    }
+
+    int rc;
+    if (cmd == "system") {
+        rc = vd::CmdSystem();
+    } else if (cmd == "monitors") {
+        rc = vd::CmdMonitors();
+    } else if (cmd == "windows") {
+        rc = vd::CmdWindows(all);
+    } else if (cmd == "private-status") {
+        rc = vd::CmdPrivateStatus();
+    } else if (cmd == "desktops") {
+        rc = vd::CmdDesktops();
+    } else if (cmd == "current-desktop") {
+        rc = vd::CmdCurrentDesktop();
+    } else if (cmd == "per-monitor-status") {
+        rc = vd::CmdPerMonitorStatus();
+    } else if (cmd == "notify-watch") {
+        rc = vd::CmdNotifyWatch(confirm_register, self_trigger, confirm_mutate, seconds);
+    } else if (cmd == "carrier-parking-test") {
+        rc = vd::CmdCarrierParkingTest(confirm_mutate);
+    } else if (cmd == "logical-workspace-test") {
+        rc = vd::CmdLogicalWorkspaceTest(confirm_mutate);
+    } else if (cmd == "matrix") {
+        rc = vd::CmdMatrix();
+    } else {
+        vd::Print("unknown subcommand: {}\n\n", cmd);
+        Usage();
+        rc = 2;
+    }
+
+    std::fflush(stdout);
+    return rc;
+}
