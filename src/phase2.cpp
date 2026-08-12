@@ -1320,6 +1320,257 @@ bool CloseProbeOwnedExplorerWindows(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4C representative packaged/modern application probe
+//
+// Windows Terminal is a packaged application with a brokered multi-process
+// implementation.  The probe launches two uniquely titled top-level windows,
+// attributes only newly observed HWNDs carrying the probe token, and closes
+// only those HWNDs during cleanup.  It never terminates WindowsTerminal.exe or
+// touches an existing Terminal window.
+
+struct TerminalWindowInfo {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    DWORD pid = 0;
+    std::wstring title;
+    std::wstring class_name;
+    std::wstring image_path;
+    WindowIdentity identity;
+};
+
+std::wstring SystemTerminalPath() {
+    std::vector<std::wstring> candidates;
+    wchar_t search_buffer[32768]{};
+    constexpr DWORD kSearchBufferChars =
+        static_cast<DWORD>(sizeof(search_buffer) / sizeof(search_buffer[0]));
+    DWORD n = ::SearchPathW(nullptr, L"wt.exe", nullptr,
+                            kSearchBufferChars,
+                            search_buffer, nullptr);
+    if (n != 0 && n < kSearchBufferChars) {
+        candidates.emplace_back(search_buffer, n);
+    }
+    const std::wstring local_appdata = EnvironmentPath(L"LOCALAPPDATA");
+    if (!local_appdata.empty()) {
+        candidates.push_back(local_appdata +
+                             L"\\Microsoft\\WindowsApps\\wt.exe");
+        candidates.push_back(local_appdata +
+                             L"\\Microsoft\\WindowsApps\\WindowsTerminal.exe");
+    }
+    const std::wstring program_files = EnvironmentPath(L"ProgramFiles");
+    if (!program_files.empty()) {
+        candidates.push_back(program_files +
+                             L"\\WindowsApps\\WindowsTerminal.exe");
+    }
+    for (const std::wstring& candidate : candidates) {
+        const std::wstring resolved = FullExistingPath(candidate);
+        if (!resolved.empty()) return resolved;
+    }
+    return {};
+}
+
+std::wstring ProcessImagePath(DWORD pid) {
+    if (pid == 0) return {};
+    HANDLE process =
+        ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) return {};
+    std::vector<wchar_t> path(32768);
+    DWORD length = static_cast<DWORD>(path.size());
+    const BOOL ok =
+        ::QueryFullProcessImageNameW(process, 0, path.data(), &length);
+    ::CloseHandle(process);
+    if (!ok || length == 0) return {};
+    return NormalizeFilesystemPath(std::wstring(path.data(), length));
+}
+
+bool IsWindowsTerminalImagePath(const std::wstring& path) {
+    if (path.empty()) return false;
+    const std::wstring normalized = NormalizeFilesystemPath(path);
+    std::wstring lower = normalized;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](wchar_t c) { return std::towlower(c); });
+    const bool package_path =
+        lower.find(L"\\microsoft.windowsterminal_") != std::wstring::npos &&
+        lower.find(L"\\windowsterminal.exe") != std::wstring::npos;
+    const bool alias_path =
+        lower.find(L"\\microsoft\\windowsapps\\wt.exe") != std::wstring::npos ||
+        lower.find(L"\\microsoft\\windowsapps\\windowsterminal.exe") !=
+            std::wstring::npos;
+    return package_path || alias_path;
+}
+
+bool IsTerminalTopLevelWindow(const TerminalWindowInfo& info,
+                              const std::wstring& token) {
+    if (info.owner != nullptr || token.empty()) return false;
+    if (info.title.find(token) == std::wstring::npos) return false;
+    return info.class_name == L"CASCADIA_HOSTING_WINDOW_CLASS" ||
+           info.class_name == L"Windows.UI.Core.CoreWindow";
+}
+
+struct TerminalEnumContext {
+    const std::wstring* token = nullptr;
+    std::vector<TerminalWindowInfo>* out = nullptr;
+    bool include_invisible = false;
+};
+
+BOOL CALLBACK EnumerateTerminalWindowsProc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<TerminalEnumContext*>(lparam);
+    if (context == nullptr || context->out == nullptr ||
+        context->token == nullptr || !::IsWindow(hwnd) ||
+        (!context->include_invisible && !::IsWindowVisible(hwnd))) {
+        return TRUE;
+    }
+    const LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) return TRUE;
+
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    const std::wstring image_path = ProcessImagePath(pid);
+    if (!IsWindowsTerminalImagePath(image_path)) return TRUE;
+
+    WindowIdentity identity;
+    if (!ReadWindowIdentity(hwnd, identity)) return TRUE;
+    wchar_t title[512]{};
+    wchar_t class_name[256]{};
+    const int title_length = ::GetWindowTextW(hwnd, title, 512);
+    const int class_length = ::GetClassNameW(hwnd, class_name, 256);
+
+    TerminalWindowInfo info;
+    info.hwnd = hwnd;
+    info.owner = ::GetWindow(hwnd, GW_OWNER);
+    info.pid = pid;
+    info.title.assign(title, static_cast<size_t>(std::max(title_length, 0)));
+    info.class_name.assign(
+        class_name, static_cast<size_t>(std::max(class_length, 0)));
+    info.image_path = image_path;
+    info.identity = identity;
+    context->out->push_back(std::move(info));
+    return TRUE;
+}
+
+std::vector<TerminalWindowInfo> EnumerateTerminalWindows(
+    const std::wstring& token, bool include_invisible = false) {
+    std::vector<TerminalWindowInfo> out;
+    TerminalEnumContext context{&token, &out, include_invisible};
+    ::EnumWindows(&EnumerateTerminalWindowsProc,
+                  reinterpret_cast<LPARAM>(&context));
+    std::sort(out.begin(), out.end(),
+              [](const TerminalWindowInfo& a, const TerminalWindowInfo& b) {
+                  return reinterpret_cast<uintptr_t>(a.hwnd) <
+                         reinterpret_cast<uintptr_t>(b.hwnd);
+              });
+    return out;
+}
+
+bool SameTerminalIdentity(const TerminalWindowInfo& a,
+                          const TerminalWindowInfo& b) {
+    return a.hwnd == b.hwnd && a.identity.pid == b.identity.pid &&
+           a.identity.process_creation_time_ok &&
+           b.identity.process_creation_time_ok &&
+           SameFileTime(a.identity.process_creation_time,
+                        b.identity.process_creation_time);
+}
+
+std::vector<TerminalWindowInfo> NewTerminalWindows(
+    const std::vector<TerminalWindowInfo>& before,
+    const std::vector<TerminalWindowInfo>& after) {
+    std::vector<TerminalWindowInfo> out;
+    for (const TerminalWindowInfo& candidate : after) {
+        if (std::none_of(before.begin(), before.end(),
+                         [&](const TerminalWindowInfo& old) {
+                             return SameTerminalIdentity(old, candidate);
+                         })) {
+            out.push_back(candidate);
+        }
+    }
+    return out;
+}
+
+bool LaunchTerminalWindow(const std::wstring& executable,
+                          const std::wstring& token) {
+    if (executable.empty() || token.empty()) return false;
+    const std::wstring command =
+        L"\"" + executable + L"\" -w new --title \"" + token +
+        L"\" cmd.exe /k \"title " + token + L"\"";
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessW(executable.c_str(), mutable_command.data(), nullptr,
+                          nullptr, FALSE, 0, nullptr, nullptr, &startup, &pi)) {
+        return false;
+    }
+    (void)::WaitForInputIdle(pi.hProcess, 5000);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return true;
+}
+
+bool WaitForNewTerminalWindow(
+    const std::vector<TerminalWindowInfo>& before, const std::wstring& token,
+    std::vector<TerminalWindowInfo>& new_windows,
+    TerminalWindowInfo& selected, bool& ambiguous, DWORD timeout_ms = 10000) {
+    new_windows.clear();
+    selected = {};
+    ambiguous = false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        const std::vector<TerminalWindowInfo> current =
+            EnumerateTerminalWindows(token);
+        new_windows = NewTerminalWindows(before, current);
+        std::vector<TerminalWindowInfo> primary;
+        for (const TerminalWindowInfo& info : new_windows) {
+            if (IsTerminalTopLevelWindow(info, token)) primary.push_back(info);
+        }
+        if (primary.size() == 1) {
+            selected = primary.front();
+            return true;
+        }
+        if (primary.size() > 1) {
+            ambiguous = true;
+            return false;
+        }
+        ::Sleep(100);
+    } while (::GetTickCount64() < deadline);
+    return false;
+}
+
+bool CloseTerminalWindow(HWND hwnd, DWORD timeout_ms = 5000) {
+    if (hwnd == nullptr || !::IsWindow(hwnd)) return true;
+    if (!::PostMessageW(hwnd, WM_CLOSE, 0, 0)) return false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        PumpStaMessages();
+        if (!::IsWindow(hwnd)) return true;
+        ::Sleep(50);
+    } while (::GetTickCount64() < deadline);
+    return !::IsWindow(hwnd);
+}
+
+bool CloseProbeOwnedTerminalWindows(
+    const std::vector<TerminalWindowInfo>& roots,
+    const std::wstring& token) {
+    bool all_closed = true;
+    const std::vector<TerminalWindowInfo> current =
+        EnumerateTerminalWindows(token, true);
+    for (const TerminalWindowInfo& root : roots) {
+        const auto it =
+            std::find_if(current.begin(), current.end(),
+                         [&](const TerminalWindowInfo& candidate) {
+                             return SameTerminalIdentity(root, candidate);
+                         });
+        if (it == current.end()) continue;
+        if (!CloseTerminalWindow(root.hwnd)) {
+            Print("  cleanup Terminal HWND 0x{:X}: FAILED (window retained)\n",
+                  reinterpret_cast<uintptr_t>(root.hwnd));
+            all_closed = false;
+        }
+    }
+    return all_closed;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4B-2A Chromium application probe
 //
 // Chromium is multi-process and may share a long-lived browser executable with
@@ -5599,6 +5850,605 @@ int CmdChromiumSemanticsTest(const std::string& browser,
     const bool cleaned = cleanup();
     if (!cleaned && rc == 0) {
         Heading("Chromium semantics cleanup verdict");
+        Field("result", "INCONCLUSIVE-CLEANUP");
+        Field("GO/NO-GO", "INCONCLUSIVE");
+        rc = kExitInconclusive;
+    }
+    return rc;
+}
+
+// ------------------------------------------------ terminal-semantics-test
+
+int CmdTerminalSemanticsTest(bool confirm_mutate) {
+    Heading("terminal-semantics-test");
+    Field("what this does",
+          "launches two newly observed Windows Terminal windows and moves one "
+          "top-level view Carrier -> Parking -> Carrier");
+    Field("representative type", "packaged/modern Windows application");
+    Field("scope",
+          "only HWNDs carrying this probe's unique title token; existing "
+          "Terminal windows and processes are never terminated");
+    Field("native model", "one current Carrier + one shared inactive Parking");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print(
+            "\n  Refusing to launch Windows Terminal or move a view without "
+            "--confirm-mutate.\n"
+            "      vdprobe terminal-semantics-test --confirm-mutate\n\n");
+        return 1;
+    }
+
+    Com<IServiceProvider> sp;
+    HRESULT hr = GetImmersiveShell(sp);
+    if (FAILED(hr)) {
+        Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        if (hr == E_ACCESSDENIED) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "ImmersiveShell E_ACCESSDENIED");
+            Field("mutation_started", "no");
+            return kExitInconclusive;
+        }
+        return 1;
+    }
+
+    ManagerInternal mi = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(mi);
+    if (mi.candidate == nullptr || mi.layout == nullptr) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "usable VDMI layout unavailable");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+
+    DesktopSnapshot carrier;
+    if (!ReadCurrentDesktop(mi, carrier)) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "current Carrier unavailable");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    if (!ReadDesktopList(mi, desktops) || desktops.size() < 2) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "at least two existing desktops are required");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.object || !parking.id_ok) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "no existing Parking desktop found");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "IApplicationViewCollection unavailable");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager,
+        documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason",
+              std::format("IVirtualDesktopManager unavailable ({})",
+                          HrToString(documented_hr)));
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+
+    const std::wstring executable = SystemTerminalPath();
+    if (executable.empty()) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "Windows Terminal executable/alias not found");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    Field("Windows Terminal launch path", ToUtf8(executable));
+
+    GUID token_id{};
+    if (FAILED(::CoCreateGuid(&token_id))) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "could not create unique attribution token");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    const std::wstring token =
+        L"vdprobe-terminal-" + ToWide(GuidToString(token_id));
+    Field("probe title token", ToUtf8(token));
+
+    std::vector<TerminalWindowInfo> created_roots;
+    auto cleanup = [&]() {
+        const bool closed = CloseProbeOwnedTerminalWindows(created_roots, token);
+        Field("probe-owned Terminal cleanup", closed ? "passed" : "incomplete");
+        return closed;
+    };
+
+    for (size_t launch_index = 0; launch_index < 2; ++launch_index) {
+        const std::vector<TerminalWindowInfo> before =
+            EnumerateTerminalWindows(token, true);
+        Field("Windows Terminal launch",
+              std::format("{}", launch_index + 1));
+        if (!LaunchTerminalWindow(executable, token)) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "Windows Terminal launch request failed");
+            Field("mutation_started", created_roots.empty() ? "no" : "yes");
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+
+        std::vector<TerminalWindowInfo> new_windows;
+        TerminalWindowInfo selected;
+        bool ambiguous = false;
+        if (!WaitForNewTerminalWindow(before, token, new_windows, selected,
+                                      ambiguous)) {
+            Field("result", "INCONCLUSIVE-ATTRIBUTION");
+            Field("reason",
+                  ambiguous
+                      ? "multiple new Windows Terminal top-level HWNDs appeared "
+                        "for one launch request"
+                      : "Windows Terminal launch did not yield one attributable "
+                        "top-level HWND");
+            Field("mutation_started",
+                  created_roots.empty() ? "no" : "yes");
+            Field("cleanup_scope",
+                  new_windows.empty() ? "attributable roots only"
+                                       : "incomplete");
+            Field("unattributed_new_windows",
+                  std::format("{}", new_windows.size()));
+            if (!new_windows.empty()) {
+                Print("  Unattributed Terminal HWNDs are intentionally retained "
+                      "because ownership is not proven.\n");
+            }
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+        created_roots.push_back(selected);
+        Field("created Terminal HWND",
+              std::format("0x{:X}", reinterpret_cast<uintptr_t>(selected.hwnd)));
+        Field("created Terminal PID", std::format("{}", selected.pid));
+        Field("created Terminal class", ToUtf8(selected.class_name));
+        Field("created Terminal image", ToUtf8(selected.image_path));
+    }
+
+    const std::vector<TerminalWindowInfo> all_windows =
+        EnumerateTerminalWindows(token, true);
+    std::vector<TerminalWindowInfo> top_level;
+    for (const TerminalWindowInfo& info : all_windows) {
+        if (IsTerminalTopLevelWindow(info, token)) top_level.push_back(info);
+    }
+    Field("new Terminal top-level windows",
+          std::format("{}", top_level.size()));
+    if (top_level.size() != 2) {
+        Field("result", "INCONCLUSIVE-ATTRIBUTION");
+        Field("reason",
+              "the launch requests did not yield exactly two attributable "
+              "Terminal top-level windows");
+        Field("mutation_started", "no");
+        const bool closed = cleanup();
+        return closed ? kExitInconclusive : 1;
+    }
+
+    for (const TerminalWindowInfo& root : created_roots) {
+        if (std::none_of(top_level.begin(), top_level.end(),
+                         [&](const TerminalWindowInfo& candidate) {
+                             return SameTerminalIdentity(root, candidate);
+                         })) {
+            Field("result", "INCONCLUSIVE-ATTRIBUTION");
+            Field("reason",
+                  "a created Terminal root was not present in the final "
+                  "attributable top-level set");
+            Field("mutation_started", "no");
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+    }
+
+    const HWND target_hwnd = created_roots.front().hwnd;
+    const HWND sibling_hwnd = created_roots.back().hwnd;
+    std::vector<RealAppWindowInfo> windows;
+    windows.reserve(all_windows.size());
+    for (const TerminalWindowInfo& info : all_windows) {
+        RealAppWindowInfo converted;
+        converted.hwnd = info.hwnd;
+        converted.owner = info.owner;
+        converted.title = info.title;
+        converted.class_name = info.class_name;
+        converted.identity = info.identity;
+        windows.push_back(std::move(converted));
+    }
+
+    auto acquire_view = [&](HWND hwnd, RawObject& out) -> bool {
+        const MethodEntry* method = FindMethod(*views.layout, "GetViewForHwnd");
+        if (method == nullptr) return false;
+        const ULONGLONG deadline = ::GetTickCount64() + 5000;
+        do {
+            PumpStaMessages();
+            Gate gate = Gate::Ok;
+            HRESULT view_hr =
+                InvokeSlot(views.object.Get(), *views.layout, *method, gate,
+                           false, hwnd, out.PutVoid());
+            if (gate == Gate::Ok && SUCCEEDED(view_hr) && out) return true;
+            ::Sleep(25);
+        } while (::GetTickCount64() < deadline);
+        return false;
+    };
+
+    std::vector<RealAppWindowSnapshot> baseline;
+    baseline.reserve(windows.size());
+    int rc = 0;
+    std::string precondition_reason;
+    for (const RealAppWindowInfo& info : windows) {
+        RealAppWindowSnapshot snapshot;
+        const bool is_target = info.hwnd == target_hwnd;
+        const bool is_sibling = info.hwnd == sibling_hwnd;
+        const bool is_root = is_target || is_sibling;
+        if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
+                                          snapshot)) {
+            Field(std::format("  window 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  is_root ? "snapshot FAIL" : "observation unavailable");
+            if (is_root) {
+                precondition_reason =
+                    is_target ? "required target Terminal snapshot unavailable"
+                              : "required sibling Terminal snapshot unavailable";
+            }
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        Field(std::format("  {} HWND", is_target ? "target"
+                                                 : (is_sibling ? "sibling"
+                                                               : "owned")),
+              std::format("0x{:X}", reinterpret_cast<uintptr_t>(info.hwnd)));
+        Field(std::format("  {} desktop", is_target ? "target"
+                                                    : (is_sibling ? "sibling"
+                                                                  : "auxiliary")),
+              snapshot.desktop.desktop_ok
+                  ? GuidToString(snapshot.desktop.desktop)
+                  : "(unavailable)");
+        Field(std::format("  {} on_current", is_target ? "target"
+                                                       : (is_sibling ? "sibling"
+                                                                     : "auxiliary")),
+              snapshot.desktop.on_current_ok
+                  ? (snapshot.desktop.on_current ? "true" : "false")
+                  : "(unavailable)");
+        if (!is_root) {
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        if (!acquire_view(info.hwnd, snapshot.view)) {
+            Field(std::format("  view 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  is_target ? "FAIL (target view unavailable)"
+                            : "observation-only (sibling view unavailable)");
+            if (is_target) {
+                precondition_reason = "required target Terminal view unavailable";
+            }
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        const MethodEntry* can_move =
+            FindMethod(*mi.layout, "CanViewMoveDesktops");
+        Gate gate = Gate::Ok;
+        BOOL can_move_value = FALSE;
+        HRESULT can_hr = E_ABORT;
+        if (can_move != nullptr) {
+            can_hr = InvokeSlot(mi.obj.Get(), *mi.layout, *can_move, gate, false,
+                                snapshot.view.Get(), &can_move_value);
+        }
+        const bool can_move_ok =
+            gate == Gate::Ok && SUCCEEDED(can_hr) && can_move_value != FALSE;
+        Field(std::format("  CanViewMoveDesktops 0x{:X}",
+                          reinterpret_cast<uintptr_t>(info.hwnd)),
+              can_move_ok ? "TRUE" : "FALSE");
+        if (is_target && !can_move_ok) {
+            precondition_reason =
+                "required target Terminal view cannot move between desktops";
+        }
+        baseline.push_back(std::move(snapshot));
+    }
+
+    if (!precondition_reason.empty()) {
+        Field("result", "INCONCLUSIVE-PRECONDITION");
+        Field("mutation_started", "no");
+        Field("reason", precondition_reason);
+        const bool closed = cleanup();
+        return closed ? kExitInconclusive : 1;
+    }
+    for (const RealAppWindowSnapshot& snapshot : baseline) {
+        const bool is_root = snapshot.info.hwnd == target_hwnd ||
+                             snapshot.info.hwnd == sibling_hwnd;
+        if (!is_root) continue;
+        if (!IsRealAppWindowOnCarrier(snapshot, carrier.id)) {
+            Field("result", "INCONCLUSIVE-PRECONDITION");
+            Field("mutation_started", "no");
+            Field("reason",
+                  snapshot.info.hwnd == target_hwnd
+                      ? "target Terminal window was not initially on Carrier"
+                      : "sibling Terminal window was not initially on Carrier");
+            const bool closed = cleanup();
+            return closed ? kExitInconclusive : 1;
+        }
+    }
+
+    NotifySink* sink = new NotifySink();
+    bool release_sink = true;
+    {
+        NotificationRegistration reg(sp.Get(), sink, confirm_mutate);
+        Field("Register gate", GateText(reg.gate()));
+        Field("Register hr", HrToString(reg.hr()));
+        Field("Register cookie", std::format("{}", reg.cookie()));
+        if (!reg.ok()) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "notification registration failed");
+            rc = kExitInconclusive;
+        } else {
+            Field("watcher STA thread",
+                  std::format("{}", ::GetCurrentThreadId()));
+            PumpStaMessages();
+            std::vector<NotifyEvent> registration_events;
+            DrainAndPrintEvents(sink, 0, registration_events);
+
+            auto target_it = std::find_if(
+                baseline.begin(), baseline.end(),
+                [target_hwnd](const RealAppWindowSnapshot& snapshot) {
+                    return snapshot.info.hwnd == target_hwnd;
+                });
+            if (target_it == baseline.end() || !target_it->view) {
+                Field("result", "INCONCLUSIVE-PRECONDITION");
+                Field("reason", "target Terminal view snapshot missing");
+                rc = kExitInconclusive;
+            } else {
+                ViewRestoreGuard restore_guard(
+                    mi, target_it->view.Get(), carrier.object.Get(),
+                    confirm_mutate);
+                restore_guard.Arm();
+                WindowMoveObservation outbound = MoveViewAndVerify(
+                    mi, target_it->view.Get(), parking.object.Get(), carrier.id,
+                    parking.id, carrier.id, target_hwnd,
+                    documented_manager.Get(), sink, confirm_mutate);
+
+                std::vector<RealAppWindowSnapshot> current;
+                current.reserve(windows.size());
+                for (const RealAppWindowInfo& info : windows) {
+                    RealAppWindowSnapshot snapshot;
+                    if (!CaptureRealAppWindowSnapshot(
+                            info, documented_manager.Get(), snapshot)) {
+                        Field(std::format("  post-move window 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(info.hwnd)),
+                              (info.hwnd == target_hwnd ||
+                               info.hwnd == sibling_hwnd)
+                                  ? "snapshot unavailable"
+                                  : "observation unavailable");
+                        if (info.hwnd == target_hwnd ||
+                            info.hwnd == sibling_hwnd) {
+                            rc = 1;
+                        }
+                    }
+                    current.push_back(std::move(snapshot));
+                }
+
+                std::vector<HWND> allowed_hwnds;
+                for (const RealAppWindowInfo& info : windows) {
+                    allowed_hwnds.push_back(info.hwnd);
+                }
+                const bool callback_scope_ok =
+                    ViewEventsWithinScope(outbound.events,
+                                          outbound.call_start_qpc,
+                                          allowed_hwnds);
+                const bool callback_contaminated = !callback_scope_ok;
+                bool target_moved = false;
+                bool sibling_moved = false;
+                size_t owned_observable = 0;
+                size_t owned_moved = 0;
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    const bool is_owned = baseline[i].info.owner != nullptr;
+                    const bool is_root =
+                        baseline[i].info.hwnd == target_hwnd ||
+                        baseline[i].info.hwnd == sibling_hwnd;
+                    if (!baseline[i].snapshot_ok || !current[i].snapshot_ok) {
+                        if (is_root) rc = 1;
+                        continue;
+                    }
+                    const bool moved =
+                        IsWindowDesktopAssignmentChanged(baseline[i], current[i]);
+                    if (baseline[i].info.hwnd == target_hwnd) {
+                        target_moved = moved;
+                    } else if (baseline[i].info.hwnd == sibling_hwnd) {
+                        sibling_moved = moved;
+                    } else if (is_owned) {
+                        ++owned_observable;
+                        if (moved) ++owned_moved;
+                    }
+                    const bool identity_ok =
+                        RealAppWindowIdentityUnchanged(baseline[i], current[i]);
+                    const bool owner_ok =
+                        ::GetWindow(current[i].info.hwnd, GW_OWNER) ==
+                        baseline[i].info.owner;
+                    const bool rect_ok =
+                        baseline[i].state_ok && current[i].state_ok &&
+                        SameRect(baseline[i].rect, current[i].rect);
+                    const bool monitor_ok =
+                        baseline[i].monitor == current[i].monitor;
+                    if (is_root && baseline[i].info.hwnd == sibling_hwnd &&
+                        (!identity_ok || !owner_ok || !rect_ok || !monitor_ok)) {
+                        rc = 1;
+                    }
+                    Field(std::format("  window 0x{:X} desktop",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          DesktopRelationText(baseline[i], current[i]));
+                    if (is_root) {
+                        Field(std::format("    identity 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              identity_ok ? "unchanged" : "CHANGED");
+                        Field(std::format("    RECT 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              rect_ok ? "unchanged" : "CHANGED");
+                        Field(std::format("    monitor 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              monitor_ok ? "unchanged" : "CHANGED");
+                    }
+                }
+
+                Field("target moved to Parking", target_moved ? "yes" : "NO");
+                Field("sibling top-level moved",
+                      sibling_moved ? "yes (unexpected)" : "no");
+                Field("owned windows observable",
+                      std::format("{}", owned_observable));
+                Field("owned windows moved", std::format("{}", owned_moved));
+                Field("callback HWND scope",
+                      callback_scope_ok ? "probe-token only" : "OUT OF SCOPE");
+                Field("observation contamination",
+                      callback_contaminated ? "yes (inconclusive)" : "none");
+                Field("CurrentVirtualDesktopChanged count",
+                      std::format("{}", outbound.current_changed_count));
+                Field("ViewVirtualDesktopChanged target",
+                      outbound.view_callback_ok ? "observed" : "missing");
+
+                const bool target_core =
+                    outbound.move_gate_ok && SUCCEEDED(outbound.move_hr) &&
+                    outbound.observed_current_ok &&
+                    ::IsEqualGUID(outbound.observed_current, carrier.id) &&
+                    outbound.observed_window_ok &&
+                    ::IsEqualGUID(outbound.observed_window.desktop,
+                                  parking.id) &&
+                    !outbound.observed_window.on_current;
+                const bool global_current_ok =
+                    outbound.observed_current_ok &&
+                    outbound.current_changed_count == 0;
+                const bool terminal_pass =
+                    target_core && outbound.view_callback_ok && target_moved &&
+                    !sibling_moved && global_current_ok;
+
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    const bool is_owned = baseline[i].info.owner != nullptr;
+                    const bool is_root =
+                        baseline[i].info.hwnd == target_hwnd ||
+                        baseline[i].info.hwnd == sibling_hwnd;
+                    if (!is_root ||
+                        !IsWindowDesktopAssignmentChanged(baseline[i],
+                                                           current[i])) {
+                        continue;
+                    }
+                    if (!baseline[i].view) {
+                        if (!is_owned) rc = 1;
+                        continue;
+                    }
+                    Gate restore_gate = Gate::Ok;
+                    HRESULT restore_hr = E_ABORT;
+                    const bool restored_window = MoveViewToDesktopAndWait(
+                        mi, baseline[i].view.Get(), carrier.object.Get(),
+                        baseline[i].info.hwnd, documented_manager.Get(),
+                        carrier.id, carrier.id, confirm_mutate, restore_gate,
+                        restore_hr);
+                    Field(std::format("restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          restored_window ? "PASS" : HrToString(restore_hr));
+                    if (!restored_window) rc = 1;
+                }
+                PumpStaMessages();
+                std::vector<NotifyEvent> restore_events;
+                DrainAndPrintEvents(sink, 0, restore_events);
+
+                bool restored = true;
+                GUID current_desktop{};
+                if (!ReadCurrentDesktopId(mi, current_desktop) ||
+                    !::IsEqualGUID(current_desktop, carrier.id)) {
+                    restored = false;
+                }
+                for (const RealAppWindowSnapshot& snapshot : baseline) {
+                    const bool is_root =
+                        snapshot.info.hwnd == target_hwnd ||
+                        snapshot.info.hwnd == sibling_hwnd;
+                    if (!is_root) continue;
+                    WindowDesktopState state;
+                    if (!ReadWindowDesktopState(documented_manager.Get(),
+                                                snapshot.info.hwnd, state) ||
+                        !IsWindowStateOnCarrier(snapshot.info, state, true,
+                                                carrier.id)) {
+                        restored = false;
+                    }
+                }
+                if (!restored) {
+                    Print("  CRITICAL TERMINAL RESTORE FAILURE\n");
+                    rc = 1;
+                } else {
+                    restore_guard.Disarm();
+                }
+
+                Heading("Terminal semantics verdict");
+                if (!restored || rc != 0) {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                } else if (callback_contaminated) {
+                    Field("result", "INCONCLUSIVE-CONTAMINATED");
+                    Field("GO/NO-GO", "INCONCLUSIVE");
+                    rc = kExitInconclusive;
+                } else if (terminal_pass) {
+                    Field("result", "TERMINAL-SEMANTICS-OBSERVED");
+                    Field("GO/NO-GO", "GO-WITH-LIMITATIONS");
+                } else {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                }
+                Field("total events observed",
+                      std::format("{}", sink->TotalEventCount()));
+            }
+        }
+
+        if (reg.ok()) {
+            PumpStaMessages();
+            std::vector<NotifyEvent> pre_unregister_events;
+            DrainAndPrintEvents(sink, 0, pre_unregister_events);
+            const HRESULT unregister_hr = reg.UnregisterNow();
+            Field("Unregister gate", GateText(reg.unregister_gate()));
+            Field("Unregister hr", HrToString(unregister_hr));
+            if (FAILED(unregister_hr)) {
+                rc = 1;
+                release_sink = false;
+            }
+            PumpStaMessages();
+            std::vector<NotifyEvent> post_unregister_events;
+            DrainAndPrintEvents(sink, 0, post_unregister_events);
+        }
+    }
+
+    if (release_sink) {
+        sink->Release();
+    } else {
+        Print("  sink retained because Unregister failed; avoiding possible "
+              "late-callback UAF.\n");
+    }
+    const bool terminal_closed = cleanup();
+    if (!terminal_closed && rc == 0) {
+        Heading("Terminal semantics cleanup verdict");
         Field("result", "INCONCLUSIVE-CLEANUP");
         Field("GO/NO-GO", "INCONCLUSIVE");
         rc = kExitInconclusive;

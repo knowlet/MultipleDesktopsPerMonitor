@@ -82,6 +82,11 @@ int CmdExplorerSemanticsTest(bool confirm_mutate);
 // existing browser profile or terminates an existing browser process.
 int CmdChromiumSemanticsTest(const std::string& browser, bool confirm_mutate);
 
+// Phase 4C: characterize two probe-owned Windows Terminal top-level windows
+// using the same Carrier/Parking contract.  The command never touches
+// pre-existing Terminal windows or terminates an unrelated process.
+int CmdTerminalSemanticsTest(bool confirm_mutate);
+
 // Internal child-process mode used only by CmdRealAppSemanticsTest.  It creates
 // controlled ordinary Win32 windows and is not part of the public probe
 // surface.
