@@ -5,8 +5,8 @@
 // notify-watch self-trigger validates the callback pipeline,
 // carrier-parking-test validates the Carrier/Parking primitive, and
 // logical-workspace-test validates one deterministic per-monitor workspace
-// round-trip.  real-app-semantics-test characterizes grouping/ownership for
-// probe-owned ordinary Win32 child applications.
+// round-trip.  The phase 4 commands characterize application window
+// granularity without touching pre-existing user windows.
 #include <windows.h>
 
 #include <cstdlib>
@@ -67,6 +67,13 @@ void Usage() {
         "                      sibling, owned popups, callbacks, and restore;\n"
         "                      requires --confirm-mutate\n"
         "\n"
+        "phase 4B-2A (mutating: isolated Chromium semantics)\n"
+        "  chromium-semantics-test\n"
+        "                      launch one isolated Edge profile with two\n"
+        "                      attributable top-level windows, move one view\n"
+        "                      Carrier -> Parking -> Carrier; requires\n"
+        "                      --browser edge --confirm-mutate\n"
+        "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
         "\n"
@@ -110,6 +117,7 @@ int main(int argc, char** argv) {
     bool confirm_register = false;
     bool self_trigger = false;
     bool confirm_mutate = false;
+    std::string browser;
     int seconds = 20;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -121,6 +129,8 @@ int main(int argc, char** argv) {
             self_trigger = true;
         } else if (a == "--confirm-mutate") {
             confirm_mutate = true;
+        } else if (a == "--browser" && i + 1 < argc) {
+            browser = vd::ToLowerAscii(argv[++i]);
         } else if (a == "--seconds" && i + 1 < argc) {
             seconds = std::atoi(argv[++i]);
             if (seconds <= 0) seconds = 20;
@@ -168,6 +178,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdRealAppSemanticsTest(confirm_mutate);
     } else if (cmd == "explorer-semantics-test") {
         rc = vd::CmdExplorerSemanticsTest(confirm_mutate);
+    } else if (cmd == "chromium-semantics-test") {
+        rc = vd::CmdChromiumSemanticsTest(browser, confirm_mutate);
     } else if (cmd == "real-app-child") {
         // Internal helper launched by real-app-semantics-test.  It is not
         // documented as a standalone probe command.

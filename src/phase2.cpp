@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
+#include <filesystem>
 #include <unordered_map>
 
 #include "notifysink.h"
@@ -237,6 +239,61 @@ std::wstring SystemExplorerPath() {
     UINT n = ::GetWindowsDirectoryW(dir, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
     return std::wstring(dir, n) + L"\\explorer.exe";
+}
+
+std::wstring EnvironmentPath(const wchar_t* name) {
+    if (name == nullptr) return {};
+    DWORD need = ::GetEnvironmentVariableW(name, nullptr, 0);
+    if (need == 0) return {};
+    std::wstring value(static_cast<size_t>(need), L'\0');
+    DWORD got = ::GetEnvironmentVariableW(name, value.data(), need);
+    if (got == 0 || got >= need) return {};
+    value.resize(got);
+    return value;
+}
+
+std::wstring NormalizeFilesystemPath(std::wstring value) {
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    if (value.rfind(L"\\\\?\\", 0) == 0) value.erase(0, 4);
+    while (value.size() > 3 && value.back() == L'\\') value.pop_back();
+    return value;
+}
+
+std::wstring FullExistingPath(const std::wstring& candidate) {
+    if (candidate.empty() ||
+        ::GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return {};
+    }
+    std::vector<wchar_t> buffer(32768);
+    DWORD n = ::GetFullPathNameW(candidate.c_str(),
+                                 static_cast<DWORD>(buffer.size()),
+                                 buffer.data(), nullptr);
+    if (n == 0 || n >= buffer.size()) return {};
+    return NormalizeFilesystemPath(std::wstring(buffer.data(), n));
+}
+
+std::wstring SystemEdgePath() {
+    const std::vector<std::wstring> candidates = {
+        EnvironmentPath(L"ProgramFiles(x86)") +
+            L"\\Microsoft\\Edge\\Application\\msedge.exe",
+        EnvironmentPath(L"ProgramFiles") +
+            L"\\Microsoft\\Edge\\Application\\msedge.exe",
+        EnvironmentPath(L"LOCALAPPDATA") +
+            L"\\Microsoft\\Edge\\Application\\msedge.exe",
+        EnvironmentPath(L"ProgramW6432") +
+            L"\\Microsoft\\Edge\\Application\\msedge.exe",
+    };
+    for (const std::wstring& candidate : candidates) {
+        const std::wstring resolved = FullExistingPath(candidate);
+        if (!resolved.empty()) return resolved;
+    }
+    return {};
+}
+
+bool SameFilesystemPath(const std::wstring& a, const std::wstring& b) {
+    const std::wstring na = NormalizeFilesystemPath(a);
+    const std::wstring nb = NormalizeFilesystemPath(b);
+    return !na.empty() && !nb.empty() && _wcsicmp(na.c_str(), nb.c_str()) == 0;
 }
 
 // ------------------------------------------------------- desktop enumeration
@@ -882,6 +939,7 @@ struct RealAppWindowInfo {
     HWND hwnd = nullptr;
     HWND owner = nullptr;
     std::wstring title;
+    std::wstring class_name;
     WindowIdentity identity;
 };
 
@@ -913,11 +971,15 @@ BOOL CALLBACK EnumerateRealAppWindowsProc(HWND hwnd, LPARAM lparam) {
     }
 
     wchar_t title[512]{};
+    wchar_t class_name[256]{};
     int length = ::GetWindowTextW(hwnd, title, 512);
+    int class_length = ::GetClassNameW(hwnd, class_name, 256);
     RealAppWindowInfo info;
     info.hwnd = hwnd;
     info.owner = ::GetWindow(hwnd, GW_OWNER);
     info.title.assign(title, static_cast<size_t>(std::max(length, 0)));
+    info.class_name.assign(class_name,
+                           static_cast<size_t>(std::max(class_length, 0)));
     info.identity = identity;
     context->out->push_back(std::move(info));
     return TRUE;
@@ -1251,6 +1313,334 @@ bool CloseProbeOwnedExplorerWindows(
         if (!CloseExplorerWindow(info.hwnd)) {
             Print("  cleanup Explorer HWND 0x{:X}: FAILED (window retained)\n",
                   reinterpret_cast<uintptr_t>(info.hwnd));
+            all_closed = false;
+        }
+    }
+    return all_closed;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4B-2A Chromium application probe
+//
+// Chromium is multi-process and may share a long-lived browser executable with
+// unrelated user windows.  Attribution therefore requires all of:
+//   * a newly observed top-level HWND;
+//   * the canonical Edge executable path; and
+//   * a command line containing this probe's unique temporary profile path.
+// A class name is only evidence used to identify normal browser roots.
+
+struct ChromiumWindowInfo {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    DWORD pid = 0;
+    bool visible = false;
+    std::wstring title;
+    std::wstring class_name;
+    std::wstring command_line;
+    WindowIdentity identity;
+    RECT rect{};
+    HMONITOR monitor = nullptr;
+};
+
+using NtQueryInformationProcessFn =
+    LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+struct NativeUnicodeString {
+    USHORT length = 0;
+    USHORT maximum_length = 0;
+    PWSTR buffer = nullptr;
+};
+
+std::wstring ReadProcessCommandLine(DWORD pid) {
+    if (pid == 0) return {};
+    HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) return {};
+    auto query = TryGetProcAs<NtQueryInformationProcessFn>(
+        L"ntdll.dll", "NtQueryInformationProcess");
+    if (query == nullptr) {
+        ::CloseHandle(process);
+        return {};
+    }
+
+    constexpr ULONG kProcessCommandLineInformation = 60;
+    ULONG length = 0;
+    (void)query(process, kProcessCommandLineInformation, nullptr, 0, &length);
+    if (length < sizeof(NativeUnicodeString) || length > (1u << 20)) {
+        ::CloseHandle(process);
+        return {};
+    }
+    std::vector<unsigned char> buffer(length);
+    const LONG status =
+        query(process, kProcessCommandLineInformation, buffer.data(), length,
+              &length);
+    ::CloseHandle(process);
+    if (status < 0 || buffer.size() < sizeof(NativeUnicodeString)) return {};
+
+    const auto* command =
+        reinterpret_cast<const NativeUnicodeString*>(buffer.data());
+    if (command->buffer == nullptr || command->length == 0 ||
+        command->length % sizeof(wchar_t) != 0) {
+        return {};
+    }
+    const size_t chars = command->length / sizeof(wchar_t);
+    const wchar_t* begin = command->buffer;
+    const wchar_t* end = begin + chars;
+    const uintptr_t buffer_begin =
+        reinterpret_cast<uintptr_t>(buffer.data());
+    const uintptr_t buffer_end = buffer_begin + buffer.size();
+    const uintptr_t string_begin = reinterpret_cast<uintptr_t>(begin);
+    const uintptr_t string_end = reinterpret_cast<uintptr_t>(end);
+    if (string_begin < buffer_begin || string_end > buffer_end ||
+        string_end < string_begin) {
+        // The documented information class normally returns an inline string;
+        // refuse an unexpected pointer rather than reading arbitrary memory.
+        return {};
+    }
+    return std::wstring(begin, end);
+}
+
+bool CommandLineContainsProfile(const std::wstring& command_line,
+                                const std::wstring& profile) {
+    if (command_line.empty() || profile.empty()) return false;
+    std::wstring cmd = NormalizeFilesystemPath(command_line);
+    std::wstring needle = NormalizeFilesystemPath(profile);
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(),
+                   [](wchar_t c) { return std::towlower(c); });
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+                   [](wchar_t c) { return std::towlower(c); });
+    return cmd.find(needle) != std::wstring::npos;
+}
+
+bool IsChromiumProcess(DWORD pid, const std::wstring& executable,
+                       const std::wstring& profile,
+                       std::wstring* command_line_out = nullptr) {
+    if (pid == 0 || executable.empty() || profile.empty()) return false;
+    HANDLE process =
+        ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) return false;
+    std::vector<wchar_t> path(32768);
+    DWORD length = static_cast<DWORD>(path.size());
+    const BOOL path_ok =
+        ::QueryFullProcessImageNameW(process, 0, path.data(), &length);
+    ::CloseHandle(process);
+    if (!path_ok || length == 0) return false;
+    const std::wstring full(path.data(), length);
+    if (!SameFilesystemPath(full, executable)) return false;
+
+    const std::wstring command_line = ReadProcessCommandLine(pid);
+    if (!CommandLineContainsProfile(command_line, profile)) return false;
+    if (command_line_out != nullptr) *command_line_out = command_line;
+    return true;
+}
+
+bool IsChromiumTopLevelWindow(const ChromiumWindowInfo& info) {
+    if (info.owner != nullptr) return false;
+    if (info.class_name == L"Chrome_WidgetWin_1" ||
+        info.class_name == L"Chrome_WidgetWin_0") {
+        return true;
+    }
+    return info.class_name.rfind(L"Chrome_WidgetWin_", 0) == 0;
+}
+
+struct ChromiumEnumContext {
+    const std::wstring* executable = nullptr;
+    const std::wstring* profile = nullptr;
+    std::vector<ChromiumWindowInfo>* out = nullptr;
+    bool include_invisible = false;
+};
+
+BOOL CALLBACK EnumerateChromiumWindowsProc(HWND hwnd, LPARAM lparam) {
+    auto* context = reinterpret_cast<ChromiumEnumContext*>(lparam);
+    if (context == nullptr || context->out == nullptr ||
+        context->executable == nullptr || context->profile == nullptr ||
+        !::IsWindow(hwnd) ||
+        (!context->include_invisible && !::IsWindowVisible(hwnd))) {
+        return TRUE;
+    }
+    const LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) return TRUE;
+
+    DWORD pid = 0;
+    (void)::GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring command_line;
+    if (!IsChromiumProcess(pid, *context->executable, *context->profile,
+                            &command_line)) {
+        return TRUE;
+    }
+
+    WindowIdentity identity;
+    if (!ReadWindowIdentity(hwnd, identity)) return TRUE;
+    wchar_t title[512]{};
+    wchar_t class_name[256]{};
+    const int title_length = ::GetWindowTextW(hwnd, title, 512);
+    const int class_length = ::GetClassNameW(hwnd, class_name, 256);
+
+    ChromiumWindowInfo info;
+    info.hwnd = hwnd;
+    info.owner = ::GetWindow(hwnd, GW_OWNER);
+    info.pid = pid;
+    info.visible = ::IsWindowVisible(hwnd) != FALSE;
+    info.title.assign(title, static_cast<size_t>(std::max(title_length, 0)));
+    info.class_name.assign(class_name,
+                           static_cast<size_t>(std::max(class_length, 0)));
+    info.command_line = std::move(command_line);
+    info.identity = identity;
+    (void)::GetWindowRect(hwnd, &info.rect);
+    info.monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    context->out->push_back(std::move(info));
+    return TRUE;
+}
+
+std::vector<ChromiumWindowInfo> EnumerateChromiumWindows(
+    const std::wstring& executable, const std::wstring& profile,
+    bool include_invisible = false) {
+    std::vector<ChromiumWindowInfo> out;
+    ChromiumEnumContext context{&executable, &profile, &out,
+                                include_invisible};
+    ::EnumWindows(&EnumerateChromiumWindowsProc,
+                  reinterpret_cast<LPARAM>(&context));
+    std::sort(out.begin(), out.end(),
+              [](const ChromiumWindowInfo& a, const ChromiumWindowInfo& b) {
+                  return reinterpret_cast<uintptr_t>(a.hwnd) <
+                         reinterpret_cast<uintptr_t>(b.hwnd);
+              });
+    return out;
+}
+
+bool SameChromiumIdentity(const ChromiumWindowInfo& a,
+                          const ChromiumWindowInfo& b) {
+    return a.hwnd == b.hwnd && a.identity.pid == b.identity.pid &&
+           a.identity.process_creation_time_ok &&
+           b.identity.process_creation_time_ok &&
+           SameFileTime(a.identity.process_creation_time,
+                        b.identity.process_creation_time);
+}
+
+std::vector<ChromiumWindowInfo> NewChromiumWindows(
+    const std::vector<ChromiumWindowInfo>& before,
+    const std::vector<ChromiumWindowInfo>& after) {
+    std::vector<ChromiumWindowInfo> out;
+    for (const ChromiumWindowInfo& candidate : after) {
+        if (std::none_of(before.begin(), before.end(),
+                         [&](const ChromiumWindowInfo& old) {
+                             return SameChromiumIdentity(old, candidate);
+                         })) {
+            out.push_back(candidate);
+        }
+    }
+    return out;
+}
+
+bool CreateProbeProfileDirectory(std::wstring& out) {
+    out.clear();
+    std::wstring temp = EnvironmentPath(L"TEMP");
+    if (temp.empty()) temp = EnvironmentPath(L"TMP");
+    if (temp.empty()) {
+        wchar_t buffer[MAX_PATH]{};
+        DWORD n = ::GetTempPathW(MAX_PATH, buffer);
+        if (n == 0 || n >= MAX_PATH) return false;
+        temp.assign(buffer, n);
+    }
+    while (temp.size() > 3 && (temp.back() == L'\\' || temp.back() == L'/')) {
+        temp.pop_back();
+    }
+    GUID id{};
+    if (FAILED(::CoCreateGuid(&id))) return false;
+    const std::wstring name = L"vdprobe-edge-" + ToWide(GuidToString(id));
+    out = temp + L"\\" + name;
+    return ::CreateDirectoryW(out.c_str(), nullptr) != FALSE;
+}
+
+bool LaunchChromiumWindow(const std::wstring& executable,
+                          const std::wstring& profile) {
+    if (executable.empty() || profile.empty()) return false;
+    std::wstring command =
+        L"\"" + executable + L"\" --user-data-dir=\"" + profile +
+        L"\" --no-first-run --no-default-browser-check --new-window "
+        L"about:blank";
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessW(executable.c_str(), mutable_command.data(), nullptr,
+                          nullptr, FALSE, 0, nullptr, nullptr, &startup, &pi)) {
+        return false;
+    }
+    (void)::WaitForInputIdle(pi.hProcess, 4000);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return true;
+}
+
+bool WaitForNewChromiumPrimary(
+    const std::vector<ChromiumWindowInfo>& before,
+    const std::wstring& executable, const std::wstring& profile,
+    std::vector<ChromiumWindowInfo>& new_windows,
+    ChromiumWindowInfo& selected, bool& ambiguous, DWORD timeout_ms = 10000) {
+    new_windows.clear();
+    selected = {};
+    ambiguous = false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        const std::vector<ChromiumWindowInfo> current =
+            EnumerateChromiumWindows(executable, profile);
+        new_windows = NewChromiumWindows(before, current);
+        std::vector<ChromiumWindowInfo> primary;
+        for (const ChromiumWindowInfo& info : new_windows) {
+            if (IsChromiumTopLevelWindow(info)) primary.push_back(info);
+        }
+        if (primary.size() == 1) {
+            selected = primary.front();
+            return true;
+        }
+        if (primary.size() > 1) {
+            ambiguous = true;
+            return false;
+        }
+        ::Sleep(100);
+    } while (::GetTickCount64() < deadline);
+    return false;
+}
+
+bool RemoveProbeProfileDirectory(const std::wstring& path) {
+    if (path.empty()) return true;
+    std::error_code ec;
+    const auto removed = std::filesystem::remove_all(path, ec);
+    return !ec && (removed != 0 ||
+                   ::GetFileAttributesW(path.c_str()) ==
+                       INVALID_FILE_ATTRIBUTES);
+}
+
+bool CloseChromiumWindow(HWND hwnd, DWORD timeout_ms = 5000) {
+    if (hwnd == nullptr || !::IsWindow(hwnd)) return true;
+    if (!::PostMessageW(hwnd, WM_CLOSE, 0, 0)) return false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    do {
+        PumpStaMessages();
+        if (!::IsWindow(hwnd)) return true;
+        ::Sleep(50);
+    } while (::GetTickCount64() < deadline);
+    return !::IsWindow(hwnd);
+}
+
+bool CloseProbeOwnedChromiumWindows(
+    const std::vector<ChromiumWindowInfo>& roots,
+    const std::wstring& executable, const std::wstring& profile) {
+    bool all_closed = true;
+    const std::vector<ChromiumWindowInfo> current =
+        EnumerateChromiumWindows(executable, profile, true);
+    for (const ChromiumWindowInfo& root : roots) {
+        const auto it =
+            std::find_if(current.begin(), current.end(),
+                         [&](const ChromiumWindowInfo& candidate) {
+                             return SameChromiumIdentity(root, candidate);
+                         });
+        if (it == current.end()) continue;
+        if (!CloseChromiumWindow(root.hwnd)) {
+            Print("  cleanup Chromium HWND 0x{:X}: FAILED (window retained)\n",
+                  reinterpret_cast<uintptr_t>(root.hwnd));
             all_closed = false;
         }
     }
@@ -4544,6 +4934,658 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
     }
     const bool explorer_closed = cleanup();
     if (!explorer_closed) rc = 1;
+    return rc;
+}
+
+// ------------------------------------------------ chromium-semantics-test
+
+int CmdChromiumSemanticsTest(const std::string& browser,
+                             bool confirm_mutate) {
+    Heading("chromium-semantics-test");
+    Field("what this does",
+          "launches one isolated Edge profile with two top-level windows and "
+          "moves one view Carrier -> Parking -> Carrier");
+    Field("browser", browser.empty() ? "(missing)" : browser);
+    Field("profile_scope", "probe-temporary");
+    Field("scope", "only HWNDs attributed to this temporary browser profile");
+    Field("native model", "one current Carrier + one shared inactive Parking");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print(
+            "\n  Refusing to launch or move an isolated Chromium profile "
+            "without --confirm-mutate.\n"
+            "      vdprobe chromium-semantics-test --browser edge "
+            "--confirm-mutate\n\n");
+        return 1;
+    }
+    if (browser != "edge") {
+        Field("result", "INCONCLUSIVE-ATTRIBUTION");
+        Field("reason", "Phase 4B-2A supports only --browser edge");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+
+    Com<IServiceProvider> sp;
+    HRESULT hr = GetImmersiveShell(sp);
+    if (FAILED(hr)) {
+        Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        if (hr == E_ACCESSDENIED) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "ImmersiveShell E_ACCESSDENIED");
+            Field("mutation_started", "no");
+            return kExitInconclusive;
+        }
+        return 1;
+    }
+
+    ManagerInternal mi = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(mi);
+    if (mi.candidate == nullptr || mi.layout == nullptr) {
+        Print("\n  Chromium semantics refused: usable VDMI layout unavailable.\n");
+        return 1;
+    }
+
+    DesktopSnapshot carrier;
+    if (!ReadCurrentDesktop(mi, carrier)) {
+        Print("\n  Chromium semantics refused: current Carrier unavailable.\n");
+        return 1;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    if (!ReadDesktopList(mi, desktops) || desktops.size() < 2) {
+        Print(
+            "\n  Chromium semantics refused: at least two existing desktops "
+            "are required. No desktop will be created.\n");
+        return 1;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.object || !parking.id_ok) {
+        Print("\n  Chromium semantics refused: no existing Parking desktop "
+              "found.\n");
+        return 1;
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        Print("\n  Chromium semantics refused: IApplicationViewCollection "
+              "unavailable.\n");
+        return 1;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager,
+        documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("IVirtualDesktopManager", HrToString(documented_hr));
+        return 1;
+    }
+
+    const std::wstring executable = SystemEdgePath();
+    if (executable.empty()) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "canonical Microsoft Edge executable not found");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    Field("browser executable", ToUtf8(executable));
+
+    std::wstring profile;
+    if (!CreateProbeProfileDirectory(profile)) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "could not create probe temporary profile directory");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+    Field("probe profile", ToUtf8(profile));
+
+    std::vector<ChromiumWindowInfo> created_roots;
+    bool retain_profile = false;
+    auto cleanup = [&]() {
+        const bool closed =
+            CloseProbeOwnedChromiumWindows(created_roots, executable, profile);
+        const bool no_profile_windows =
+            EnumerateChromiumWindows(executable, profile, true).empty();
+        bool profile_removed = false;
+        if (no_profile_windows && !retain_profile) {
+            profile_removed = RemoveProbeProfileDirectory(profile);
+        }
+        const bool complete =
+            closed && no_profile_windows && !retain_profile && profile_removed;
+        Field("probe-owned Chromium cleanup",
+              closed ? "passed" : "incomplete (retained)");
+        if (profile_removed) {
+            Field("temporary profile cleanup", "passed");
+        } else if (retain_profile || !no_profile_windows) {
+            Field("temporary profile cleanup", "incomplete (retained)");
+        } else {
+            Field("temporary profile cleanup", "incomplete (profile retained)");
+        }
+        return complete;
+    };
+
+    auto inconclusive_attribution = [&](const char* reason,
+                                        const std::vector<ChromiumWindowInfo>&
+                                            unattributed) {
+        Field("result", "INCONCLUSIVE-ATTRIBUTION");
+        Field("reason", reason);
+        Field("mutation_started", created_roots.empty() ? "no" : "yes");
+        Field("target_attribution",
+              created_roots.size() >= 1 ? "unique" : "not-established");
+        Field("sibling_attribution",
+              created_roots.size() >= 2 ? "unique" : "not-established");
+        if (!unattributed.empty()) {
+            retain_profile = true;
+            Field("cleanup_scope", "incomplete");
+            Field("unattributed_new_windows",
+                  std::format("{}", unattributed.size()));
+            Print("  Unattributed Chromium HWNDs are intentionally retained "
+                  "because ownership is not proven.\n");
+        }
+        (void)cleanup();
+        return kExitInconclusive;
+    };
+
+    const std::vector<std::wstring> launch_args = {L"about:blank", L"about:blank"};
+    for (size_t launch_index = 0; launch_index < launch_args.size();
+         ++launch_index) {
+        const std::vector<ChromiumWindowInfo> before =
+            EnumerateChromiumWindows(executable, profile, true);
+        Field("Edge launch", std::format("{}", launch_index + 1));
+        if (!LaunchChromiumWindow(executable, profile)) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "Edge launch request failed");
+            Field("mutation_started", created_roots.empty() ? "no" : "yes");
+            (void)cleanup();
+            return kExitInconclusive;
+        }
+
+        std::vector<ChromiumWindowInfo> new_windows;
+        ChromiumWindowInfo selected;
+        bool ambiguous = false;
+        if (!WaitForNewChromiumPrimary(before, executable, profile,
+                                       new_windows, selected, ambiguous)) {
+            return inconclusive_attribution(
+                ambiguous
+                    ? "multiple new Chromium top-level HWNDs appeared for one "
+                      "launch request"
+                    : "Edge launch did not yield one attributable new top-level "
+                      "HWND",
+                new_windows);
+        }
+        created_roots.push_back(selected);
+        Field("created Chromium HWND",
+              std::format("0x{:X}", reinterpret_cast<uintptr_t>(selected.hwnd)));
+        Field("created Chromium PID", std::format("{}", selected.pid));
+        Field("created Chromium class", ToUtf8(selected.class_name));
+        Field("created Chromium command line",
+              selected.command_line.empty() ? "(unavailable)"
+                                             : ToUtf8(selected.command_line));
+    }
+
+    Field("target_attribution", "unique");
+    Field("sibling_attribution", "unique");
+    const std::vector<ChromiumWindowInfo> all_windows =
+        EnumerateChromiumWindows(executable, profile, true);
+    std::vector<ChromiumWindowInfo> top_level;
+    for (const ChromiumWindowInfo& info : all_windows) {
+        if (info.visible && IsChromiumTopLevelWindow(info)) {
+            top_level.push_back(info);
+        }
+    }
+    if (top_level.size() != 2) {
+        return inconclusive_attribution(
+            "isolated Edge profile did not expose exactly two attributable "
+            "normal top-level windows",
+            all_windows);
+    }
+    for (const ChromiumWindowInfo& root : created_roots) {
+        if (std::none_of(top_level.begin(), top_level.end(),
+                         [&](const ChromiumWindowInfo& candidate) {
+                             return SameChromiumIdentity(root, candidate);
+                         })) {
+            return inconclusive_attribution(
+                "a created Edge root was not present in the final attributable "
+                "top-level set",
+                all_windows);
+        }
+    }
+
+    std::vector<RealAppWindowInfo> windows;
+    windows.reserve(all_windows.size());
+    for (const ChromiumWindowInfo& info : all_windows) {
+        RealAppWindowInfo converted;
+        converted.hwnd = info.hwnd;
+        converted.owner = info.owner;
+        converted.title = info.title;
+        converted.class_name = info.class_name;
+        converted.identity = info.identity;
+        windows.push_back(std::move(converted));
+    }
+    const HWND target_hwnd = created_roots.front().hwnd;
+    const HWND sibling_hwnd = created_roots.back().hwnd;
+    auto print_window_snapshot = [&](const RealAppWindowSnapshot& snapshot,
+                                     const char* role) {
+        Field(std::format("  {} HWND", role),
+              std::format("0x{:X}",
+                          reinterpret_cast<uintptr_t>(snapshot.info.hwnd)));
+        Field(std::format("  {} PID", role),
+              std::format("{}", snapshot.info.identity.pid));
+        Field(std::format("  {} process creation", role),
+              snapshot.info.identity.process_creation_time_ok ? "captured"
+                                                              : "unavailable");
+        Field(std::format("  {} title", role),
+              ToUtf8(snapshot.info.title.empty() ? L"(untitled)"
+                                                  : snapshot.info.title));
+        Field(std::format("  {} class", role),
+              ToUtf8(snapshot.info.class_name.empty()
+                         ? L"(unavailable)"
+                         : snapshot.info.class_name));
+        Field(std::format("  {} RECT", role),
+              std::format("({},{})-({},{})", snapshot.rect.left,
+                          snapshot.rect.top, snapshot.rect.right,
+                          snapshot.rect.bottom));
+        Field(std::format("  {} monitor", role),
+              snapshot.monitor != nullptr
+                  ? std::format("0x{:X}",
+                                reinterpret_cast<uintptr_t>(snapshot.monitor))
+                  : "(unavailable)");
+        Field(std::format("  {} desktop", role),
+              snapshot.desktop.desktop_ok
+                  ? GuidToString(snapshot.desktop.desktop)
+                  : "(unavailable)");
+        Field(std::format("  {} on_current", role),
+              snapshot.desktop.on_current_ok
+                  ? (snapshot.desktop.on_current ? "true" : "false")
+                  : "(unavailable)");
+    };
+    auto acquire_view = [&](HWND hwnd, RawObject& out) -> bool {
+        const MethodEntry* method = FindMethod(*views.layout, "GetViewForHwnd");
+        if (method == nullptr) return false;
+        const ULONGLONG deadline = ::GetTickCount64() + 5000;
+        do {
+            PumpStaMessages();
+            Gate gate = Gate::Ok;
+            HRESULT view_hr =
+                InvokeSlot(views.object.Get(), *views.layout, *method, gate,
+                           false, hwnd, out.PutVoid());
+            if (gate == Gate::Ok && SUCCEEDED(view_hr) && out) return true;
+            ::Sleep(25);
+        } while (::GetTickCount64() < deadline);
+        return false;
+    };
+
+    int rc = 0;
+    std::vector<RealAppWindowSnapshot> baseline;
+    baseline.reserve(windows.size());
+    auto fail_precondition = [&](const std::string& reason) {
+        Field("result", "INCONCLUSIVE-PRECONDITION");
+        Field("mutation_started", "no");
+        Field("reason", reason);
+        const bool cleaned = cleanup();
+        rc = cleaned ? kExitInconclusive : 1;
+    };
+
+    for (const RealAppWindowInfo& info : windows) {
+        RealAppWindowSnapshot snapshot;
+        const bool is_top_level = info.hwnd == target_hwnd ||
+                                   info.hwnd == sibling_hwnd;
+        if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
+                                          snapshot)) {
+            Field(std::format("  window 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  is_top_level ? "snapshot FAIL" : "observation unavailable");
+            if (is_top_level) {
+                fail_precondition(
+                    info.hwnd == target_hwnd
+                        ? "required target Chromium snapshot unavailable"
+                        : "required sibling Chromium snapshot unavailable");
+                return rc;
+            }
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+        print_window_snapshot(
+            snapshot, info.hwnd == target_hwnd
+                          ? "target"
+                          : (info.hwnd == sibling_hwnd ? "sibling"
+                                                       : "internal"));
+        if (info.hwnd != target_hwnd && info.hwnd != sibling_hwnd) {
+            Field(std::format("  owned/internal HWND 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  "observation-only; independent IApplicationView not required");
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+
+        if (!acquire_view(info.hwnd, snapshot.view)) {
+            Field(std::format("  view 0x{:X}",
+                              reinterpret_cast<uintptr_t>(info.hwnd)),
+                  info.hwnd == target_hwnd
+                      ? "FAIL (target view unavailable)"
+                      : "observation-only (sibling view unavailable)");
+            if (info.hwnd == target_hwnd) {
+                fail_precondition("required target Chromium view unavailable");
+                return rc;
+            }
+            baseline.push_back(std::move(snapshot));
+            continue;
+        }
+
+        const MethodEntry* can_move =
+            FindMethod(*mi.layout, "CanViewMoveDesktops");
+        Gate gate = Gate::Ok;
+        BOOL can_move_value = FALSE;
+        HRESULT can_hr = E_ABORT;
+        if (can_move != nullptr) {
+            can_hr = InvokeSlot(mi.obj.Get(), *mi.layout, *can_move, gate, false,
+                                 snapshot.view.Get(), &can_move_value);
+        }
+        const bool can_move_ok =
+            gate == Gate::Ok && SUCCEEDED(can_hr) && can_move_value != FALSE;
+        Field(std::format("  CanViewMoveDesktops 0x{:X}",
+                          reinterpret_cast<uintptr_t>(info.hwnd)),
+              can_move_ok ? "TRUE" : "FALSE");
+        if (info.hwnd == target_hwnd && !can_move_ok) {
+            fail_precondition(
+                "required target Chromium view cannot move between desktops");
+            return rc;
+        }
+        baseline.push_back(std::move(snapshot));
+    }
+
+    for (const RealAppWindowSnapshot& snapshot : baseline) {
+        const bool is_root = snapshot.info.hwnd == target_hwnd ||
+                             snapshot.info.hwnd == sibling_hwnd;
+        if (!is_root) continue;
+        if (!IsRealAppWindowOnCarrier(snapshot, carrier.id)) {
+            fail_precondition(
+                snapshot.info.hwnd == target_hwnd
+                    ? "target Chromium window was not initially on Carrier"
+                    : "sibling Chromium window was not initially on Carrier");
+            return rc;
+        }
+    }
+
+    NotifySink* sink = new NotifySink();
+    bool release_sink = true;
+    {
+        NotificationRegistration reg(sp.Get(), sink, confirm_mutate);
+        Field("Register gate", GateText(reg.gate()));
+        Field("Register hr", HrToString(reg.hr()));
+        Field("Register cookie", std::format("{}", reg.cookie()));
+        if (!reg.ok()) {
+            Print("\n  Chromium semantics refused: notification registration "
+                  "failed.\n");
+            rc = 1;
+        } else {
+            Field("watcher STA thread",
+                  std::format("{}", ::GetCurrentThreadId()));
+            PumpStaMessages();
+            std::vector<NotifyEvent> registration_events;
+            DrainAndPrintEvents(sink, 0, registration_events);
+
+            auto target_it = std::find_if(
+                baseline.begin(), baseline.end(),
+                [target_hwnd](const RealAppWindowSnapshot& snapshot) {
+                    return snapshot.info.hwnd == target_hwnd;
+                });
+            if (target_it == baseline.end() || !target_it->view) {
+                Print("\n  Chromium semantics failed: target view snapshot "
+                      "missing.\n");
+                rc = 1;
+            } else {
+                ViewRestoreGuard restore_guard(
+                    mi, target_it->view.Get(), carrier.object.Get(),
+                    confirm_mutate);
+                restore_guard.Arm();
+                WindowMoveObservation outbound = MoveViewAndVerify(
+                    mi, target_it->view.Get(), parking.object.Get(), carrier.id,
+                    parking.id, carrier.id, target_hwnd,
+                    documented_manager.Get(), sink, confirm_mutate);
+
+                std::vector<RealAppWindowSnapshot> current;
+                current.reserve(windows.size());
+                for (const RealAppWindowInfo& info : windows) {
+                    RealAppWindowSnapshot snapshot;
+                    if (!CaptureRealAppWindowSnapshot(
+                            info, documented_manager.Get(), snapshot)) {
+                        Field(std::format("  post-move window 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(info.hwnd)),
+                              (info.hwnd == target_hwnd ||
+                               info.hwnd == sibling_hwnd)
+                                  ? "snapshot unavailable"
+                                  : "observation unavailable");
+                        if (info.hwnd == target_hwnd ||
+                            info.hwnd == sibling_hwnd) {
+                            rc = 1;
+                        }
+                    }
+                    current.push_back(std::move(snapshot));
+                }
+
+                std::vector<HWND> allowed_hwnds;
+                for (const RealAppWindowInfo& info : windows) {
+                    allowed_hwnds.push_back(info.hwnd);
+                }
+                const bool callback_scope_ok =
+                    ViewEventsWithinScope(outbound.events,
+                                          outbound.call_start_qpc,
+                                          allowed_hwnds);
+                const bool callback_contaminated = !callback_scope_ok;
+                bool target_moved = false;
+                bool sibling_moved = false;
+                size_t internal_observable = 0;
+                size_t internal_moved = 0;
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    const bool is_root =
+                        baseline[i].info.hwnd == target_hwnd ||
+                        baseline[i].info.hwnd == sibling_hwnd;
+                    const bool full_observation =
+                        baseline[i].snapshot_ok && current[i].snapshot_ok;
+                    if (!full_observation) {
+                        if (is_root) rc = 1;
+                        continue;
+                    }
+                    const bool moved = IsWindowDesktopAssignmentChanged(
+                        baseline[i], current[i]);
+                    if (baseline[i].info.hwnd == target_hwnd) {
+                        target_moved = moved;
+                    } else if (baseline[i].info.hwnd == sibling_hwnd) {
+                        sibling_moved = moved;
+                    } else {
+                        ++internal_observable;
+                        if (moved) ++internal_moved;
+                    }
+                    const bool identity_ok =
+                        RealAppWindowIdentityUnchanged(baseline[i], current[i]);
+                    const bool owner_ok =
+                        ::GetWindow(current[i].info.hwnd, GW_OWNER) ==
+                        baseline[i].info.owner;
+                    const bool rect_ok =
+                        baseline[i].state_ok && current[i].state_ok &&
+                        SameRect(baseline[i].rect, current[i].rect);
+                    const bool monitor_ok =
+                        baseline[i].monitor == current[i].monitor;
+                    if (is_root && baseline[i].info.hwnd == sibling_hwnd &&
+                        (!identity_ok || !owner_ok || !rect_ok || !monitor_ok)) {
+                        rc = 1;
+                    }
+                    Field(std::format("  window 0x{:X} desktop",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          DesktopRelationText(baseline[i], current[i]));
+                    if (is_root) {
+                        Field(std::format("    identity 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              identity_ok ? "unchanged" : "CHANGED");
+                        Field(std::format("    RECT 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              rect_ok ? "unchanged" : "CHANGED");
+                        Field(std::format("    monitor 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              monitor_ok ? "unchanged" : "CHANGED");
+                    }
+                }
+
+                Field("target moved to Parking", target_moved ? "yes" : "NO");
+                Field("sibling top-level moved",
+                      sibling_moved ? "yes (unexpected)" : "no");
+                Field("internal windows observable",
+                      std::format("{}", internal_observable));
+                Field("internal windows moved",
+                      std::format("{}", internal_moved));
+                Field("callback HWND scope",
+                      callback_scope_ok ? "probe-profile only"
+                                         : "OUT OF SCOPE");
+                Field("observation contamination",
+                      callback_contaminated ? "yes (inconclusive)" : "none");
+                Field("CurrentVirtualDesktopChanged count",
+                      std::format("{}", outbound.current_changed_count));
+                Field("ViewVirtualDesktopChanged target",
+                      outbound.view_callback_ok ? "observed" : "missing");
+
+                const bool target_core =
+                    outbound.move_gate_ok && SUCCEEDED(outbound.move_hr) &&
+                    outbound.observed_current_ok &&
+                    ::IsEqualGUID(outbound.observed_current, carrier.id) &&
+                    outbound.observed_window_ok &&
+                    ::IsEqualGUID(outbound.observed_window.desktop,
+                                  parking.id) &&
+                    !outbound.observed_window.on_current;
+                const bool global_current_ok =
+                    outbound.observed_current_ok &&
+                    outbound.current_changed_count == 0;
+                const bool chromium_pass =
+                    target_core && outbound.view_callback_ok && target_moved &&
+                    !sibling_moved && global_current_ok;
+
+                for (size_t i = 0; i < baseline.size() && i < current.size();
+                     ++i) {
+                    const bool is_root =
+                        baseline[i].info.hwnd == target_hwnd ||
+                        baseline[i].info.hwnd == sibling_hwnd;
+                    if (!is_root ||
+                        !IsWindowDesktopAssignmentChanged(baseline[i],
+                                                           current[i])) {
+                        continue;
+                    }
+                    if (!baseline[i].view) {
+                        if (baseline[i].info.hwnd == sibling_hwnd) {
+                            rc = 1;
+                        }
+                        continue;
+                    }
+                    Gate restore_gate = Gate::Ok;
+                    HRESULT restore_hr = E_ABORT;
+                    const bool restored_window = MoveViewToDesktopAndWait(
+                        mi, baseline[i].view.Get(), carrier.object.Get(),
+                        baseline[i].info.hwnd, documented_manager.Get(),
+                        carrier.id, carrier.id, confirm_mutate, restore_gate,
+                        restore_hr);
+                    Field(std::format("restore 0x{:X}",
+                                      reinterpret_cast<uintptr_t>(
+                                          baseline[i].info.hwnd)),
+                          restored_window ? "PASS" : HrToString(restore_hr));
+                    if (!restored_window) rc = 1;
+                }
+                PumpStaMessages();
+                std::vector<NotifyEvent> restore_events;
+                DrainAndPrintEvents(sink, 0, restore_events);
+
+                bool restored = true;
+                GUID current_desktop{};
+                if (!ReadCurrentDesktopId(mi, current_desktop) ||
+                    !::IsEqualGUID(current_desktop, carrier.id)) {
+                    restored = false;
+                }
+                for (const RealAppWindowSnapshot& snapshot : baseline) {
+                    if (snapshot.info.hwnd != target_hwnd &&
+                        snapshot.info.hwnd != sibling_hwnd) {
+                        continue;
+                    }
+                    WindowDesktopState state;
+                    if (!ReadWindowDesktopState(documented_manager.Get(),
+                                                snapshot.info.hwnd, state) ||
+                        !IsWindowStateOnCarrier(snapshot.info, state, true,
+                                                carrier.id)) {
+                        restored = false;
+                    }
+                }
+                if (!restored) {
+                    Print("  CRITICAL CHROMIUM RESTORE FAILURE\n");
+                    rc = 1;
+                } else {
+                    restore_guard.Disarm();
+                }
+
+                Heading("Chromium semantics verdict");
+                if (!restored || rc != 0) {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                } else if (callback_contaminated) {
+                    Field("result", "INCONCLUSIVE-CONTAMINATED");
+                    Field("GO/NO-GO", "INCONCLUSIVE");
+                    rc = kExitInconclusive;
+                } else if (chromium_pass) {
+                    Field("result", "CHROMIUM-SEMANTICS-OBSERVED");
+                    Field("GO/NO-GO", "GO-WITH-LIMITATIONS");
+                } else {
+                    Field("result", "SEMANTICS-FAILED");
+                    Field("GO/NO-GO", "NO-GO");
+                    rc = 1;
+                }
+                Field("total events observed",
+                      std::format("{}", sink->TotalEventCount()));
+            }
+        }
+
+        if (reg.ok()) {
+            PumpStaMessages();
+            std::vector<NotifyEvent> pre_unregister_events;
+            DrainAndPrintEvents(sink, 0, pre_unregister_events);
+            const HRESULT unregister_hr = reg.UnregisterNow();
+            Field("Unregister gate", GateText(reg.unregister_gate()));
+            Field("Unregister hr", HrToString(unregister_hr));
+            if (FAILED(unregister_hr)) {
+                rc = 1;
+                release_sink = false;
+            }
+            PumpStaMessages();
+            std::vector<NotifyEvent> post_unregister_events;
+            DrainAndPrintEvents(sink, 0, post_unregister_events);
+        }
+    }
+
+    if (release_sink) {
+        sink->Release();
+    } else {
+        Print("  sink retained because Unregister failed; avoiding possible "
+              "late-callback UAF.\n");
+    }
+    const bool cleaned = cleanup();
+    if (!cleaned && rc == 0) {
+        Heading("Chromium semantics cleanup verdict");
+        Field("result", "INCONCLUSIVE-CLEANUP");
+        Field("GO/NO-GO", "INCONCLUSIVE");
+        rc = kExitInconclusive;
+    }
     return rc;
 }
 

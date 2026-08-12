@@ -76,6 +76,12 @@ int CmdRealAppSemanticsTest(bool confirm_mutate);
 // user's shell.
 int CmdExplorerSemanticsTest(bool confirm_mutate);
 
+// Phase 4B-2A: launch one isolated Chromium-family browser profile and
+// characterize two top-level Edge windows with one Carrier -> Parking move.
+// The first milestone supports only `--browser edge`; it never touches an
+// existing browser profile or terminates an existing browser process.
+int CmdChromiumSemanticsTest(const std::string& browser, bool confirm_mutate);
+
 // Internal child-process mode used only by CmdRealAppSemanticsTest.  It creates
 // controlled ordinary Win32 windows and is not part of the public probe
 // surface.
