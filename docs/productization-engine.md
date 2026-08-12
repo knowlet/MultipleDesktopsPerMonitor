@@ -132,11 +132,15 @@ generation changes are recorded as recreation. `PreparePresentationRestore()`
 emits placement, Z-order, and foreground operations only when the snapshot is
  complete, managed, capability-safe, and identity-consistent.
 
-The read-only `window_discovery.{h,cpp}` layer is the next productization
-boundary. Its `WindowDiscoveryBackend` accepts complete HWND enumeration and
-per-window observation callbacks, so platform-specific identity, monitor,
-desktop-role, presentation, and `IApplicationView` capability reads remain
-outside the state model. `WindowDiscovery::Discover()` sorts and validates a
+The read-only `window_discovery.{h,cpp}` layer now implements the next
+productization boundary. `CreateSystemWindowDiscoveryBackend()` supplies
+complete `EnumWindows` enumeration plus documented identity, monitor,
+owner/style, presentation, foreground/Z-order, DWM-cloak, and
+`IVirtualDesktopManager` observations. An injectable
+`CreateWin32WindowDiscoveryBackend()` seam keeps the platform reads testable,
+while optional `IApplicationView` capability augmentation can establish only
+`has_application_view` and `can_move_desktops`; it cannot relax the documented
+HWND safety checks. `WindowDiscovery::Discover()` sorts and validates a
 complete snapshot, rejects duplicate HWNDs or generations, and leaves the
 previous result unchanged on observation failure or callback exception. It
 classifies only proven Carrier/Parking top-level records as `Managed`;
@@ -149,10 +153,12 @@ state, or branch on executable names. Run:
 .\build\vdprobe.exe workspace-discovery-test
 ```
 
-This deterministic test covers managed/unsupported/ambiguous classification,
-incomplete and duplicate enumeration, tool/ownership limits, invalid native
-roles, and enumeration/observation exception containment. A live all-window
-discovery adapter and assignment policy remain separate milestones.
+This deterministic test covers the injected backend and managed/unsupported/
+ambiguous classification, incomplete and duplicate enumeration, tool/ownership
+limits, invalid native roles, HWND-generation changes, and enumeration/
+observation exception containment. The system backend is read-only and ready
+for caller integration, but production coordinator wiring, assignment policy,
+and lifecycle-driven rescan remain separate milestones.
 
 ## Deliberate next boundaries
 

@@ -1,10 +1,16 @@
 #include "window_discovery.h"
 
+#include <shobjidl.h>
+
 #include <algorithm>
+#include <format>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
+#include "comraw.h"
 #include "util.h"
+#include "vdids.h"
 
 namespace vd {
 
@@ -17,6 +23,200 @@ bool IsZeroGuid(const GUID& id) {
 
 bool SameIdentity(const WindowIdentity& a, const WindowIdentity& b) {
     return a == b;
+}
+
+bool SameGuid(const GUID& a, const GUID& b) {
+    return ::IsEqualGUID(a, b) != FALSE;
+}
+
+std::string Win32Error(const char* operation, DWORD error) {
+    return std::format("{} failed (Win32 {})", operation, error);
+}
+
+bool ReadWindowLong(HWND hwnd, int index, LONG_PTR& value) {
+    ::SetLastError(ERROR_SUCCESS);
+    value = ::GetWindowLongPtrW(hwnd, index);
+    return value != 0 || ::GetLastError() == ERROR_SUCCESS;
+}
+
+using DwmGetWindowAttributeFn =
+    HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
+
+bool TryReadCloaked(HWND hwnd, DWORD& cloaked) {
+    static const auto get_attribute = [] {
+        HMODULE module = ::GetModuleHandleW(L"dwmapi.dll");
+        if (module == nullptr) module = ::LoadLibraryW(L"dwmapi.dll");
+        return module == nullptr
+                   ? nullptr
+                   : reinterpret_cast<DwmGetWindowAttributeFn>(
+                         ::GetProcAddress(module, "DwmGetWindowAttribute"));
+    }();
+    constexpr DWORD kDwmwaCloaked = 14;
+    cloaked = 0;
+    return get_attribute != nullptr &&
+           SUCCEEDED(get_attribute(hwnd, kDwmwaCloaked, &cloaked,
+                                   sizeof(cloaked)));
+}
+
+struct EnumContext {
+    std::vector<HWND>* handles = nullptr;
+    bool allocation_failed = false;
+};
+
+BOOL CALLBACK CollectTopLevelWindow(HWND hwnd, LPARAM parameter) {
+    auto* context = reinterpret_cast<EnumContext*>(parameter);
+    try {
+        context->handles->push_back(hwnd);
+        return TRUE;
+    } catch (...) {
+        context->allocation_failed = true;
+        ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+}
+
+Win32WindowDiscoveryApi MakeSystemApi(std::string* error) {
+    Win32WindowDiscoveryApi api;
+
+    auto manager = std::make_shared<Com<IVirtualDesktopManager>>();
+    const HRESULT hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+        IID_IVirtualDesktopManager, manager->PutVoid());
+    if (FAILED(hr)) {
+        if (error != nullptr) {
+            *error = std::format(
+                "documented IVirtualDesktopManager unavailable ({})",
+                HrToString(hr));
+        }
+        return api;
+    }
+
+    api.enumerate = [](std::vector<HWND>& handles, std::string* local_error) {
+        handles.clear();
+        EnumContext context{&handles, false};
+        ::SetLastError(ERROR_SUCCESS);
+        if (!::EnumWindows(CollectTopLevelWindow,
+                           reinterpret_cast<LPARAM>(&context))) {
+            const DWORD code = ::GetLastError();
+            if (local_error != nullptr) {
+                *local_error = context.allocation_failed
+                                   ? "EnumWindows result allocation failed"
+                                   : Win32Error("EnumWindows", code);
+            }
+            return false;
+        }
+        return true;
+    };
+
+    api.read_identity = [](HWND hwnd, WindowIdentity& identity,
+                           std::string* local_error) {
+        identity = {};
+        if (hwnd == nullptr || !::IsWindow(hwnd)) {
+            if (local_error != nullptr) *local_error = "HWND no longer exists";
+            return false;
+        }
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == 0) {
+            if (local_error != nullptr) {
+                *local_error = "GetWindowThreadProcessId returned no PID";
+            }
+            return false;
+        }
+        HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, pid);
+        if (process == nullptr) {
+            if (local_error != nullptr) {
+                *local_error = Win32Error("OpenProcess", ::GetLastError());
+            }
+            return false;
+        }
+        FILETIME exit_time{};
+        FILETIME kernel_time{};
+        FILETIME user_time{};
+        FILETIME creation_time{};
+        const BOOL times_ok = ::GetProcessTimes(
+            process, &creation_time, &exit_time, &kernel_time, &user_time);
+        const DWORD times_error = times_ok ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(process);
+
+        DWORD revalidated_pid = 0;
+        ::GetWindowThreadProcessId(hwnd, &revalidated_pid);
+        if (!times_ok || !::IsWindow(hwnd) || revalidated_pid != pid) {
+            if (local_error != nullptr) {
+                *local_error = times_ok
+                                   ? "HWND identity changed during observation"
+                                   : Win32Error("GetProcessTimes",
+                                                times_error);
+            }
+            return false;
+        }
+        identity.hwnd = hwnd;
+        identity.pid = pid;
+        identity.process_creation_time = creation_time;
+        identity.process_creation_time_ok = true;
+        return true;
+    };
+
+    api.read_window = [](HWND hwnd, Win32WindowObservation& observation,
+                         std::string* local_error) {
+        observation = {};
+        LONG_PTR style = 0;
+        LONG_PTR extended_style = 0;
+        if (!::IsWindow(hwnd) || !ReadWindowLong(hwnd, GWL_STYLE, style) ||
+            !ReadWindowLong(hwnd, GWL_EXSTYLE, extended_style)) {
+            if (local_error != nullptr) {
+                *local_error = "window style unavailable or HWND vanished";
+            }
+            return false;
+        }
+        observation.owner = ::GetWindow(hwnd, GW_OWNER);
+        observation.child = (style & WS_CHILD) != 0;
+        observation.visible = ::IsWindowVisible(hwnd) != FALSE;
+        observation.tool_window = (extended_style & WS_EX_TOOLWINDOW) != 0;
+        observation.monitor =
+            ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        observation.cloaked_ok =
+            TryReadCloaked(hwnd, observation.cloaked);
+
+        observation.presentation.rect_valid =
+            ::GetWindowRect(hwnd, &observation.presentation.rect) != FALSE;
+        observation.presentation.placement.length = sizeof(WINDOWPLACEMENT);
+        observation.presentation.placement_valid =
+            ::GetWindowPlacement(hwnd,
+                                 &observation.presentation.placement) != FALSE;
+        observation.presentation.foreground =
+            ::GetForegroundWindow() == hwnd;
+        // EnumWindows is ordered top-to-bottom, but WindowDiscovery sorts the
+        // complete HWND set for deterministic validation.  Reconstruct a
+        // bounded relative rank using documented GW_HWNDPREV reads.
+        constexpr std::int64_t kMaxZOrderWalk = 10000;
+        HWND previous = hwnd;
+        while (observation.presentation.z_order < kMaxZOrderWalk &&
+               (previous = ::GetWindow(previous, GW_HWNDPREV)) != nullptr) {
+            ++observation.presentation.z_order;
+        }
+        return true;
+    };
+
+    api.read_desktop =
+        [manager](HWND hwnd, Win32DesktopObservation& observation,
+                  std::string*) {
+            observation = {};
+            const HRESULT desktop_hr =
+                (*manager)->GetWindowDesktopId(hwnd, &observation.desktop);
+            observation.desktop_ok = SUCCEEDED(desktop_hr);
+            BOOL on_current = FALSE;
+            const HRESULT current_hr =
+                (*manager)->IsWindowOnCurrentVirtualDesktop(hwnd, &on_current);
+            observation.on_current_ok = SUCCEEDED(current_hr);
+            observation.on_current = on_current != FALSE;
+            // Per-HWND failures are observations, not an incomplete scan.  In
+            // particular, Shell-owned helper HWNDs need not expose a desktop.
+            return true;
+        };
+    return api;
 }
 
 WindowDisposition Classify(const WindowDiscoveryObservation& observation) {
@@ -58,6 +258,118 @@ bool HasDuplicateIdentity(const std::vector<DiscoveredWindow>& windows,
 }
 
 }  // namespace
+
+std::optional<WindowDiscoveryBackend> CreateWin32WindowDiscoveryBackend(
+    Win32WindowDiscoveryOptions options, Win32WindowDiscoveryApi api,
+    std::string* error) {
+    if (error != nullptr) *error = {};
+    if (!api.enumerate || !api.read_identity || !api.read_window ||
+        !api.read_desktop) {
+        if (error != nullptr) {
+            *error = "Win32 discovery API is missing a required read callback";
+        }
+        return std::nullopt;
+    }
+    if (IsZeroGuid(options.carrier) || IsZeroGuid(options.parking) ||
+        SameGuid(options.carrier, options.parking)) {
+        if (error != nullptr) {
+            *error = "Carrier and Parking must be distinct non-null GUIDs";
+        }
+        return std::nullopt;
+    }
+
+    auto shared_api = std::make_shared<Win32WindowDiscoveryApi>(std::move(api));
+    auto shared_options =
+        std::make_shared<Win32WindowDiscoveryOptions>(std::move(options));
+    WindowDiscoveryBackend backend(
+        [shared_api](std::vector<HWND>& handles, bool& complete,
+                     std::string* local_error) {
+            complete = false;
+            if (!shared_api->enumerate(handles, local_error)) return false;
+            complete = true;
+            return true;
+        },
+        [shared_api, shared_options](HWND hwnd,
+                                     WindowDiscoveryObservation& observation,
+                                     std::string* local_error) {
+            observation = {};
+            WindowIdentity identity;
+            Win32WindowObservation window;
+            Win32DesktopObservation desktop;
+            if (!shared_api->read_identity(hwnd, identity, local_error) ||
+                !shared_api->read_window(hwnd, window, local_error) ||
+                !shared_api->read_desktop(hwnd, desktop, local_error)) {
+                return false;
+            }
+
+            observation.identity = identity;
+            observation.monitor = window.monitor;
+            observation.owner = window.owner;
+            observation.child = window.child;
+            observation.visible = window.visible;
+            observation.cloaked = window.cloaked;
+            observation.cloaked_ok = window.cloaked_ok;
+            observation.tool_window = window.tool_window;
+            observation.desktop = desktop.desktop;
+            observation.desktop_ok = desktop.desktop_ok;
+            observation.on_current = desktop.on_current;
+            observation.on_current_ok = desktop.on_current_ok;
+            observation.presentation = window.presentation;
+
+            observation.capabilities.independent_top_level =
+                !window.child && window.owner == nullptr &&
+                !window.tool_window;
+            observation.capabilities.desktop_state_observable =
+                desktop.desktop_ok && desktop.on_current_ok;
+            observation.capabilities.owner_state_observable =
+                window.owner == nullptr;
+
+            if (desktop.desktop_ok &&
+                SameGuid(desktop.desktop, shared_options->carrier)) {
+                observation.native_role = NativeDesktopRole::Carrier;
+            } else if (desktop.desktop_ok &&
+                       SameGuid(desktop.desktop, shared_options->parking)) {
+                observation.native_role = NativeDesktopRole::Parking;
+            }
+
+            if (shared_options->augment_capabilities) {
+                WindowCapabilities augmented = observation.capabilities;
+                if (!shared_options->augment_capabilities(
+                        hwnd, observation, augmented, local_error)) {
+                    return false;
+                }
+                // The private augmentation may establish only private Shell
+                // capability.  It cannot relax the documented HWND safety
+                // classification derived above.
+                observation.capabilities.has_application_view =
+                    augmented.has_application_view;
+                observation.capabilities.can_move_desktops =
+                    augmented.can_move_desktops;
+            }
+
+            WindowIdentity revalidated_identity;
+            if (!shared_api->read_identity(hwnd, revalidated_identity,
+                                           local_error) ||
+                revalidated_identity != identity) {
+                if (local_error != nullptr && local_error->empty()) {
+                    *local_error =
+                        "HWND identity changed during complete observation";
+                }
+                return false;
+            }
+            return true;
+        });
+    return backend;
+}
+
+std::optional<WindowDiscoveryBackend> CreateSystemWindowDiscoveryBackend(
+    Win32WindowDiscoveryOptions options, std::string* error) {
+    if (error != nullptr) *error = {};
+    Win32WindowDiscoveryApi api = MakeSystemApi(error);
+    if (!api.enumerate) return std::nullopt;
+    return CreateWin32WindowDiscoveryBackend(std::move(options),
+                                              std::move(api), error);
+}
 
 bool WindowDiscoveryBackend::EnumerateWindows(
     std::vector<HWND>& handles, bool& complete, std::string* error) const {
@@ -157,9 +469,13 @@ bool WindowDiscovery::Discover(std::vector<DiscoveredWindow>& out,
         discovered.owner = observation.owner;
         discovered.child = observation.child;
         discovered.visible = observation.visible;
+        discovered.cloaked = observation.cloaked;
+        discovered.cloaked_ok = observation.cloaked_ok;
         discovered.tool_window = observation.tool_window;
         discovered.desktop = observation.desktop;
         discovered.desktop_ok = observation.desktop_ok;
+        discovered.on_current = observation.on_current;
+        discovered.on_current_ok = observation.on_current_ok;
         discovered.native_role = observation.native_role;
         discovered.capabilities = observation.capabilities;
         discovered.presentation = observation.presentation;
@@ -312,6 +628,136 @@ int CmdWorkspaceDiscoveryTest() {
     Field("tool/owner-unobservable unsupported",
           tool_rejected ? "PASS" : "FAIL");
     ok = ok && tool_rejected;
+
+    GUID parking{};
+    parking.Data1 = 0x20;
+    std::size_t identity_reads = 0;
+    std::size_t augment_calls = 0;
+    Win32WindowDiscoveryApi win32_api;
+    win32_api.enumerate =
+        [managed_id](std::vector<HWND>& out, std::string*) {
+            out = {managed_id.hwnd};
+            return true;
+        };
+    win32_api.read_identity =
+        [managed_id, &identity_reads](HWND, WindowIdentity& out,
+                                      std::string*) {
+            ++identity_reads;
+            out = managed_id;
+            return true;
+        };
+    win32_api.read_window =
+        [](HWND, Win32WindowObservation& out, std::string*) {
+            out.monitor = reinterpret_cast<HMONITOR>(0x100);
+            out.visible = true;
+            out.cloaked = 0;
+            out.cloaked_ok = true;
+            out.presentation.rect = {10, 20, 210, 220};
+            out.presentation.rect_valid = true;
+            out.presentation.placement.length = sizeof(WINDOWPLACEMENT);
+            out.presentation.placement_valid = true;
+            out.presentation.foreground = true;
+            out.presentation.z_order = 3;
+            return true;
+        };
+    win32_api.read_desktop =
+        [carrier](HWND, Win32DesktopObservation& out, std::string*) {
+            out.desktop = carrier;
+            out.desktop_ok = true;
+            out.on_current = true;
+            out.on_current_ok = true;
+            return true;
+        };
+    Win32WindowDiscoveryOptions win32_options;
+    win32_options.carrier = carrier;
+    win32_options.parking = parking;
+    win32_options.augment_capabilities =
+        [&augment_calls](HWND, const WindowDiscoveryObservation&,
+                         WindowCapabilities& capabilities, std::string*) {
+            ++augment_calls;
+            capabilities.has_application_view = true;
+            capabilities.can_move_desktops = true;
+            // These unsafe overrides must be ignored by the factory.
+            capabilities.independent_top_level = false;
+            capabilities.desktop_state_observable = false;
+            capabilities.owner_state_observable = false;
+            return true;
+        };
+    error.clear();
+    auto win32_backend = CreateWin32WindowDiscoveryBackend(
+        std::move(win32_options), std::move(win32_api), &error);
+    bool win32_seam_ok = win32_backend.has_value();
+    if (win32_backend) {
+        WindowDiscovery win32_discovery(std::move(*win32_backend));
+        std::vector<DiscoveredWindow> live_like;
+        win32_seam_ok = win32_discovery.Discover(live_like, &error) &&
+                        live_like.size() == 1 &&
+                        live_like[0].disposition == WindowDisposition::Managed &&
+                        live_like[0].on_current_ok &&
+                        live_like[0].on_current &&
+                        live_like[0].cloaked_ok &&
+                        live_like[0].presentation.rect_valid &&
+                        live_like[0].presentation.placement_valid &&
+                        live_like[0].presentation.foreground &&
+                        live_like[0].presentation.z_order == 3 &&
+                        identity_reads == 2 && augment_calls == 1;
+    }
+    Field("Win32 backend seam/classification",
+          win32_seam_ok ? "PASS" : "FAIL");
+    ok = ok && win32_seam_ok;
+
+    WindowIdentity changed_id = managed_id;
+    changed_id.process_creation_time.dwLowDateTime++;
+    Win32WindowDiscoveryApi reuse_api;
+    reuse_api.enumerate =
+        [managed_id](std::vector<HWND>& out, std::string*) {
+            out = {managed_id.hwnd};
+            return true;
+        };
+    std::size_t reuse_reads = 0;
+    reuse_api.read_identity =
+        [managed_id, changed_id, &reuse_reads](HWND, WindowIdentity& out,
+                                               std::string*) {
+            out = reuse_reads++ == 0 ? managed_id : changed_id;
+            return true;
+        };
+    reuse_api.read_window =
+        [](HWND, Win32WindowObservation& out, std::string*) {
+            out.monitor = reinterpret_cast<HMONITOR>(0x100);
+            return true;
+        };
+    reuse_api.read_desktop =
+        [carrier](HWND, Win32DesktopObservation& out, std::string*) {
+            out.desktop = carrier;
+            out.desktop_ok = true;
+            out.on_current_ok = true;
+            out.on_current = true;
+            return true;
+        };
+    Win32WindowDiscoveryOptions reuse_options;
+    reuse_options.carrier = carrier;
+    reuse_options.parking = parking;
+    auto reuse_backend = CreateWin32WindowDiscoveryBackend(
+        std::move(reuse_options), std::move(reuse_api));
+    const std::vector<DiscoveredWindow> before_reuse = windows;
+    error.clear();
+    bool reuse_rejected = reuse_backend.has_value();
+    if (reuse_backend) {
+        WindowDiscovery reuse_discovery(std::move(*reuse_backend));
+        reuse_rejected = !reuse_discovery.Discover(windows, &error) &&
+                         windows.size() == before_reuse.size() &&
+                         std::equal(
+                             windows.begin(), windows.end(),
+                             before_reuse.begin(),
+                             [](const DiscoveredWindow& left,
+                                const DiscoveredWindow& right) {
+                                 return left.identity == right.identity &&
+                                        left.disposition == right.disposition;
+                             });
+    }
+    Field("HWND generation change fail-closed",
+          reuse_rejected ? "PASS" : "FAIL");
+    ok = ok && reuse_rejected;
 
     WindowDiscovery invalid_role(
         WindowDiscoveryBackend(

@@ -208,17 +208,18 @@ window-object
 WinEvent hints for owner-thread draining; native destroy hints remain
 non-authoritative and require a complete snapshot before model closure.
 The new `window_discovery.{h,cpp}` boundary performs complete, deterministic
-read-only discovery through injected enumeration/observation callbacks. It
-captures generation-safe HWND identity, monitor/owner/tool state, documented
-desktop role, presentation, and runtime capabilities, then classifies records
-as `Managed`, `Unsupported`, or `Ambiguous` without assigning logical
+read-only discovery and now also exposes a system backend built from
+`EnumWindows`, generation-safe HWND identity, documented desktop/presentation
+reads, and optional capability augmentation. It captures monitor/owner/tool
+state, desktop role, presentation, and runtime capabilities, then classifies
+records as `Managed`, `Unsupported`, or `Ambiguous` without assigning logical
 workspaces or using executable names. Incomplete enumeration, duplicate
 identity, unstable observation, invalid desktop role, or backend exceptions
 fail closed and preserve the prior snapshot. `workspace-discovery-test`
-exercises this boundary without COM or native mutation; it is an injectable
-classification seam, not yet a live all-window production enumerator.
-Production lifecycle wiring, durable journal/bootstrap policy, production
-focus/Z-order policy, and UI integration remain separate milestones.
+exercises the injected seam without COM or native mutation; the system backend
+is ready for caller integration but is not yet wired into the long-running
+coordinator. Production assignment/lifecycle policy, durable journal/bootstrap
+policy, focus/Z-order execution, and UI integration remain separate milestones.
 
 The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
