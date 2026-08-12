@@ -36,6 +36,11 @@ struct LifecycleReconcileResult {
     DiscoveryReconcileResult discovery{};
 };
 
+struct WindowLifecycleBatch {
+    std::vector<WindowLifecycleEvent> events;
+    bool overflowed = false;
+};
+
 enum class LifecycleApplyResult {
     Added,
     Updated,
@@ -102,6 +107,10 @@ class WinEventLifecycleSource {
     bool shutdown_ok() const noexcept { return shutdown_ok_; }
     bool queue_overflowed() const noexcept { return queue_overflowed_; }
     std::vector<WindowLifecycleEvent> Drain();
+    // Atomically drains queued hints and consumes the sticky overflow flag.
+    // Coordinators should prefer this over separately reading queue_overflowed()
+    // and Drain(), which cannot form one observation boundary.
+    WindowLifecycleBatch DrainBatch();
 
     // Accepts an already-normalized hint. Useful to join other read-only
     // discovery sources to the same owner-thread drain boundary.

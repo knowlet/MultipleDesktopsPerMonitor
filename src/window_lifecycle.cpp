@@ -236,11 +236,17 @@ void WinEventLifecycleSource::Stop() noexcept {
 }
 
 std::vector<WindowLifecycleEvent> WinEventLifecycleSource::Drain() {
+    return DrainBatch().events;
+}
+
+WindowLifecycleBatch WinEventLifecycleSource::DrainBatch() {
     std::lock_guard lock(queue_mutex_);
-    std::vector<WindowLifecycleEvent> result;
-    result.reserve(queue_.size());
+    WindowLifecycleBatch result;
+    result.overflowed = queue_overflowed_;
+    queue_overflowed_ = false;
+    result.events.reserve(queue_.size());
     while (!queue_.empty()) {
-        result.push_back(std::move(queue_.front()));
+        result.events.push_back(std::move(queue_.front()));
         queue_.pop_front();
     }
     return result;
