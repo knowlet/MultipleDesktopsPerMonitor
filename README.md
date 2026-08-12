@@ -189,9 +189,12 @@ The first productization core is in
 runtime `WindowCapabilities`, rejects unsupported/ambiguous affected windows,
 and provides a callback-based switch transaction with rollback and optional
 journal recovery. Run `workspace-engine-test` for deterministic, non-mutating
-evidence. Live HWND discovery, `IApplicationView` movement, WinEvent lifecycle
-tracking, focus/Z-order restoration, and UI integration remain separate
-milestones.
+evidence. The controlled `logical-workspace-test` is now the first live use of
+that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
+`GetViewForHwnd` resolution before each move, and verifies the callback-backed
+transaction against live desktop state. Automatic WinEvent lifecycle tracking,
+focus/Z-order restoration, durable journal policy, and UI integration remain
+separate milestones.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

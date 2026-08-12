@@ -17,7 +17,9 @@ capability-driven; it must not grow an executable whitelist.
 ## Engine milestone
 
 `src/workspace_engine.{h,cpp}` contains the first non-mutating productization
-core. It keeps logical workspace identity separate from native desktop GUIDs:
+core. The core itself invokes no native shell calls; its first live use is the
+callback-backed `logical-workspace-test` adapter. It keeps logical workspace
+identity separate from native desktop GUIDs:
 
 ```text
 HMONITOR/MonitorId × WorkspaceId -> logical ownership
@@ -87,22 +89,29 @@ currently verifies:
 - close and recreate lifecycle;
 - unsupported capability fail-closed behavior;
 - interrupted transaction recovery.
+- durable journal `BEGIN` replacement and terminal-marker flushing.
 
 All checks passed on August 12, 2026 after the engine was added.
 
 ## Deliberate next boundaries
 
-The engine is not yet the user-facing workspace manager. The following still
-need live integration and evidence:
+The controlled `logical-workspace-test` now provides first live integration
+evidence: it captures three vdprobe-owned top-level HWNDs, resolves and
+re-resolves `IApplicationView` with `GetViewForHwnd`, supplies
+identity-checked move/observe callbacks to `WorkspaceEngine`, and verifies the
+transaction with notification events and documented desktop state. It is not
+yet the user-facing workspace manager. Remaining work is:
 
-- discovery through top-level HWND enumeration and `GetViewForHwnd`;
-- a live move/observe adapter around `IApplicationView`;
 - `SetWinEventHook` lifecycle tracking;
 - focus and Z-order restoration;
-- durable crash journal placement and startup recovery policy;
+- durable crash-journal placement and startup recovery policy;
 - minimal hotkey/UI integration.
+
+The live command was also attempted on the current host. `GetImmersiveShell`
+returned `E_ACCESSDENIED` before any probe window was spawned, so the command
+reported `ENVIRONMENT-BLOCKED`, `mutation_started = no`, and exit status `77`.
+That is an environment limitation, not a logical-workspace semantics result.
 
 These layers should call the capability-driven engine and preserve its
 fail-closed behavior. They should not add app-name branches unless a concrete
 runtime anomaly demonstrates that a capability is insufficient.
-
