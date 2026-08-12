@@ -1264,6 +1264,7 @@ struct RealAppWindowSnapshot {
     HMONITOR monitor = nullptr;
     WindowDesktopState desktop{};
     bool state_ok = false;
+    bool snapshot_ok = false;
 };
 
 bool CaptureRealAppWindowSnapshot(const RealAppWindowInfo& info,
@@ -1275,8 +1276,10 @@ bool CaptureRealAppWindowSnapshot(const RealAppWindowInfo& info,
     out.state_ok =
         ReadWindowDesktopState(documented_manager, info.hwnd, out.desktop) &&
         ::GetWindowRect(info.hwnd, &out.rect);
-    return out.state_ok && out.monitor != nullptr &&
-           ::GetWindow(info.hwnd, GW_OWNER) == info.owner;
+    out.snapshot_ok =
+        out.state_ok && out.monitor != nullptr &&
+        ::GetWindow(info.hwnd, GW_OWNER) == info.owner;
+    return out.snapshot_ok;
 }
 
 bool RealAppWindowIdentityUnchanged(const RealAppWindowSnapshot& baseline,
@@ -4125,19 +4128,32 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
     std::vector<RealAppWindowSnapshot> baseline;
     baseline.reserve(windows.size());
     int rc = 0;
+    bool precondition_failed = false;
+    std::string precondition_reason;
+    auto fail_precondition = [&](std::string reason) {
+        rc = 1;
+        precondition_failed = true;
+        if (precondition_reason.empty()) {
+            precondition_reason = std::move(reason);
+        }
+    };
     for (const RealAppWindowInfo& info : windows) {
         RealAppWindowSnapshot snapshot;
+        const bool is_owned = info.owner != nullptr;
+        const bool is_target = info.hwnd == target_hwnd;
         if (!CaptureRealAppWindowSnapshot(info, documented_manager.Get(),
                                           snapshot)) {
             Field(std::format("  window 0x{:X}",
                               reinterpret_cast<uintptr_t>(info.hwnd)),
-                  "snapshot FAIL");
-            rc = 1;
+                  is_owned ? "observation unavailable" : "snapshot FAIL");
+            if (!is_owned) {
+                fail_precondition(is_target
+                                      ? "required target Explorer snapshot unavailable"
+                                      : "required sibling Explorer snapshot unavailable");
+            }
             baseline.push_back(std::move(snapshot));
             continue;
         }
-        const bool is_owned = info.owner != nullptr;
-        const bool is_target = info.hwnd == target_hwnd;
         if (is_owned) {
             Field(std::format("  owned Explorer window 0x{:X}",
                               reinterpret_cast<uintptr_t>(info.hwnd)),
@@ -4150,7 +4166,9 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                               reinterpret_cast<uintptr_t>(info.hwnd)),
                   is_target ? "FAIL (target view unavailable)"
                             : "observation-only (sibling view unavailable)");
-            if (is_target) rc = 1;
+            if (is_target) {
+                fail_precondition("required target Explorer view unavailable");
+            }
             baseline.push_back(std::move(snapshot));
             continue;
         }
@@ -4168,19 +4186,46 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
         Field(std::format("  CanViewMoveDesktops 0x{:X}",
                           reinterpret_cast<uintptr_t>(info.hwnd)),
               can_move_ok ? "TRUE" : "FALSE");
-        if (is_target && !can_move_ok) rc = 1;
+        if (is_target && !can_move_ok) {
+            fail_precondition(
+                "required target Explorer view cannot move between desktops");
+        }
         baseline.push_back(std::move(snapshot));
     }
 
-    if (baseline.size() != windows.size()) rc = 1;
+    if (baseline.size() != windows.size()) {
+        fail_precondition("required Explorer window baseline is incomplete");
+    }
     if (rc == 0) {
         for (const RealAppWindowSnapshot& snapshot : baseline) {
+            if (snapshot.info.owner != nullptr && !snapshot.snapshot_ok) {
+                Field(std::format("  initial native state 0x{:X}",
+                                  reinterpret_cast<uintptr_t>(
+                                      snapshot.info.hwnd)),
+                      "observation unavailable");
+                continue;
+            }
             if (!IsRealAppWindowOnCarrier(snapshot, carrier.id)) {
                 Field("initial native state", "FAIL (not all on Carrier)");
-                rc = 1;
+                fail_precondition(
+                    snapshot.info.owner != nullptr
+                        ? "an observable owned Explorer window was not on Carrier"
+                        : (snapshot.info.hwnd == target_hwnd
+                               ? "target Explorer window was not on Carrier"
+                               : "sibling Explorer window was not on Carrier"));
                 break;
             }
         }
+    }
+
+    if (precondition_failed) {
+        Field("result", "INCONCLUSIVE-PRECONDITION");
+        Field("mutation_started", "no");
+        Field("reason", precondition_reason.empty()
+                            ? "required Explorer observation unavailable"
+                            : precondition_reason);
+        const bool closed = cleanup();
+        return closed ? kExitInconclusive : 1;
     }
 
     NotifySink* sink = new NotifySink();
@@ -4225,7 +4270,13 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                     if (!CaptureRealAppWindowSnapshot(info,
                                                       documented_manager.Get(),
                                                       snapshot)) {
-                        rc = 1;
+                        Field(std::format("  post-move window 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(info.hwnd)),
+                              info.owner != nullptr ? "observation unavailable"
+                                                    : "snapshot unavailable");
+                        if (info.owner == nullptr) {
+                            rc = 1;
+                        }
                     }
                     current.push_back(std::move(snapshot));
                 }
@@ -4240,12 +4291,31 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                                           allowed_hwnds);
                 const bool callback_contaminated = !callback_scope_ok;
                 std::vector<HWND> moved_windows;
+                size_t owned_observable_count = 0;
+                size_t owned_moved_count = 0;
                 for (size_t i = 0; i < baseline.size() && i < current.size();
                      ++i) {
-                    if (IsWindowDesktopAssignmentChanged(baseline[i],
-                                                          current[i])) {
+                    const bool is_owned = baseline[i].info.owner != nullptr;
+                    const bool full_observation =
+                        baseline[i].snapshot_ok && current[i].snapshot_ok;
+                    if (!full_observation) {
+                        Field(std::format("  window 0x{:X} desktop",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              is_owned ? "observation unavailable"
+                                       : "snapshot unavailable");
+                        if (!is_owned) {
+                            rc = 1;
+                        }
+                        continue;
+                    }
+                    if (is_owned) ++owned_observable_count;
+                    const bool moved = IsWindowDesktopAssignmentChanged(
+                        baseline[i], current[i]);
+                    if (moved) {
                         moved_windows.push_back(baseline[i].info.hwnd);
                     }
+                    if (is_owned && moved) ++owned_moved_count;
                     const bool identity_ok =
                         RealAppWindowIdentityUnchanged(baseline[i], current[i]);
                     const bool owner_ok =
@@ -4276,7 +4346,9 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                                       reinterpret_cast<uintptr_t>(
                                           baseline[i].info.hwnd)),
                           monitor_ok ? "unchanged" : "CHANGED");
-                    if (!identity_ok || !owner_ok || !rect_ok || !monitor_ok) {
+                    if (!is_owned &&
+                        (!identity_ok || !owner_ok || !rect_ok ||
+                         !monitor_ok)) {
                         rc = 1;
                     }
                 }
@@ -4287,20 +4359,25 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                 const bool sibling_moved =
                     std::find(moved_windows.begin(), moved_windows.end(),
                               sibling_hwnd) != moved_windows.end();
-                bool owned_moved = false;
-                for (const RealAppWindowInfo& info : owned) {
-                    owned_moved =
-                        owned_moved ||
-                        std::find(moved_windows.begin(), moved_windows.end(),
-                                  info.hwnd) != moved_windows.end();
-                }
+                const std::string owned_semantics =
+                    owned.empty()
+                        ? "none-observed"
+                        : owned_observable_count == 0
+                            ? "unavailable"
+                            : owned_observable_count < owned.size()
+                                ? "partially-observed"
+                                : owned_moved_count != 0
+                                    ? "grouped"
+                                    : "independent";
                 Field("  target moved to Parking", target_moved ? "yes" : "NO");
                 Field("  sibling top-level moved",
                       sibling_moved ? "yes (unexpected)" : "no");
-                Field("  owned popup moved with owner",
-                      owned.empty() ? "none observed"
-                                    : (owned_moved ? "yes (grouped)"
-                                                   : "no (independent)"));
+                Field("  owned windows total", std::format("{}", owned.size()));
+                Field("  owned windows observable",
+                      std::format("{}", owned_observable_count));
+                Field("  owned windows moved",
+                      std::format("{}", owned_moved_count));
+                Field("  owned window semantics", owned_semantics);
                 Field("  callback HWND scope",
                       callback_scope_ok ? "probe-owned only" : "OUT OF SCOPE");
                 Field("  observation contamination",
@@ -4326,8 +4403,17 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
 
                 for (size_t i = 0; i < baseline.size() && i < current.size();
                      ++i) {
-                    if (!baseline[i].state_ok || !current[i].state_ok) {
-                        rc = 1;
+                    const bool is_owned = baseline[i].info.owner != nullptr;
+                    if (!baseline[i].snapshot_ok ||
+                        !current[i].snapshot_ok) {
+                        Field(std::format("  restore 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              baseline[i].info.hwnd)),
+                              is_owned ? "observation unavailable"
+                                       : "snapshot unavailable");
+                        if (!is_owned) {
+                            rc = 1;
+                        }
                         continue;
                     }
                     if (!IsWindowDesktopAssignmentChanged(baseline[i],
@@ -4379,8 +4465,27 @@ int CmdExplorerSemanticsTest(bool confirm_mutate) {
                     const bool state_ok =
                         ReadWindowDesktopState(documented_manager.Get(),
                                                snapshot.info.hwnd, state);
-                    if (!IsWindowStateOnCarrier(snapshot.info, state, state_ok,
-                                                carrier.id)) {
+                    if (!state_ok) {
+                        Field(std::format("  final restore 0x{:X}",
+                                          reinterpret_cast<uintptr_t>(
+                                              snapshot.info.hwnd)),
+                              snapshot.info.owner != nullptr
+                                  ? "observation unavailable"
+                                  : "snapshot unavailable");
+                        if (snapshot.info.owner == nullptr) {
+                            restored = false;
+                        }
+                        continue;
+                    }
+                    if (!IsWindowStateOnCarrier(snapshot.info, state,
+                                                 state_ok, carrier.id)) {
+                        if (snapshot.info.owner != nullptr) {
+                            Field(std::format("  final restore 0x{:X}",
+                                              reinterpret_cast<uintptr_t>(
+                                                  snapshot.info.hwnd)),
+                                  "observation: not on Carrier");
+                            continue;
+                        }
                         restored = false;
                     }
                 }

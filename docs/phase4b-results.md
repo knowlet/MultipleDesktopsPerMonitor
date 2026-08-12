@@ -35,6 +35,7 @@ The command emits machine-readable outcomes:
 |---|---|
 | `EXPLORER-SEMANTICS-OBSERVED` | The controlled Explorer move/restore contract passed; this is a `GO-WITH-LIMITATIONS` observation, not a complete real-app matrix result. |
 | `INCONCLUSIVE-ENVIRONMENT` | Explorer launch attribution or window discovery was not deterministic in the host session; rerun rather than infer a semantics failure. |
+| `INCONCLUSIVE-PRECONDITION` | A required top-level target or sibling snapshot/view precondition was unavailable before mutation; no Explorer view was moved and the probe returns exit status `77`. |
 | `INCONCLUSIVE-CONTAMINATED` | An unrelated `ViewVirtualDesktopChanged` callback entered the observation window; rerun in a quiet session. |
 | `ENVIRONMENT-BLOCKED` | ImmersiveShell access was denied before any Explorer window was launched (`mutation_started = no`, exit status `77`). |
 | `SEMANTICS-FAILED` | A target move, global-current-desktop invariant, callback contract, restoration, or cleanup assertion failed. |
@@ -53,6 +54,14 @@ characterize owner/group behavior. `GUID_NULL` is accepted only on this
 owned-window observation/recovery path when `IsWindowOnCurrentVirtualDesktop`
 confirms the Carrier-side state. Top-level target and sibling windows still
 require a real Carrier GUID.
+
+Owned/internal Explorer HWND snapshot failures are non-blocking observation
+limits throughout the baseline, post-move, restore, and final-verification
+paths. The probe reports owned-window totals, observable counts, moved counts,
+and a tri-state semantic summary (`unavailable`, `partially-observed`,
+`grouped`, or `independent`) so unavailable state is never reported as
+independent behavior. Target and sibling top-level snapshots remain strict:
+without them the command reports `INCONCLUSIVE-PRECONDITION` before mutation.
 
 ## Validation in this checkout
 
