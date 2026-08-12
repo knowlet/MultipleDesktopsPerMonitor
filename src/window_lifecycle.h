@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -105,7 +106,9 @@ class WinEventLifecycleSource {
     void Stop() noexcept;
     bool running() const noexcept { return !hooks_.empty(); }
     bool shutdown_ok() const noexcept { return shutdown_ok_; }
-    bool queue_overflowed() const noexcept { return queue_overflowed_; }
+    bool queue_overflowed() const noexcept {
+        return queue_overflowed_.load(std::memory_order_acquire);
+    }
     std::vector<WindowLifecycleEvent> Drain();
     // Atomically drains queued hints and consumes the sticky overflow flag.
     // Coordinators should prefer this over separately reading queue_overflowed()
@@ -127,7 +130,7 @@ class WinEventLifecycleSource {
     RemoveHook remove_;
     DWORD owner_thread_id_ = 0;
     bool shutdown_ok_ = true;
-    bool queue_overflowed_ = false;
+    std::atomic_bool queue_overflowed_{false};
     std::mutex queue_mutex_;
     std::deque<WindowLifecycleEvent> queue_;
 };

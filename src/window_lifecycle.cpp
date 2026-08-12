@@ -193,7 +193,7 @@ bool WinEventLifecycleSource::Start(std::string* error) {
             g_sources.emplace(hook, this);
         }
         shutdown_ok_ = true;
-        queue_overflowed_ = false;
+        queue_overflowed_.store(false, std::memory_order_release);
         return true;
     } catch (...) {
         if (error) *error = "SetWinEventHook installation threw";
@@ -242,8 +242,8 @@ std::vector<WindowLifecycleEvent> WinEventLifecycleSource::Drain() {
 WindowLifecycleBatch WinEventLifecycleSource::DrainBatch() {
     std::lock_guard lock(queue_mutex_);
     WindowLifecycleBatch result;
-    result.overflowed = queue_overflowed_;
-    queue_overflowed_ = false;
+    result.overflowed =
+        queue_overflowed_.exchange(false, std::memory_order_acq_rel);
     result.events.reserve(queue_.size());
     while (!queue_.empty()) {
         result.events.push_back(std::move(queue_.front()));
@@ -260,7 +260,7 @@ void WinEventLifecycleSource::Enqueue(WindowLifecycleEvent event) {
     std::lock_guard lock(queue_mutex_);
     constexpr std::size_t kMaxQueuedEvents = 4096;
     if (queue_.size() >= kMaxQueuedEvents) {
-        queue_overflowed_ = true;
+        queue_overflowed_.store(true, std::memory_order_release);
         return;
     }
     queue_.push_back(std::move(event));

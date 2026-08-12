@@ -248,6 +248,48 @@ int CmdWorkspaceCoordinatorTest() {
     ok = ok && reconciled.succeeded() &&
          reconciled.discovery_attempts == 2 &&
          reconciled.lifecycle.events == 1;
+
+    const std::filesystem::path pending_path =
+        std::filesystem::temp_directory_path() /
+        ("vdprobe-coordinator-pending-" +
+         std::to_string(GetCurrentProcessId()) + ".journal");
+    std::error_code remove_error;
+    std::filesystem::remove(pending_path, remove_error);
+    WorkspaceJournal pending_journal(pending_path);
+    std::string pending_error;
+    const std::optional<SwitchPlan> pending_plan =
+        engine.PrepareSwitch(1, 11, &pending_error);
+    const bool journal_started =
+        pending_plan && pending_journal.Begin(*pending_plan, &pending_error);
+    WorkspaceCoordinator gated(
+        engine, lifecycle, source,
+        [&](std::vector<WindowRecord>& observed, std::string*) {
+            observed = snapshot;
+            return true;
+        },
+        [&](const WindowRecord& window, NativeDesktopRole target) {
+            roles[window.identity] = target;
+            return true;
+        },
+        [&](const WindowRecord& window) { return roles[window.identity]; },
+        &pending_journal, 2);
+    const CoordinatorResult blocked =
+        journal_started ? gated.Switch(1, 11) : CoordinatorResult{};
+    const bool pending_gate_ok =
+        journal_started &&
+        blocked.code == CoordinatorResultCode::PendingRecovery &&
+        roles[a] == NativeDesktopRole::Carrier &&
+        roles[b] == NativeDesktopRole::Parking;
+    if (journal_started) {
+        std::string abort_error;
+        if (!pending_journal.Abort(&abort_error)) {
+            ok = false;
+            if (error.empty()) error = abort_error;
+        }
+    }
+    std::filesystem::remove(pending_path, remove_error);
+    ok = ok && pending_gate_ok;
+
     const CoordinatorResult switched = coordinator.Switch(1, 11);
     ok = ok && switched.succeeded() && switched.transaction.committed &&
          engine.Monitor(1)->active == 11 &&
@@ -256,6 +298,8 @@ int CmdWorkspaceCoordinatorTest() {
          engine.CheckInvariant(&error);
 
     Field("bounded quiet snapshot", reconciled.succeeded() ? "PASS" : "FAIL");
+    Field("pending journal gate",
+          pending_gate_ok ? "PASS" : "FAIL");
     Field("serialized stale-safe switch", switched.succeeded() ? "PASS" : "FAIL");
     Field("result", ok ? "PASS" : "FAIL");
     if (!ok && !error.empty()) Field("error", error);
