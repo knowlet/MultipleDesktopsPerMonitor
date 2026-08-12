@@ -61,7 +61,8 @@ Gated feasibility tests:
 | `vdprobe logical-workspace-test --confirm-mutate` | creates three probe-owned windows, performs one monitor-local logical A1 -> A2 -> A1 round-trip, and verifies that the other monitor and global current desktop are unchanged |
 | `vdprobe real-app-semantics-test --confirm-mutate` | Phase 4A: launches a probe-owned ordinary Win32 child with two top-level windows and one owned popup, then characterizes view grouping/ownership for one Carrier -> Parking move |
 | `vdprobe explorer-semantics-test --confirm-mutate` | Phase 4B-1: launches two newly attributable Explorer top-level windows, moves one view Carrier -> Parking, observes sibling/owned-window behavior, and restores only probe-created HWNDs |
-| `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4B-2A: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
+| `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4C: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
+| `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -156,30 +157,34 @@ research/
 
 ## Scope
 
-Phase 4A's controlled Win32 process semantics gate is complete with a
-`GO-WITH-LIMITATIONS` result. Phase 4B-1 adds a narrowly scoped Explorer
-semantics probe, and Phase 4B-2A adds an isolated Chromium-family probe using
-Microsoft Edge as the first reference browser. Two interactive Edge runs
-observed the target/sibling window-granularity contract and completed restore,
-but temporary-profile removal remained inconclusive; the probe now combines a
-bounded cleanup retry with Chromium's `--disable-background-mode` launch flag.
-The Edge probe creates a unique temporary `--user-data-dir`, launches two
-same-profile top-level windows, attributes them using pre/post HWND snapshots
-plus the canonical Edge image path and profile-bearing command line, and moves
-only one view. It never touches an existing browser profile, closes an
-unattributed browser HWND, or terminates an existing browser process.
+Phase 4C is the representative compatibility gate. Controlled Win32,
+Explorer, isolated Edge, and Windows Terminal probes all reached
+`GO-WITH-LIMITATIONS` for the tested top-level Carrier/Parking contract.
+Evidence and limitations are recorded in
+[`docs/phase4c-results.md`](docs/phase4c-results.md).
 
-The current Chromium implementation is an interactive semantics probe, not a
-browser compatibility claim. Chrome, Terminal, Electron, WinUI/UWP,
-lifecycle tracking, focus/Z-order recovery, persistence, GUI, tray icon,
-installer, Rust port, stress or latency benchmarking, automatic application
-tracking, and any form of faked or emulated native desktop lifecycle remain
-out of scope.
+The project now moves from app-by-app compatibility research to productization
+with runtime capability detection:
+
+```text
+GetViewForHwnd
+    -> CanViewMoveDesktops
+    -> move and verify target/global state
+    -> rollback immediately on an anomaly
+```
+
+The probe never maintains an executable whitelist. Chrome, Electron, other
+packaged applications, and unusual owner/popup behavior remain beta validation
+inputs rather than separate prebuilt compatibility claims.
+
+Productization work still excludes automatic lifecycle tracking, focus/Z-order
+recovery, persistence, GUI, hotkeys, tray icon, installer, Rust port, stress,
+latency benchmarking, and any form of faked or emulated native desktop
+lifecycle until those milestones are explicitly implemented.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with
 status `77` (inconclusive/skip); that is not a semantics PASS or FAIL. The
-The same exit status is used for non-deterministic Chromium attribution,
-callback contamination, and cleanup that is safe but incomplete; those
-outcomes must be rerun or investigated rather than treated as a semantics
-failure.
+same exit status is used for non-deterministic attribution, callback
+contamination, and cleanup that is safe but incomplete; those outcomes must be
+rerun or investigated rather than treated as a semantics failure.
