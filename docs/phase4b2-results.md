@@ -1,0 +1,111 @@
+# Phase 4B-2A — Isolated Chromium / Edge semantics
+
+## Scope
+
+This milestone is a narrow application-family probe. It keeps the validated
+Carrier/Parking architecture unchanged and asks one question:
+
+> Can two top-level windows in the same isolated Chromium instance be treated
+> with window granularity, moving only one view from Carrier to Parking while
+> the sibling and the session-global current desktop remain unchanged?
+
+The command is:
+
+```powershell
+.\build\vdprobe.exe chromium-semantics-test --browser edge --confirm-mutate
+```
+
+The probe:
+
+- resolves the canonical installed Microsoft Edge executable and uses that
+  absolute path for launch and attribution;
+- creates a unique temporary profile directory owned by the probe;
+- launches two `--new-window about:blank` requests against the same profile;
+- attributes each new normal browser root by pre/post HWND observation, full
+  executable path, and a command line containing the unique profile path;
+- treats the Chromium class name (`Chrome_WidgetWin_*`) as evidence, not as an
+  ownership boundary;
+- moves one attributable top-level view Carrier -> Parking -> Carrier;
+- verifies the sibling HWND, PID, process generation, RECT, and monitor;
+- observes `ViewVirtualDesktopChanged` and requires zero
+  `CurrentVirtualDesktopChanged` events;
+- closes only probe-attributed browser roots with `WM_CLOSE`;
+- removes the temporary profile only when no profile-associated windows remain.
+
+The probe never uses an existing browser profile, never closes an
+unattributed browser HWND, never calls `SwitchDesktop`, and never terminates an
+existing browser process. Internal, popup, and utility windows are
+observation-only.
+
+## Result categories
+
+| Result | Meaning |
+|---|---|
+| `CHROMIUM-SEMANTICS-OBSERVED` | Target move/restore, sibling isolation, callback, and global-current-desktop contract passed. This is a `GO-WITH-LIMITATIONS` observation, not a complete browser matrix result. |
+| `INCONCLUSIVE-ATTRIBUTION` | A launch did not yield exactly one attributable top-level window, or the final same-profile set was ambiguous. Unattributed HWNDs are intentionally retained. |
+| `INCONCLUSIVE-PRECONDITION` | A required target/sibling snapshot or target view precondition was unavailable before mutation. |
+| `INCONCLUSIVE-CONTAMINATED` | An unrelated `ViewVirtualDesktopChanged` callback entered the observation window. |
+| `ENVIRONMENT-BLOCKED` | ImmersiveShell access, canonical Edge discovery, or temporary profile creation was unavailable before the semantics mutation. |
+| `INCONCLUSIVE-CLEANUP` | The semantics observation completed, but safe cleanup could not prove the temporary profile was fully released/removed. |
+| `SEMANTICS-FAILED` | A mutation occurred and violated the target, sibling, callback, global-current-desktop, restoration, or hard cleanup contract. |
+
+Exit status `77` means inconclusive/environment-blocked and is not a
+semantics PASS or FAIL. A cleanup state that is safe but incomplete must not be
+reported as a clean semantics pass.
+
+## Validation in this checkout
+
+The source and dispatch path build successfully:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The mutation gate rejects launch without explicit consent:
+
+```text
+vdprobe chromium-semantics-test
+  gate REFUSED: method mutates shell state
+```
+
+The first supported browser is Edge; unsupported browser selection is
+machine-readable and does not launch a profile:
+
+```text
+vdprobe chromium-semantics-test --browser chrome --confirm-mutate
+  result = INCONCLUSIVE-ATTRIBUTION
+  reason = Phase 4B-2A supports only --browser edge
+  mutation_started = no
+```
+
+The available non-interactive run is host-blocked before Edge/profile
+creation:
+
+```text
+.\build\vdprobe.exe chromium-semantics-test --browser edge --confirm-mutate
+  IServiceProvider FAILED 0x00000005 (E_ACCESSDENIED)
+  result = ENVIRONMENT-BLOCKED
+  reason = ImmersiveShell E_ACCESSDENIED
+  mutation_started = no
+  exit = 77
+```
+
+An interactive Edge run remains pending. The expected evidence-bearing
+success is:
+
+```text
+result                        CHROMIUM-SEMANTICS-OBSERVED
+GO/NO-GO                      GO-WITH-LIMITATIONS
+target desktop                Parking
+target on current             false
+ViewVirtualDesktopChanged     observed
+sibling moved                 no
+CurrentVirtualDesktopChanged  0
+restore                       PASS
+Unregister                    S_OK
+temporary profile cleanup     passed
+```
+
+This milestone does not claim Chrome equivalence, browser lifecycle support,
+focus/Z-order recovery, existing-profile safety beyond the stated attribution
+boundary, or a complete Phase 4B real-application matrix.
