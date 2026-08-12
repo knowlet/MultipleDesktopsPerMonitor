@@ -104,6 +104,12 @@ int CmdWorkspaceLiveBootstrapTest();
 // explicitly synthetic and in-memory; no move callback is installed.
 int CmdWorkspaceLiveCoordinatorBootstrapTest();
 
+// Productization read-only host validation: composes the system discovery
+// backend, capability augmentation, owner-thread WinEvent source, assignment
+// policy, coordinator, and clean-journal startup boundary.  It never installs
+// native move/observe/recovery callbacks and never mutates windows or desktops.
+int CmdWorkspaceLiveReadOnlyHostTest();
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();

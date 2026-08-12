@@ -18,6 +18,7 @@
 #include "workspace_coordinator.h"
 #include "workspace_engine.h"
 #include "window_discovery.h"
+#include "workspace_readonly_host.h"
 
 namespace vd {
 namespace {
@@ -4254,6 +4255,261 @@ int CmdWorkspaceLiveBootstrapTest() {
 
 int CmdWorkspaceLiveCoordinatorBootstrapTest() {
     return CmdWorkspaceLiveDiscovery(true, true);
+}
+
+int CmdWorkspaceLiveReadOnlyHostTest() {
+    Heading("workspace-live-readonly-host-test");
+    Field("scope",
+          "one bounded system-backed read-only host startup/reconcile");
+    Field("native mutation", "none");
+    Field("move callback", "not installed");
+    Field("observe callback", "not installed");
+    Field("window close", "none");
+    Field("desktop lifecycle", "no create/remove");
+
+    auto environment_blocked = [](std::string_view reason) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", reason);
+        Field("mutation_started", "no");
+        Print("mutation_started=no\n");
+        Print("RESULT=ENVIRONMENT-BLOCKED\n");
+        return kExitInconclusive;
+    };
+    auto failed = [](std::string_view reason) {
+        Field("result", "ERROR");
+        Field("reason", reason);
+        Field("mutation_started", "no");
+        Print("mutation_started=no\n");
+        Print("RESULT=ERROR\n");
+        return 1;
+    };
+
+    Com<IServiceProvider> sp;
+    const HRESULT shell_hr = GetImmersiveShell(sp);
+    if (shell_hr == E_ACCESSDENIED) {
+        return environment_blocked("ImmersiveShell E_ACCESSDENIED");
+    }
+    if (FAILED(shell_hr) || !sp) {
+        return failed(std::format("ImmersiveShell unavailable ({})",
+                                  HrToString(shell_hr)));
+    }
+
+    ManagerInternal manager = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(manager);
+    if (!manager.obj || manager.layout == nullptr) {
+        if (manager.access_denied_seen || manager.hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "IVirtualDesktopManagerInternal E_ACCESSDENIED");
+        }
+        return failed("usable IVirtualDesktopManagerInternal unavailable");
+    }
+
+    DesktopSnapshot carrier;
+    HRESULT current_hr = E_ABORT;
+    if (!ReadCurrentDesktop(manager, carrier, &current_hr)) {
+        if (current_hr == E_ACCESSDENIED) {
+            return environment_blocked("GetCurrentDesktop E_ACCESSDENIED");
+        }
+        return failed("current Carrier unavailable");
+    }
+    std::vector<DesktopSnapshot> desktops;
+    HRESULT desktops_hr = E_ABORT;
+    if (!ReadDesktopList(manager, desktops, &desktops_hr)) {
+        if (desktops_hr == E_ACCESSDENIED) {
+            return environment_blocked("GetDesktops E_ACCESSDENIED");
+        }
+        return failed("existing desktop enumeration failed");
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.id_ok || !parking.object) {
+        return failed("no existing inactive Parking desktop");
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        if (views.access_denied_seen || views.hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "IApplicationViewCollection E_ACCESSDENIED");
+        }
+        return failed("usable IApplicationViewCollection unavailable");
+    }
+    const MethodEntry* get_view =
+        FindMethod(*views.layout, "GetViewForHwnd");
+    const MethodEntry* can_move =
+        FindMethod(*manager.layout, "CanViewMoveDesktops");
+    if (get_view == nullptr || can_move == nullptr) {
+        return failed("required read-only capability slots are unavailable");
+    }
+
+    bool capability_access_denied = false;
+    Win32WindowDiscoveryOptions options;
+    options.carrier = carrier.id;
+    options.parking = parking.id;
+    options.augment_capabilities =
+        [&](HWND hwnd, const WindowDiscoveryObservation& observation,
+            WindowCapabilities& capabilities, std::string* error) {
+            if (!observation.capabilities.independent_top_level ||
+                !observation.desktop_ok ||
+                observation.native_role == NativeDesktopRole::Unknown) {
+                return true;
+            }
+
+            RawObject view;
+            Gate view_gate = Gate::Ok;
+            const HRESULT view_hr = InvokeSlot(
+                views.object.Get(), *views.layout, *get_view, view_gate, false,
+                hwnd, view.PutVoid());
+            if (view_hr == E_ACCESSDENIED) {
+                capability_access_denied = true;
+                if (error != nullptr) {
+                    *error = "GetViewForHwnd returned E_ACCESSDENIED";
+                }
+                return false;
+            }
+            if (view_gate != Gate::Ok || FAILED(view_hr) || !view) {
+                return true;
+            }
+            capabilities.has_application_view = true;
+
+            Gate move_gate = Gate::Ok;
+            BOOL value = FALSE;
+            const HRESULT move_hr = InvokeSlot(
+                manager.obj.Get(), *manager.layout, *can_move, move_gate,
+                false, view.Get(), &value);
+            if (move_hr == E_ACCESSDENIED) {
+                capability_access_denied = true;
+                if (error != nullptr) {
+                    *error = "CanViewMoveDesktops returned E_ACCESSDENIED";
+                }
+                return false;
+            }
+            if (move_gate == Gate::Ok && SUCCEEDED(move_hr)) {
+                capabilities.can_move_desktops = value != FALSE;
+            }
+            return true;
+        };
+
+    std::string error;
+    HRESULT documented_hr = S_OK;
+    auto backend = CreateSystemWindowDiscoveryBackend(
+        std::move(options), &error, &documented_hr);
+    if (!backend) {
+        if (documented_hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "documented IVirtualDesktopManager E_ACCESSDENIED");
+        }
+        return failed(error.empty() ? "system discovery backend unavailable"
+                                    : error);
+    }
+
+    const std::vector<MonitorRec> monitors = EnumerateMonitors();
+    if (monitors.empty()) {
+        return failed("no monitors available for read-only assignment topology");
+    }
+    std::vector<ReadOnlyMonitorConfiguration> topology;
+    topology.reserve(monitors.size());
+    for (std::size_t index = 0; index < monitors.size(); ++index) {
+        const MonitorId monitor =
+            reinterpret_cast<MonitorId>(monitors[index].handle);
+        const WorkspaceId active =
+            static_cast<WorkspaceId>(index * 2 + 1);
+        topology.push_back({monitor, active, {active, active + 1}});
+    }
+
+    const std::filesystem::path journal_path =
+        std::filesystem::temp_directory_path() /
+        ("vdprobe-live-readonly-host-" +
+         std::to_string(GetCurrentProcessId()) + ".journal");
+    std::error_code remove_error;
+    std::filesystem::remove(journal_path, remove_error);
+    if (remove_error) {
+        return failed("unable to prepare temporary read-only journal path");
+    }
+
+    WorkspaceReadOnlyHost host(
+        carrier.id, parking.id, std::move(topology), std::move(*backend),
+        journal_path);
+    const ReadOnlyHostResult started = host.Start();
+    if (!started.succeeded()) {
+        const std::string reason =
+            std::string(ReadOnlyHostResultCodeText(started.code)) + ": " +
+            started.error;
+        std::error_code cleanup_error;
+        std::filesystem::remove(journal_path, cleanup_error);
+        if (started.code == ReadOnlyHostResultCode::StartupBlocked &&
+            (started.error.find("E_ACCESSDENIED") != std::string::npos ||
+             started.error.find("unavailable") != std::string::npos)) {
+            return environment_blocked(reason);
+        }
+        return failed(reason);
+    }
+
+    const ReadOnlyHostResult reconciled = host.Reconcile();
+    if (!reconciled.succeeded()) {
+        const std::string reason =
+            std::string(ReadOnlyHostResultCodeText(reconciled.code)) + ": " +
+            reconciled.error;
+        (void)host.Stop();
+        std::error_code cleanup_error;
+        std::filesystem::remove(journal_path, cleanup_error);
+        if (reconciled.code == ReadOnlyHostResultCode::ReconcileFailed &&
+            (reconciled.error.find("E_ACCESSDENIED") != std::string::npos ||
+             reconciled.error.find("unstable") != std::string::npos ||
+             reconciled.error.find("lifecycle") != std::string::npos)) {
+            return environment_blocked(reason);
+        }
+        return failed(reason);
+    }
+
+    std::size_t managed = 0;
+    std::size_t unsupported = 0;
+    std::size_t ambiguous = 0;
+    for (const WindowRecord* window : host.engine().Windows()) {
+        if (window == nullptr) continue;
+        switch (window->disposition) {
+            case WindowDisposition::Managed: ++managed; break;
+            case WindowDisposition::Unsupported: ++unsupported; break;
+            case WindowDisposition::Ambiguous: ++ambiguous; break;
+            case WindowDisposition::Closed: ++ambiguous; break;
+        }
+    }
+    const ReadOnlyHostResult stopped = host.Stop();
+    std::error_code cleanup_error;
+    const bool journal_removed =
+        std::filesystem::remove(journal_path, cleanup_error) ||
+        !std::filesystem::exists(journal_path);
+    if (!stopped.succeeded() || cleanup_error || !journal_removed) {
+        return failed("read-only host shutdown or journal cleanup failed");
+    }
+
+    Field("managed", std::format("{}", managed));
+    Field("unsupported", std::format("{}", unsupported));
+    Field("ambiguous", std::format("{}", ambiguous));
+    Field("discovery attempts",
+          std::format("{}", reconciled.coordinator.discovery_attempts));
+    Field("lifecycle hints",
+          std::format("{}", reconciled.coordinator.lifecycle.events));
+    Field("result", "OK");
+    Field("mutation_started", "no");
+    Print("MANAGED_COUNT={}\n", managed);
+    Print("UNSUPPORTED_COUNT={}\n", unsupported);
+    Print("AMBIGUOUS_COUNT={}\n", ambiguous);
+    Print("DISCOVERY_ATTEMPTS={}\n",
+          reconciled.coordinator.discovery_attempts);
+    Print("MOVE_CALLBACK_INSTALLED=0\n");
+    Print("OBSERVE_CALLBACK_INSTALLED=0\n");
+    Print("mutation_started=no\n");
+    Print("RESULT=OK\n");
+    return 0;
 }
 
 // ---------------------------------------------------- logical-workspace-test

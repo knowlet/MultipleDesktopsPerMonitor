@@ -99,6 +99,9 @@ void Usage() {
         "  workspace-live-coordinator-bootstrap-test\n"
         "                      reconcile bounded live read-only discovery via\n"
         "                      lifecycle/coordinator with synthetic assignment\n"
+        "  workspace-live-readonly-host-test\n"
+        "                      compose system discovery, assignment, lifecycle,\n"
+        "                      coordinator, and clean startup read-only\n"
         "  workspace-live-lifecycle-test\n"
         "                      deterministic read-only lifecycle and explicit\n"
         "                      in-memory assignment integration\n"
@@ -237,6 +240,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveBootstrapTest();
     } else if (cmd == "workspace-live-coordinator-bootstrap-test") {
         rc = vd::CmdWorkspaceLiveCoordinatorBootstrapTest();
+    } else if (cmd == "workspace-live-readonly-host-test") {
+        rc = vd::CmdWorkspaceLiveReadOnlyHostTest();
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-engine-test") {
