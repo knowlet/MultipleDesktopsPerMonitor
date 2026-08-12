@@ -232,6 +232,13 @@ std::wstring WindowsPath(std::wstring_view name) {
     return std::wstring(dir, n) + L"\\" + std::wstring(name);
 }
 
+std::wstring SystemExplorerPath() {
+    wchar_t dir[MAX_PATH]{};
+    UINT n = ::GetWindowsDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    return std::wstring(dir, n) + L"\\explorer.exe";
+}
+
 // ------------------------------------------------------- desktop enumeration
 
 struct DesktopInfo {
@@ -1014,15 +1021,8 @@ bool IsExplorerProcess(DWORD pid) {
     if (!ok || length == 0) return false;
     std::wstring full(path.data(), length);
 
-    wchar_t windows_dir[MAX_PATH]{};
-    const UINT windows_dir_length =
-        ::GetWindowsDirectoryW(windows_dir, ARRAYSIZE(windows_dir));
-    if (windows_dir_length == 0 ||
-        windows_dir_length >= ARRAYSIZE(windows_dir)) {
-        return false;
-    }
-    std::wstring expected(windows_dir, windows_dir_length);
-    expected += L"\\explorer.exe";
+    const std::wstring expected = SystemExplorerPath();
+    if (expected.empty()) return false;
 
     auto normalize_path = [](std::wstring value) {
         std::replace(value.begin(), value.end(), L'/', L'\\');
@@ -1123,12 +1123,17 @@ std::vector<ExplorerWindowInfo> NewExplorerWindows(
 }
 
 bool LaunchExplorerWindow(const std::wstring& path) {
+    const std::wstring explorer = SystemExplorerPath();
+    if (explorer.empty()) {
+        Print("  cannot resolve canonical system Explorer path; refusing launch\n");
+        return false;
+    }
     std::wstring parameters = L"/n,\"" + path + L"\"";
     SHELLEXECUTEINFOW execute{};
     execute.cbSize = sizeof(execute);
     execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
     execute.lpVerb = L"open";
-    execute.lpFile = L"explorer.exe";
+    execute.lpFile = explorer.c_str();
     execute.lpParameters = parameters.c_str();
     execute.nShow = SW_SHOWNOACTIVATE;
     if (!::ShellExecuteExW(&execute)) {
