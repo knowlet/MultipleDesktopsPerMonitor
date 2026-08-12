@@ -1,6 +1,7 @@
 #include "workspace_engine.h"
 
 #include <algorithm>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -74,6 +75,15 @@ bool PlansMatch(const SwitchPlan& a, const SwitchPlan& b) noexcept {
 std::string Win32Error(const char* action, DWORD code = GetLastError()) {
     return std::string(action) + ": " +
            std::system_category().message(static_cast<int>(code));
+}
+
+std::string CallbackException(const char* callback) {
+    return std::string(callback) + " callback threw";
+}
+
+std::string CallbackException(const char* callback,
+                             const std::exception& exception) {
+    return std::string(callback) + " callback threw: " + exception.what();
 }
 
 bool WriteHandle(HANDLE file, const std::string& contents,
@@ -792,8 +802,15 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
 bool WorkspaceEngine::RolesMatch(const SwitchOperation& operation,
                                  const ObserveCallback& observe) const {
     const WindowRecord* window = FindWindow(operation.identity);
-    return window != nullptr &&
-           (!observe || observe(*window) == operation.to);
+    if (window == nullptr) return false;
+    if (!observe) return true;
+    try {
+        return observe(*window) == operation.to;
+    } catch (const std::exception&) {
+        return false;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool WorkspaceEngine::ApplyOperations(
@@ -810,7 +827,17 @@ bool WorkspaceEngine::ApplyOperations(
             if (error) *error = "operation references an unmanaged window";
             return false;
         }
-        if (observe(*window) != operation.from) {
+        NativeDesktopRole current = NativeDesktopRole::Unknown;
+        try {
+            current = observe(*window);
+        } catch (const std::exception& exception) {
+            if (error) *error = CallbackException("observe", exception);
+            return false;
+        } catch (...) {
+            if (error) *error = CallbackException("observe");
+            return false;
+        }
+        if (current != operation.from) {
             if (error) *error = "native state changed before operation";
             return false;
         }
@@ -819,7 +846,16 @@ bool WorkspaceEngine::ApplyOperations(
         // untouched; rollback therefore always gets a chance to observe and
         // restore this operation.
         applied.push_back(operation);
-        const bool move_ok = move(*window, operation.to);
+        bool move_ok = false;
+        try {
+            move_ok = move(*window, operation.to);
+        } catch (const std::exception& exception) {
+            if (error) *error = CallbackException("move", exception);
+            return false;
+        } catch (...) {
+            if (error) *error = CallbackException("move");
+            return false;
+        }
         if (!move_ok || !RolesMatch(operation, observe)) {
             if (error) {
                 *error = move_ok ? "native move verification failed"
@@ -845,10 +881,42 @@ bool WorkspaceEngine::RestoreOperations(
             if (error) *error = "rollback failed";
             return false;
         }
-        const NativeDesktopRole current = observe(*window);
+        NativeDesktopRole current = NativeDesktopRole::Unknown;
+        try {
+            current = observe(*window);
+        } catch (const std::exception& exception) {
+            if (error) *error = CallbackException("rollback observe", exception);
+            return false;
+        } catch (...) {
+            if (error) *error = "rollback observe callback threw";
+            return false;
+        }
         if (current == restore.to) continue;
-        if (current != restore.from || !move(*window, restore.to) ||
-            observe(*window) != restore.to) {
+        if (current != restore.from) {
+            if (error) *error = "rollback failed";
+            return false;
+        }
+        bool move_ok = false;
+        try {
+            move_ok = move(*window, restore.to);
+        } catch (const std::exception& exception) {
+            if (error) *error = CallbackException("rollback move", exception);
+            return false;
+        } catch (...) {
+            if (error) *error = "rollback move callback threw";
+            return false;
+        }
+        NativeDesktopRole restored = NativeDesktopRole::Unknown;
+        try {
+            restored = observe(*window);
+        } catch (const std::exception& exception) {
+            if (error) *error = CallbackException("rollback observe", exception);
+            return false;
+        } catch (...) {
+            if (error) *error = "rollback observe callback threw";
+            return false;
+        }
+        if (!move_ok || restored != restore.to) {
             if (error) *error = "rollback failed";
             return false;
         }
@@ -867,7 +935,8 @@ void WorkspaceEngine::CommitPlan(const SwitchPlan& plan) {
 
 TransactionResult WorkspaceEngine::ExecuteSwitch(
     const SwitchPlan& plan, const MoveCallback& move,
-    const ObserveCallback& observe, const WorkspaceJournal* journal) {
+    const ObserveCallback& observe, const WorkspaceJournal* journal,
+    const PreCommitCallback& pre_commit) {
     TransactionResult result;
     std::string expected_error;
     const std::optional<SwitchPlan> expected =
@@ -886,11 +955,17 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     std::string error;
     if (!ApplyOperations(plan.operations, move, observe, applied, &error)) {
         result.rollback_attempted = !applied.empty();
+        const std::string operation_error = error;
         // Verify the entire recorded baseline before declaring the transaction
         // aborted. Native side effects are not necessarily limited to the
         // operation whose callback was invoked.
+        std::string rollback_error;
         result.rollback_succeeded =
-            RestoreOperations(plan.operations, move, observe, &error);
+            RestoreOperations(plan.operations, move, observe, &rollback_error);
+        error = operation_error;
+        if (!result.rollback_succeeded && !rollback_error.empty()) {
+            error += "; " + rollback_error;
+        }
         if (result.rollback_succeeded && journal) {
             std::string abort_error;
             if (!journal->Abort(&abort_error)) {
@@ -914,17 +989,51 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     if (post_state_matches) {
         for (const SwitchOperation& operation : plan.operations) {
             const WindowRecord* window = FindWindow(operation.identity);
-            if (window == nullptr || observe(*window) != operation.to) {
+            if (window == nullptr) {
+                post_state_matches = false;
+                break;
+            }
+            try {
+                if (observe(*window) != operation.to) {
+                    post_state_matches = false;
+                    break;
+                }
+            } catch (const std::exception& exception) {
+                error = CallbackException("observe", exception);
+                post_state_matches = false;
+                break;
+            } catch (...) {
+                error = CallbackException("observe");
                 post_state_matches = false;
                 break;
             }
         }
     }
+    if (post_state_matches && pre_commit) {
+        try {
+            if (!pre_commit()) {
+                error = "switch invalidated before commit";
+                post_state_matches = false;
+            }
+        } catch (const std::exception& exception) {
+            error = CallbackException("pre-commit validation", exception);
+            post_state_matches = false;
+        } catch (...) {
+            error = CallbackException("pre-commit validation");
+            post_state_matches = false;
+        }
+    }
     if (!post_state_matches) {
         result.rollback_attempted = !applied.empty();
-        error = "switch state changed during execution";
+        if (error.empty()) error = "switch state changed during execution";
+        const std::string operation_error = error;
+        std::string rollback_error;
         result.rollback_succeeded =
-            RestoreOperations(plan.operations, move, observe, &error);
+            RestoreOperations(plan.operations, move, observe, &rollback_error);
+        error = operation_error;
+        if (!result.rollback_succeeded && !rollback_error.empty()) {
+            error += "; " + rollback_error;
+        }
         if (result.rollback_succeeded && journal) {
             std::string abort_error;
             if (!journal->Abort(&abort_error)) {
@@ -940,8 +1049,10 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
 
     if (journal && !journal->Commit(&journal_error)) {
         result.rollback_attempted = true;
+        std::string rollback_error;
         result.rollback_succeeded =
-            RestoreOperations(plan.operations, move, observe, &error);
+            RestoreOperations(plan.operations, move, observe, &rollback_error);
+        error = rollback_error;
         if (result.rollback_succeeded) {
             std::string abort_error;
             if (!journal->Abort(&abort_error)) {
@@ -1076,7 +1187,17 @@ bool WorkspaceEngine::Reconcile(const MoveCallback& move,
                 ? NativeDesktopRole::Carrier
                 : NativeDesktopRole::Parking;
         NativeDesktopRole current = window->native_role;
-        if (observe) current = observe(*window);
+        if (observe) {
+            try {
+                current = observe(*window);
+            } catch (const std::exception& exception) {
+                if (error) *error = CallbackException("observe", exception);
+                return false;
+            } catch (...) {
+                if (error) *error = CallbackException("observe");
+                return false;
+            }
+        }
         if (current == NativeDesktopRole::Unknown) {
             if (error) *error = "native role is unobservable";
             return false;

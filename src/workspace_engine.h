@@ -185,6 +185,7 @@ class WorkspaceEngine {
         std::function<bool(const WindowRecord&, NativeDesktopRole target)>;
     using ObserveCallback =
         std::function<NativeDesktopRole(const WindowRecord&)>;
+    using PreCommitCallback = std::function<bool()>;
 
     WorkspaceEngine(GUID carrier, GUID parking);
 
@@ -233,7 +234,8 @@ class WorkspaceEngine {
     TransactionResult ExecuteSwitch(const SwitchPlan& plan,
                                     const MoveCallback& move,
                                     const ObserveCallback& observe = {},
-                                    const WorkspaceJournal* journal = nullptr);
+                                    const WorkspaceJournal* journal = nullptr,
+                                    const PreCommitCallback& pre_commit = {});
 
     RecoveryResult RecoverPending(const SwitchPlan& plan,
                                   const MoveCallback& move,
