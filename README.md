@@ -181,12 +181,12 @@ packaged applications, and unusual owner/popup behavior remain beta validation
 inputs rather than separate prebuilt compatibility claims.
 
 Productization work still excludes production automatic lifecycle tracking,
-placement/Z-order/focus execution, persistence, GUI, hotkeys, tray icon,
-installer, Rust port, stress, latency benchmarking, and any form of faked or
-emulated native desktop lifecycle until those milestones are explicitly
-implemented. The model now includes complete discovery-snapshot reconciliation
-and fail-closed presentation planning, but those APIs do not themselves
-discover windows or mutate native presentation state.
+persistence, GUI, hotkeys, tray icon, installer, Rust port, stress, latency
+benchmarking, and any form of faked or emulated native desktop lifecycle until
+those milestones are explicitly implemented. The controlled
+`logical-workspace-test` now exercises identity-checked placement,
+non-activating Z-order, and confirmation-gated foreground restoration for its
+probe-owned windows; this is not yet a user-facing presentation manager.
 
 The first productization core is in
 [`src/workspace_engine.{h,cpp}`](src/workspace_engine.h). It models
@@ -198,12 +198,16 @@ evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
 `GetViewForHwnd` resolution before each move, and verifies the callback-backed
 transaction against live desktop state. The engine also provides deterministic
-generation-safe discovery reconciliation and presentation restore planning. A
-bounded read-only `window_lifecycle.{h,cpp}` source collects window-object
+generation-safe discovery reconciliation and fail-closed presentation restore
+planning/execution. The live command hands a journal to a fresh
+engine/coordinator pair and performs complete snapshot reconciliation after
+recovery; this is a bounded same-process simulation, not fresh-process startup
+bootstrap. A bounded read-only `window_lifecycle.{h,cpp}` source collects
+window-object
 WinEvent hints for owner-thread draining; native destroy hints remain
 non-authoritative and require a complete snapshot before model closure.
-Production lifecycle wiring, native placement/Z-order/focus execution, durable
-journal policy, and UI integration remain separate milestones.
+Production lifecycle wiring, durable journal/bootstrap policy, production
+focus/Z-order policy, and UI integration remain separate milestones.
 
 The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
@@ -212,8 +216,8 @@ until the lifecycle input is quiet, rejects stale plans before native mutation,
 and blocks new operations while a journal transaction is pending. Run
 `workspace-coordinator-test` for deterministic, non-mutating evidence. This is
 still a library boundary, not a long-running user-facing manager: production
-discovery policy, WinEvent message pumping, startup bootstrap, and native
-presentation execution remain separate.
+discovery policy, WinEvent message pumping, startup bootstrap, and
+presentation/focus policy remain separate.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

@@ -97,15 +97,19 @@ currently verifies:
   suppression and fail-closed handling of identity-less close events;
 - complete discovery-snapshot reconciliation with HWND-generation checks;
 - deterministic Z-order capture and fail-closed presentation restore planning;
+- identity-checked presentation execution ordering for probe-owned windows;
 - unsupported capability fail-closed behavior;
-- interrupted transaction recovery.
+- interrupted transaction recovery;
 - durable journal `BEGIN` replacement and terminal-marker flushing.
 
 All checks passed on August 12, 2026 after the engine was added.
 
-The discovery and presentation APIs are model-level boundaries, not a claim
-that the product already tracks every desktop window or changes native
-presentation state. `window_lifecycle.{h,cpp}` now adds a bounded read-only
+The discovery and presentation APIs remain callback boundaries, not a claim
+that the product already tracks every desktop window. The controlled
+`logical-workspace-test` supplies a probe-owned native presentation adapter
+that revalidates HWND generation and capability immediately before applying
+placement, non-activating Z-order, and confirmation-gated foreground
+operations. `window_lifecycle.{h,cpp}` adds a bounded read-only
 `SetWinEventHook` source for window-object create/show/destroy hints and a separate
 model-neutral adapter. The hook callback queues window-object hints without
 doing COM or model mutation; capability/native-role resolution happens later
@@ -127,17 +131,21 @@ complete, managed, capability-safe, and identity-consistent.
 
 ## Deliberate next boundaries
 
-The controlled `logical-workspace-test` now provides first live integration
+The controlled `logical-workspace-test` now provides live integration
 evidence: it captures three vdprobe-owned top-level HWNDs, resolves and
 re-resolves `IApplicationView` with `GetViewForHwnd`, supplies
-identity-checked move/observe callbacks to `WorkspaceEngine`, and verifies the
-transaction with notification events and documented desktop state. It is not
-yet the user-facing workspace manager. Remaining work is:
+identity-checked move/observe callbacks to `WorkspaceEngine`, executes the
+probe-only presentation restore path, and verifies the transaction with
+notification events and documented desktop state. Its interrupted-operation
+check hands the journal to a fresh engine/coordinator pair and then performs
+an authoritative complete reconciliation; this is still a bounded simulation,
+not a process-restart bootstrap. It is not yet the user-facing workspace
+manager. Remaining work is:
 
 - production wiring of lifecycle observations to full window discovery and a
   periodic/recovery full-snapshot policy;
-- native placement, Z-order, and focus execution;
 - durable crash-journal placement and startup recovery policy;
+- production focus/Z-order policy and foreground-lock failure handling;
 - minimal hotkey/UI integration.
 
 The serialized `WorkspaceCoordinator` boundary is now covered by the
