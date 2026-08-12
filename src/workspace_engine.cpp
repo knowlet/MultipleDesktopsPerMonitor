@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <system_error>
 #include <unordered_set>
@@ -52,6 +53,49 @@ NativeDesktopRole ParseRole(const std::string& value) noexcept {
     return NativeDesktopRole::Unknown;
 }
 
+bool PlansMatch(const SwitchPlan& a, const SwitchPlan& b) noexcept {
+    if (a.monitor != b.monitor || a.from_workspace != b.from_workspace ||
+        a.to_workspace != b.to_workspace ||
+        a.operations.size() != b.operations.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.operations.size(); ++i) {
+        const SwitchOperation& left = a.operations[i];
+        const SwitchOperation& right = b.operations[i];
+        if (left.identity != right.identity || left.from != right.from ||
+            left.to != right.to) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string Win32Error(const char* action, DWORD code = GetLastError()) {
+    return std::string(action) + ": " +
+           std::system_category().message(static_cast<int>(code));
+}
+
+bool WriteHandle(HANDLE file, const std::string& contents,
+                 std::string* error) {
+    std::size_t offset = 0;
+    while (offset < contents.size()) {
+        const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(
+            contents.size() - offset, std::numeric_limits<DWORD>::max()));
+        DWORD written = 0;
+        if (!WriteFile(file, contents.data() + offset, requested, &written,
+                       nullptr) || written == 0) {
+            if (error) *error = Win32Error("write journal failed");
+            return false;
+        }
+        offset += written;
+    }
+    if (!FlushFileBuffers(file)) {
+        if (error) *error = Win32Error("flush journal failed");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool WindowIdentity::IsValid() const noexcept {
@@ -95,18 +139,17 @@ bool WorkspaceJournal::Append(const std::string& line,
         if (!path_.parent_path().empty()) {
             std::filesystem::create_directories(path_.parent_path());
         }
-        std::ofstream out(path_, std::ios::binary | std::ios::app);
-        if (!out) {
-            if (error) *error = "open journal failed";
+        HANDLE file = CreateFileW(
+            path_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            if (error) *error = Win32Error("open journal failed");
             return false;
         }
-        out << line << '\n';
-        out.flush();
-        if (!out) {
-            if (error) *error = "write journal failed";
-            return false;
-        }
-        return true;
+        const bool written = WriteHandle(file, line + '\n', error);
+        CloseHandle(file);
+        return written;
     } catch (const std::exception& ex) {
         if (error) *error = ex.what();
         return false;
@@ -115,24 +158,49 @@ bool WorkspaceJournal::Append(const std::string& line,
 
 bool WorkspaceJournal::Begin(const SwitchPlan& plan, std::string* error) const {
     try {
+        std::string pending_error;
+        const std::optional<SwitchPlan> pending = ReadPending(&pending_error);
+        if (!pending_error.empty()) {
+            if (error) *error = "read existing journal failed: " + pending_error;
+            return false;
+        }
+        if (pending) {
+            if (error) *error = "journal already contains a pending transaction";
+            return false;
+        }
         if (!path_.parent_path().empty()) {
             std::filesystem::create_directories(path_.parent_path());
         }
-        std::ofstream out(path_, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            if (error) *error = "create journal failed";
+        std::ostringstream contents;
+        contents << "BEGIN " << plan.monitor << ' ' << plan.from_workspace
+                 << ' ' << plan.to_workspace << '\n';
+        for (const SwitchOperation& operation : plan.operations) {
+            contents << "MOVE " << IdentityText(operation.identity) << ' '
+                     << RoleLetter(operation.from) << ' '
+                     << RoleLetter(operation.to) << '\n';
+        }
+
+        std::filesystem::path temporary = path_;
+        temporary += L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                     std::to_wstring(GetCurrentThreadId()) + L"." +
+                     std::to_wstring(GetTickCount64());
+        HANDLE file = CreateFileW(
+            temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            if (error) *error = Win32Error("create journal temporary failed");
             return false;
         }
-        out << "BEGIN " << plan.monitor << ' ' << plan.from_workspace << ' '
-            << plan.to_workspace << '\n';
-        for (const SwitchOperation& operation : plan.operations) {
-            out << "MOVE " << IdentityText(operation.identity) << ' '
-                << RoleLetter(operation.from) << ' ' << RoleLetter(operation.to)
-                << '\n';
+        const bool written = WriteHandle(file, contents.str(), error);
+        CloseHandle(file);
+        if (!written) {
+            DeleteFileW(temporary.c_str());
+            return false;
         }
-        out.flush();
-        if (!out) {
-            if (error) *error = "write journal failed";
+        if (!MoveFileExW(temporary.c_str(), path_.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            if (error) *error = Win32Error("replace journal failed");
+            DeleteFileW(temporary.c_str());
             return false;
         }
         return true;
@@ -643,14 +711,20 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     std::string error;
     if (!ApplyOperations(plan.operations, move, observe, applied, &error)) {
         result.rollback_attempted = !applied.empty();
-        if (!applied.empty()) {
-            result.rollback_succeeded =
-                RestoreOperations(applied, move, observe, &error);
-        }
+        // Verify the entire recorded baseline before declaring the transaction
+        // aborted. Native side effects are not necessarily limited to the
+        // operation whose callback was invoked.
+        result.rollback_succeeded =
+            RestoreOperations(plan.operations, move, observe, &error);
         if (result.rollback_succeeded && journal) {
-            (void)journal->Abort(nullptr);
+            std::string abort_error;
+            if (!journal->Abort(&abort_error)) {
+                result.recovery_required = true;
+                error += "; journal abort failed: " + abort_error;
+            }
         }
-        result.recovery_required = !result.rollback_succeeded;
+        result.recovery_required =
+            result.recovery_required || !result.rollback_succeeded;
         result.error = error;
         return result;
     }
@@ -658,13 +732,18 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     if (journal && !journal->Commit(&journal_error)) {
         result.rollback_attempted = true;
         result.rollback_succeeded =
-            RestoreOperations(applied, move, observe, &error);
+            RestoreOperations(plan.operations, move, observe, &error);
         if (result.rollback_succeeded) {
-            (void)journal->Abort(nullptr);
-        } else {
-            result.recovery_required = true;
+            std::string abort_error;
+            if (!journal->Abort(&abort_error)) {
+                result.recovery_required = true;
+                error += "; journal abort failed: " + abort_error;
+            }
         }
+        result.recovery_required =
+            result.recovery_required || !result.rollback_succeeded;
         result.error = "journal commit failed: " + journal_error;
+        if (!error.empty()) result.error += "; " + error;
         return result;
     }
 
@@ -681,6 +760,74 @@ RecoveryResult WorkspaceEngine::RecoverPending(
         result.recovery_required = true;
         result.error = "move and observation callbacks are required";
         return result;
+    }
+    if (journal) {
+        std::string journal_error;
+        const std::optional<SwitchPlan> recorded =
+            journal->ReadPending(&journal_error);
+        if (!journal_error.empty()) {
+            result.recovery_required = true;
+            result.error = "journal recovery read failed: " + journal_error;
+            return result;
+        }
+        if (!recorded || !PlansMatch(*recorded, plan)) {
+            result.recovery_required = true;
+            result.error = "recovery plan does not match pending journal";
+            return result;
+        }
+    }
+    if (plan.monitor == 0) {
+        if (plan.from_workspace != 0 || plan.to_workspace != 0) {
+            result.recovery_required = true;
+            result.error = "invalid reconcile recovery plan";
+            return result;
+        }
+    } else {
+        const MonitorWorkspaceState* monitor = Monitor(plan.monitor);
+        if (monitor == nullptr || plan.from_workspace == plan.to_workspace ||
+            !HasWorkspace(plan.monitor, plan.from_workspace) ||
+            !HasWorkspace(plan.monitor, plan.to_workspace) ||
+            monitor->active != plan.from_workspace) {
+            result.recovery_required = true;
+            result.error = "invalid or stale switch recovery plan";
+            return result;
+        }
+        std::string expected_error;
+        const std::optional<SwitchPlan> expected =
+            PrepareSwitch(plan.monitor, plan.to_workspace, &expected_error);
+        if (!expected || !PlansMatch(*expected, plan)) {
+            result.recovery_required = true;
+            result.error = "recovery plan does not match current workspace state";
+            return result;
+        }
+    }
+    std::unordered_set<WindowIdentity, WindowIdentityHash> identities;
+    for (const SwitchOperation& operation : plan.operations) {
+        const WindowRecord* window = FindWindow(operation.identity);
+        if (window == nullptr ||
+            window->disposition != WindowDisposition::Managed ||
+            !window->capabilities.Manageable() ||
+            operation.from == NativeDesktopRole::Unknown ||
+            operation.to == NativeDesktopRole::Unknown ||
+            operation.from == operation.to ||
+            !identities.insert(operation.identity).second ||
+            (plan.monitor != 0 && window->monitor != plan.monitor)) {
+            result.recovery_required = true;
+            result.error = "invalid or stale recovery operation";
+            return result;
+        }
+        if (plan.monitor == 0) {
+            const MonitorWorkspaceState* monitor = Monitor(window->monitor);
+            const NativeDesktopRole desired =
+                monitor != nullptr && monitor->active == window->workspace
+                    ? NativeDesktopRole::Carrier
+                    : NativeDesktopRole::Parking;
+            if (monitor == nullptr || operation.to != desired) {
+                result.recovery_required = true;
+                result.error = "reconcile recovery operation is stale";
+                return result;
+            }
+        }
     }
     std::vector<SwitchOperation> pending = plan.operations;
     std::string error;
@@ -742,27 +889,38 @@ bool WorkspaceEngine::Reconcile(const MoveCallback& move,
 
     std::vector<SwitchOperation> applied;
     if (!ApplyOperations(operations, move, observe, applied, error)) {
-        if (!applied.empty()) {
-            std::string rollback_error;
-            if (!RestoreOperations(applied, move, observe, &rollback_error) &&
-                error) {
-                *error += "; " + rollback_error;
+        std::string rollback_error;
+        const bool rolled_back =
+            RestoreOperations(operations, move, observe, &rollback_error);
+        if (!rolled_back && error) {
+            *error += "; " + rollback_error + "; recovery required";
+        }
+        if (rolled_back && journal) {
+            std::string abort_error;
+            if (!journal->Abort(&abort_error) && error) {
+                *error += "; journal abort failed: " + abort_error +
+                          "; recovery required";
             }
         }
-        if (journal) (void)journal->Abort(nullptr);
         return false;
     }
     if (journal && !journal->Commit(&journal_error)) {
         std::string rollback_error;
         const bool rolled_back =
-            RestoreOperations(applied, move, observe, &rollback_error);
+            RestoreOperations(operations, move, observe, &rollback_error);
         if (!rolled_back && error) {
             *error = "journal reconcile commit failed: " + journal_error +
                      "; " + rollback_error;
         } else if (error) {
             *error = "journal reconcile commit failed: " + journal_error;
         }
-        if (rolled_back) (void)journal->Abort(nullptr);
+        if (rolled_back) {
+            std::string abort_error;
+            if (!journal->Abort(&abort_error) && error) {
+                *error += "; journal abort failed: " + abort_error +
+                          "; recovery required";
+            }
+        }
         return false;
     }
     for (const SwitchOperation& operation : operations) {
@@ -945,6 +1103,12 @@ int CmdWorkspaceEngineTest() {
     bool recovery_ok = recovery_plan.has_value() &&
                        journal.Begin(*recovery_plan, &error);
     if (recovery_ok) {
+        std::string second_begin_error;
+        recovery_ok = !journal.Begin(*recovery_plan, &second_begin_error) &&
+                      second_begin_error ==
+                          "journal already contains a pending transaction";
+    }
+    if (recovery_ok) {
         const std::optional<SwitchPlan> pending =
             journal.ReadPending(&error);
         recovery_ok = pending.has_value() &&
@@ -963,6 +1127,75 @@ int CmdWorkspaceEngineTest() {
     std::filesystem::remove(journal_path, ignored);
     ok = ok && recovery_ok;
     Field("interrupted transaction recovery", recovery_ok ? "PASS" : "FAIL");
+
+    std::filesystem::remove(journal_path, ignored);
+    std::filesystem::path stale_temporary = journal_path;
+    stale_temporary += L".tmp.stale";
+    {
+        std::ofstream stale(stale_temporary, std::ios::binary | std::ios::trunc);
+        stale << "incomplete replacement";
+    }
+    bool durable_journal = recovery_plan.has_value() &&
+                           journal.Begin(*recovery_plan, &error);
+    if (durable_journal) {
+        std::ifstream persisted(journal_path, std::ios::binary);
+        const std::string journal_contents(
+            (std::istreambuf_iterator<char>(persisted)),
+            std::istreambuf_iterator<char>());
+        durable_journal = journal_contents.starts_with("BEGIN ") &&
+                          journal_contents.find("MOVE ") != std::string::npos &&
+                          journal.Abort(&error) && !journal.ReadPending(&error);
+    }
+    std::filesystem::remove(journal_path, ignored);
+    std::filesystem::remove(stale_temporary, ignored);
+    ok = ok && durable_journal;
+    Field("durable journal replacement and marker",
+          durable_journal ? "PASS" : "FAIL");
+
+    std::filesystem::remove(journal_path, ignored);
+    WorkspaceJournal rollback_journal(journal_path);
+    auto rollback_plan = engine.PrepareSwitch(1, 2, &error);
+    bool retained_pending = rollback_plan.has_value();
+    int rollback_move_count = 0;
+    auto fail_move_and_rollback = [&](const WindowRecord& window,
+                                      NativeDesktopRole target) -> bool {
+        ++rollback_move_count;
+        fake_roles[window.identity] = target;
+        // The first operation succeeds, the second reports failure after its
+        // side effect, and restoring either operation then fails.
+        return rollback_move_count < 2;
+    };
+    if (retained_pending) {
+        const TransactionResult rollback_failed = engine.ExecuteSwitch(
+            *rollback_plan, fail_move_and_rollback, observe, &rollback_journal);
+        const std::optional<SwitchPlan> still_pending =
+            rollback_journal.ReadPending(&error);
+        retained_pending = !rollback_failed.committed &&
+                           rollback_failed.recovery_required &&
+                           still_pending.has_value() &&
+                           PlansMatch(*still_pending, *rollback_plan);
+    }
+    fake_roles[a1_id] = NativeDesktopRole::Carrier;
+    fake_roles[reused_id] = NativeDesktopRole::Parking;
+    std::filesystem::remove(journal_path, ignored);
+    ok = ok && retained_pending;
+    Field("failed rollback retains pending journal",
+          retained_pending ? "PASS" : "FAIL");
+
+    SwitchPlan stale_plan{};
+    stale_plan.monitor = 99;
+    stale_plan.from_workspace = 1;
+    stale_plan.to_workspace = 2;
+    stale_plan.operations = {{a1_id, NativeDesktopRole::Carrier,
+                              NativeDesktopRole::Parking}};
+    const RecoveryResult stale_recovery =
+        engine.RecoverPending(stale_plan, move, observe);
+    const bool stale_rejected = !stale_recovery.recovered &&
+                                stale_recovery.recovery_required &&
+                                fake_roles[a1_id] == NativeDesktopRole::Carrier;
+    ok = ok && stale_rejected;
+    Field("stale recovery plan is rejected",
+          stale_rejected ? "PASS" : "FAIL");
 
     Field("result", ok ? "PASS" : "FAIL");
     if (!ok && !error.empty()) Field("error", error);
