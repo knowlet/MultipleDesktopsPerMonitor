@@ -63,6 +63,7 @@ Gated feasibility tests:
 | `vdprobe explorer-semantics-test --confirm-mutate` | Phase 4B-1: launches two newly attributable Explorer top-level windows, moves one view Carrier -> Parking, observes sibling/owned-window behavior, and restores only probe-created HWNDs |
 | `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4C: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
+| `vdprobe workspace-discovery-test` | productization boundary: deterministic, non-mutating capability-driven complete-window discovery and fail-closed classification |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 
@@ -206,6 +207,16 @@ bootstrap. A bounded read-only `window_lifecycle.{h,cpp}` source collects
 window-object
 WinEvent hints for owner-thread draining; native destroy hints remain
 non-authoritative and require a complete snapshot before model closure.
+The new `window_discovery.{h,cpp}` boundary performs complete, deterministic
+read-only discovery through injected enumeration/observation callbacks. It
+captures generation-safe HWND identity, monitor/owner/tool state, documented
+desktop role, presentation, and runtime capabilities, then classifies records
+as `Managed`, `Unsupported`, or `Ambiguous` without assigning logical
+workspaces or using executable names. Incomplete enumeration, duplicate
+identity, unstable observation, invalid desktop role, or backend exceptions
+fail closed and preserve the prior snapshot. `workspace-discovery-test`
+exercises this boundary without COM or native mutation; it is an injectable
+classification seam, not yet a live all-window production enumerator.
 Production lifecycle wiring, durable journal/bootstrap policy, production
 focus/Z-order policy, and UI integration remain separate milestones.
 

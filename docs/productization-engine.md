@@ -96,6 +96,9 @@ currently verifies:
 - generation-safe lifecycle observations, including stale-generation
   suppression and fail-closed handling of identity-less close events;
 - complete discovery-snapshot reconciliation with HWND-generation checks;
+- read-only complete-window discovery through an injected backend, including
+  runtime capability classification and fail-closed duplicate/exception
+  handling;
 - deterministic Z-order capture and fail-closed presentation restore planning;
 - identity-checked presentation execution ordering for probe-owned windows;
 - unsupported capability fail-closed behavior;
@@ -127,7 +130,29 @@ through `shutdown_ok()`. `ReconcileDiscoverySnapshot()` requires a complete,
 point-in-time observation and treats omitted tracked windows as closed;
 generation changes are recorded as recreation. `PreparePresentationRestore()`
 emits placement, Z-order, and foreground operations only when the snapshot is
-complete, managed, capability-safe, and identity-consistent.
+ complete, managed, capability-safe, and identity-consistent.
+
+The read-only `window_discovery.{h,cpp}` layer is the next productization
+boundary. Its `WindowDiscoveryBackend` accepts complete HWND enumeration and
+per-window observation callbacks, so platform-specific identity, monitor,
+desktop-role, presentation, and `IApplicationView` capability reads remain
+outside the state model. `WindowDiscovery::Discover()` sorts and validates a
+complete snapshot, rejects duplicate HWNDs or generations, and leaves the
+previous result unchanged on observation failure or callback exception. It
+classifies only proven Carrier/Parking top-level records as `Managed`;
+unsupported capability or tool/owned windows are retained as `Unsupported`,
+while missing identity, monitor, desktop state, or a valid native role is
+`Ambiguous`. It deliberately does not assign logical workspaces, mutate native
+state, or branch on executable names. Run:
+
+```powershell
+.\build\vdprobe.exe workspace-discovery-test
+```
+
+This deterministic test covers managed/unsupported/ambiguous classification,
+incomplete and duplicate enumeration, tool/ownership limits, invalid native
+roles, and enumeration/observation exception containment. A live all-window
+discovery adapter and assignment policy remain separate milestones.
 
 ## Deliberate next boundaries
 
