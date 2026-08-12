@@ -206,7 +206,8 @@ manager. Remaining work is:
 
 - production wiring of lifecycle observations to full window discovery and a
   periodic/recovery full-snapshot policy;
-- durable crash-journal placement and startup recovery policy;
+- production process hosting, journal-path selection, and startup invocation
+  policy around the reusable startup boundary;
 - production focus/Z-order policy and foreground-lock failure handling;
 - minimal hotkey/UI integration.
 
@@ -219,6 +220,19 @@ journal recovery to `WorkspaceEngine`. It is intentionally not yet a
 long-running manager: the caller still supplies complete discovery and native
 move/observe callbacks, pumps the WinEvent owner thread, and chooses the
 production journal/bootstrap policy.
+
+`workspace_startup.{h,cpp}` adds the bounded reusable `RecoverAtStartup`
+ordering boundary. Its caller supplies the normal engine/coordinator,
+authoritative discovery callback, lifecycle source, stable journal path, and a
+factory for the fresh recovery runtime. It starts and verifies the WinEvent
+source, reads the journal before enabling operations, requires a complete quiet
+snapshot, and for a pending transaction bootstraps a fresh model, recovers it,
+then requires full reconciliation. Journal parse errors, unproven identities,
+lifecycle instability, and every recovery failure block operations and retain
+the journal. `workspace-startup-test` is deterministic and uses only
+in-memory move/observation callbacks; it does not mutate native windows or
+desktops. This is a boundary, not a claim that a long-running product host or
+journal-location policy is complete.
 
 The live command was also attempted on the current host. `GetImmersiveShell`
 returned `E_ACCESSDENIED` before any probe window was spawned, so the command

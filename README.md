@@ -69,6 +69,7 @@ Gated feasibility tests:
 | `vdprobe workspace-live-coordinator-bootstrap-test` | starts the read-only WinEvent source and reconciles bounded complete live discovery through `WorkspaceCoordinator`; assignment remains synthetic/in-memory and no move callback is installed |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
+| `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -241,7 +242,15 @@ and blocks new operations while a journal transaction is pending. Run
 `workspace-coordinator-test` for deterministic, non-mutating evidence. This is
 still a library boundary, not a long-running user-facing manager: production
 discovery policy, WinEvent message pumping, startup bootstrap, and
-presentation/focus policy remain separate.
+presentation/focus policy remain separate. `workspace_startup.{h,cpp}` now
+adds a reusable caller-composed `RecoverAtStartup` gate: it starts/verifies the
+owner-thread WinEvent source, reads an injected stable journal path before
+enabling operations, requires an authoritative complete snapshot, and, for a
+pending transaction, bootstraps a fresh recovery engine, recovers it, then
+requires a second full reconciliation. Malformed journals, missing pending
+identities, unavailable/unstable lifecycle input, and recovery failures remain
+blocked with the journal retained. The boundary does not choose discovery or
+native move policy; its deterministic test uses only in-memory callbacks.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

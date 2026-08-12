@@ -19,6 +19,7 @@
 #include "util.h"
 #include "window_discovery.h"
 #include "workspace_coordinator.h"
+#include "workspace_startup.h"
 
 namespace {
 
@@ -103,6 +104,9 @@ void Usage() {
         "                      exercise serialized discovery, lifecycle quiet\n"
         "                      boundaries, stale-safe switching, and recovery\n"
         "                      without touching COM or native desktops\n"
+        "  workspace-startup-test\n"
+        "                      exercise fail-closed startup ordering, stable\n"
+        "                      journal recovery, and fresh-model reconciliation\n"
         "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
@@ -224,6 +228,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-coordinator-test") {
         rc = vd::CmdWorkspaceCoordinatorTest();
+    } else if (cmd == "workspace-startup-test") {
+        rc = vd::CmdWorkspaceStartupTest();
     } else if (cmd == "real-app-child") {
         // Internal helper launched by real-app-semantics-test.  It is not
         // documented as a standalone probe command.
