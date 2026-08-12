@@ -1,6 +1,7 @@
 #include "window_lifecycle.h"
 
 #include <algorithm>
+#include <exception>
 #include <system_error>
 #include <unordered_map>
 
@@ -13,6 +14,25 @@ std::unordered_map<HWINEVENTHOOK, WinEventLifecycleSource*> g_sources;
 std::string Win32Error(const char* action) {
     return std::string(action) + ": " +
            std::system_category().message(static_cast<int>(GetLastError()));
+}
+
+bool RemoveHookNoexcept(const WinEventLifecycleSource::RemoveHook& remove,
+                        HWINEVENTHOOK hook) noexcept {
+    try {
+        return remove && remove(hook);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool IsWellFormedHint(const WindowLifecycleEvent& event) noexcept {
+    if (event.hwnd == nullptr) return false;
+    if (event.kind != WindowLifecycleEventKind::Appeared &&
+        event.kind != WindowLifecycleEventKind::Closed) {
+        return false;
+    }
+    return !event.identity ||
+           (event.identity->IsValid() && event.identity->hwnd == event.hwnd);
 }
 
 }  // namespace
@@ -31,13 +51,13 @@ LifecycleApplyResult WindowLifecycleAdapter::RequireReconcile(
 LifecycleApplyResult WindowLifecycleAdapter::Apply(
     const WindowLifecycleEvent& event, std::string* error) {
     if (error) error->clear();
+    // Hints are never authoritative.  In particular, a malformed hint must
+    // not force a snapshot or cause the observer to mutate model state.
+    if (!IsWellFormedHint(event)) return LifecycleApplyResult::Ignored;
     if (reconciliation_required_) {
         return RequireReconcile(
             "authoritative full snapshot required before incremental events",
             error);
-    }
-    if (event.hwnd == nullptr) {
-        return RequireReconcile("lifecycle event has no HWND", error);
     }
 
     if (event.kind == WindowLifecycleEventKind::Closed) {
@@ -54,7 +74,18 @@ LifecycleApplyResult WindowLifecycleAdapter::Apply(
         return RequireReconcile("window observation callback is unavailable",
                                 error);
     }
-    std::optional<WindowRecord> observed = observe_(event.hwnd);
+    std::optional<WindowRecord> observed;
+    try {
+        observed = observe_(event.hwnd);
+    } catch (const std::exception& exception) {
+        return RequireReconcile(
+            (std::string("window observation callback threw: ") +
+             exception.what())
+                .c_str(),
+            error);
+    } catch (...) {
+        return RequireReconcile("window observation callback threw", error);
+    }
     if (!observed) {
         // Creation/show notifications are hints. An untracked window may have
         // vanished before dispatch; losing a tracked observation is unsafe.
@@ -103,10 +134,7 @@ bool WindowLifecycleAdapter::ReconcileCompleteSnapshot(
     std::vector<EventKey> unique;
     unique.reserve(events.size());
     for (const WindowLifecycleEvent& event : events) {
-        if (event.hwnd == nullptr ||
-            (event.identity &&
-             (!event.identity->IsValid() ||
-              event.identity->hwnd != event.hwnd))) {
+        if (!IsWellFormedHint(event)) {
             ++next.invalid_events;
             continue;
         }
@@ -175,64 +203,113 @@ bool WinEventLifecycleSource::Start(std::string* error) {
         return false;
     }
     if (running()) return true;
+    if (!hooks_.empty()) {
+        if (error) {
+            *error = "WinEvent source has a hook pending failed shutdown";
+        }
+        shutdown_ok_ = false;
+        return false;
+    }
     owner_thread_id_ = current_thread;
+
+    HWINEVENTHOOK hook = nullptr;
+    bool duplicate_hook = false;
     try {
         hooks_.reserve(1);
         // CREATE, DESTROY, and SHOW are contiguous EVENT_OBJECT values. One
         // hook keeps their delivery in a single ordered source.
-        HWINEVENTHOOK hook =
-            install_(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, Callback);
+        hook = install_(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, Callback);
         if (hook == nullptr) {
             if (error) *error = Win32Error("SetWinEventHook failed");
-            Stop();
+            shutdown_ok_ = true;
             return false;
         }
         hooks_.push_back(hook);
         {
             std::lock_guard lock(g_sources_mutex);
-            g_sources.emplace(hook, this);
+            const auto [it, inserted] = g_sources.emplace(hook, this);
+            (void)it;
+            duplicate_hook = !inserted;
         }
+        if (duplicate_hook) {
+            const bool removed = RemoveHookNoexcept(remove_, hook);
+            if (removed) hooks_.pop_back();
+            shutdown_ok_ = removed;
+            if (error) {
+                *error = removed ? "SetWinEventHook returned a duplicate hook"
+                                 : "SetWinEventHook returned a duplicate hook "
+                                   "and cleanup failed";
+            }
+            return false;
+        }
+        running_ = true;
         shutdown_ok_ = true;
         queue_overflowed_.store(false, std::memory_order_release);
         return true;
     } catch (...) {
-        if (error) *error = "SetWinEventHook installation threw";
-        Stop();
+        // reserve() completes before a native hook is installed, so an
+        // installed hook always has a no-allocation slot in hooks_.  Remove it
+        // directly rather than calling Stop(), whose public semantics retain
+        // failed unhooks for an explicit retry.
+        const bool removed =
+            hook != nullptr && !hooks_.empty() && hooks_.back() == hook &&
+            RemoveHookNoexcept(remove_, hook);
+        if (removed) hooks_.pop_back();
+        shutdown_ok_ = hook == nullptr || removed;
+        if (error) {
+            *error = shutdown_ok_ ? "SetWinEventHook installation threw"
+                                  : "SetWinEventHook installation threw and "
+                                    "hook cleanup failed";
+        }
         return false;
     }
 }
 
 void WinEventLifecycleSource::Stop() noexcept {
-    if (hooks_.empty()) return;
+    if (hooks_.empty()) {
+        running_ = false;
+        return;
+    }
     if (owner_thread_id_ != GetCurrentThreadId()) {
         // The WinEvent API requires unhooking on the installing thread. Do
         // remove registry ownership here so a cross-thread destructor cannot
         // leave callbacks dereferencing a destroyed source. The native hooks
         // remain installed until their owner thread can unhook them.
-        {
+        try {
             std::lock_guard lock(g_sources_mutex);
             for (HWINEVENTHOOK hook : hooks_) g_sources.erase(hook);
+        } catch (...) {
+            // There is no safe way to unhook while a callback may still hold
+            // this source's registry entry. Keep the failure observable.
         }
+        running_ = false;
         shutdown_ok_ = false;
         return;
     }
-    std::vector<HWINEVENTHOOK> remaining;
-    remaining.reserve(hooks_.size());
-    for (HWINEVENTHOOK hook : hooks_) {
-        {
+    std::size_t index = 0;
+    bool all_removed = true;
+    while (index < hooks_.size()) {
+        const HWINEVENTHOOK hook = hooks_[index];
+        try {
             std::lock_guard lock(g_sources_mutex);
             g_sources.erase(hook);
-        }
-        bool removed = false;
-        try {
-            removed = remove_(hook);
         } catch (...) {
-            removed = false;
+            // Do not call the native unhook while callbacks can still reach
+            // the source through an entry that could not be removed.
+            all_removed = false;
+            ++index;
+            continue;
         }
-        if (!removed) remaining.push_back(hook);
+        if (RemoveHookNoexcept(remove_, hook)) {
+            hooks_[index] = hooks_.back();
+            hooks_.pop_back();
+        } else {
+            all_removed = false;
+            ++index;
+        }
     }
-    hooks_.swap(remaining);
-    shutdown_ok_ = hooks_.empty();
+    running_ = false;
+    shutdown_ok_ = all_removed && hooks_.empty();
 }
 
 std::vector<WindowLifecycleEvent> WinEventLifecycleSource::Drain() {
@@ -242,9 +319,13 @@ std::vector<WindowLifecycleEvent> WinEventLifecycleSource::Drain() {
 WindowLifecycleBatch WinEventLifecycleSource::DrainBatch() {
     std::lock_guard lock(queue_mutex_);
     WindowLifecycleBatch result;
+    // Allocate before consuming the sticky bit.  If reserve throws, both the
+    // queued hints and the evidence that hints were lost remain available to
+    // the next successful drain.
+    result.events.reserve(queue_.size());
     result.overflowed =
         queue_overflowed_.exchange(false, std::memory_order_acq_rel);
-    result.events.reserve(queue_.size());
+    result.event_epoch = event_epoch_.load(std::memory_order_acquire);
     while (!queue_.empty()) {
         result.events.push_back(std::move(queue_.front()));
         queue_.pop_front();
@@ -258,6 +339,7 @@ void WinEventLifecycleSource::Collect(WindowLifecycleEvent event) {
 
 void WinEventLifecycleSource::Enqueue(WindowLifecycleEvent event) {
     std::lock_guard lock(queue_mutex_);
+    event_epoch_.fetch_add(1, std::memory_order_acq_rel);
     constexpr std::size_t kMaxQueuedEvents = 4096;
     if (queue_.size() >= kMaxQueuedEvents) {
         queue_overflowed_.store(true, std::memory_order_release);
@@ -269,26 +351,40 @@ void WinEventLifecycleSource::Enqueue(WindowLifecycleEvent event) {
 void CALLBACK WinEventLifecycleSource::Callback(
     HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG object_id, LONG child_id,
     DWORD /*event_thread*/, DWORD /*event_time*/) {
-    if (hwnd == nullptr || object_id != OBJID_WINDOW ||
-        child_id != CHILDID_SELF) {
-        return;
-    }
-    WindowLifecycleEventKind kind;
-    if (event == EVENT_OBJECT_DESTROY) {
-        kind = WindowLifecycleEventKind::Closed;
-    } else if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
-        kind = WindowLifecycleEventKind::Appeared;
-    } else {
-        return;
-    }
+    // No exception may cross a WinEvent callback boundary. If queueing itself
+    // fails (for example, allocation failure), preserve correctness by
+    // forcing the owner to obtain an authoritative snapshot on its next drain.
+    try {
+        if (hwnd == nullptr || object_id != OBJID_WINDOW ||
+            child_id != CHILDID_SELF) {
+            return;
+        }
+        WindowLifecycleEventKind kind;
+        if (event == EVENT_OBJECT_DESTROY) {
+            kind = WindowLifecycleEventKind::Closed;
+        } else if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
+            kind = WindowLifecycleEventKind::Appeared;
+        } else {
+            return;
+        }
 
-    // Native out-of-context callbacks are hints only. Identity is resolved
-    // later by the observer/full-snapshot boundary; destroy dispatch is too
-    // late to provide a trustworthy event-time generation.
-    WindowLifecycleEvent observation{kind, hwnd, std::nullopt};
-    std::lock_guard lock(g_sources_mutex);
-    const auto it = g_sources.find(hook);
-    if (it != g_sources.end()) it->second->Enqueue(std::move(observation));
+        // Native out-of-context callbacks are hints only. Identity is resolved
+        // later by the observer/full-snapshot boundary; destroy dispatch is too
+        // late to provide a trustworthy event-time generation.
+        WindowLifecycleEvent observation{kind, hwnd, std::nullopt};
+        std::lock_guard lock(g_sources_mutex);
+        const auto it = g_sources.find(hook);
+        if (it == g_sources.end()) return;
+        try {
+            it->second->Enqueue(std::move(observation));
+        } catch (...) {
+            it->second->queue_overflowed_.store(true,
+                                                 std::memory_order_release);
+        }
+    } catch (...) {
+        // The source may be unavailable (for example if acquiring the global
+        // registry lock failed). There is no safe target to mark in that case.
+    }
 }
 
 const char* LifecycleApplyResultText(LifecycleApplyResult result) noexcept {

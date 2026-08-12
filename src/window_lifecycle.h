@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -40,6 +41,7 @@ struct LifecycleReconcileResult {
 struct WindowLifecycleBatch {
     std::vector<WindowLifecycleEvent> events;
     bool overflowed = false;
+    std::uint64_t event_epoch = 0;
 };
 
 enum class LifecycleApplyResult {
@@ -104,8 +106,12 @@ class WinEventLifecycleSource {
 
     bool Start(std::string* error = nullptr);
     void Stop() noexcept;
-    bool running() const noexcept { return !hooks_.empty(); }
+    bool running() const noexcept { return running_; }
     bool shutdown_ok() const noexcept { return shutdown_ok_; }
+    bool healthy() const noexcept { return running_ && shutdown_ok_; }
+    std::uint64_t event_epoch() const noexcept {
+        return event_epoch_.load(std::memory_order_acquire);
+    }
     bool queue_overflowed() const noexcept {
         return queue_overflowed_.load(std::memory_order_acquire);
     }
@@ -129,7 +135,15 @@ class WinEventLifecycleSource {
     InstallHook install_;
     RemoveHook remove_;
     DWORD owner_thread_id_ = 0;
+    // A hook that could not be removed is retained for a later Stop() retry,
+    // but is no longer considered a running event source once it has been
+    // removed from the callback registry.
+    bool running_ = false;
     bool shutdown_ok_ = true;
+    // Monotonically changes whenever a valid hint reaches this source,
+    // including a hint that cannot be queued. Transactions can use this as a
+    // non-destructive pre-commit lifecycle boundary.
+    std::atomic<std::uint64_t> event_epoch_{0};
     std::atomic_bool queue_overflowed_{false};
     std::mutex queue_mutex_;
     std::deque<WindowLifecycleEvent> queue_;
