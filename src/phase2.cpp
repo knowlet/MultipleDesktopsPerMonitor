@@ -1604,13 +1604,30 @@ bool WaitForNewChromiumPrimary(
     return false;
 }
 
-bool RemoveProbeProfileDirectory(const std::wstring& path) {
+bool RemoveProbeProfileDirectory(const std::wstring& path,
+                                 DWORD timeout_ms = 5000) {
     if (path.empty()) return true;
-    std::error_code ec;
-    const auto removed = std::filesystem::remove_all(path, ec);
-    return !ec && (removed != 0 ||
-                   ::GetFileAttributesW(path.c_str()) ==
-                       INVALID_FILE_ATTRIBUTES);
+
+    // Edge can keep a short-lived profile lock after the last top-level
+    // window has processed WM_CLOSE.  Retry only this probe-owned directory;
+    // never terminate a process or remove an existing browser profile.
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    for (;;) {
+        std::error_code ec;
+        (void)std::filesystem::remove_all(path, ec);
+        const DWORD attributes = ::GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            const DWORD error = ::GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND ||
+                error == ERROR_PATH_NOT_FOUND) {
+                return true;
+            }
+        }
+
+        if (::GetTickCount64() >= deadline) return false;
+        PumpStaMessages();
+        ::Sleep(100);
+    }
 }
 
 bool CloseChromiumWindow(HWND hwnd, DWORD timeout_ms = 5000) {
