@@ -63,6 +63,7 @@ Gated feasibility tests:
 | `vdprobe explorer-semantics-test --confirm-mutate` | Phase 4B-1: launches two newly attributable Explorer top-level windows, moves one view Carrier -> Parking, observes sibling/owned-window behavior, and restores only probe-created HWNDs |
 | `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4C: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
+| `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -181,6 +182,16 @@ Productization work still excludes automatic lifecycle tracking, focus/Z-order
 recovery, persistence, GUI, hotkeys, tray icon, installer, Rust port, stress,
 latency benchmarking, and any form of faked or emulated native desktop
 lifecycle until those milestones are explicitly implemented.
+
+The first productization core is in
+[`src/workspace_engine.{h,cpp}`](src/workspace_engine.h). It models
+`MonitorId × WorkspaceId` independently from native desktop GUIDs, accepts
+runtime `WindowCapabilities`, rejects unsupported/ambiguous affected windows,
+and provides a callback-based switch transaction with rollback and optional
+journal recovery. Run `workspace-engine-test` for deterministic, non-mutating
+evidence. Live HWND discovery, `IApplicationView` movement, WinEvent lifecycle
+tracking, focus/Z-order restoration, and UI integration remain separate
+milestones.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

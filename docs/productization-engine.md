@@ -1,0 +1,108 @@
+# Productization engine — stateful Carrier/Parking core
+
+## Decision
+
+The representative compatibility gate is complete:
+
+| Behavior type | Representative | Result |
+|---|---|---|
+| Classic Win32 | controlled vdprobe child | `GO-WITH-LIMITATIONS` |
+| Shell/shared process | Explorer | `GO-WITH-LIMITATIONS` |
+| Chromium multi-process | isolated Microsoft Edge | `GO-WITH-LIMITATIONS` |
+| Packaged/modern Windows app | Windows Terminal | `GO-WITH-LIMITATIONS` |
+
+This is the `GO-PRODUCTIZATION` checkpoint. The engine must remain
+capability-driven; it must not grow an executable whitelist.
+
+## Engine milestone
+
+`src/workspace_engine.{h,cpp}` contains the first non-mutating productization
+core. It keeps logical workspace identity separate from native desktop GUIDs:
+
+```text
+HMONITOR/MonitorId × WorkspaceId -> logical ownership
+active workspace window         -> Carrier
+inactive workspace window       -> shared Parking
+```
+
+The engine accepts a `WindowCapabilities` record instead of an application
+name:
+
+```cpp
+has_application_view
+can_move_desktops
+independent_top_level
+desktop_state_observable
+owner_state_observable
+```
+
+Unsupported or ambiguous windows are retained as records but are excluded from
+mutating switch plans. A switch touching an unsupported/ambiguous affected
+workspace fails closed. Unrelated unsupported windows on another workspace do
+not block a monitor-local switch.
+
+Window identity is generation-safe for the current model: HWND, PID, and
+process creation time are stored together. Re-observing the same HWND with a
+different process generation produces `Recreated`; a close removes the record
+and a later observation adds a fresh record.
+
+## Transaction and recovery boundary
+
+`PrepareSwitch()` only produces operations for the outgoing and incoming
+logical workspaces on one monitor. Operations are ordered Carrier -> Parking
+before Parking -> Carrier. `ExecuteSwitch()`:
+
+1. validates the current logical/native invariant;
+2. writes a `BEGIN` journal record when configured;
+3. verifies the observed native role before each move;
+4. invokes the caller-supplied move callback;
+5. verifies the resulting native role;
+6. rolls back applied operations in reverse order on failure;
+7. commits the logical active workspace only after all operations succeed.
+
+If a journal commit or native move fails, rollback is attempted immediately.
+If rollback cannot be verified, the result is marked
+`recovery_required=true`; startup can call `RecoverPending()` with the pending
+plan before accepting new workspace operations.
+
+The journal is deliberately generic and does not call `SwitchDesktop`, create
+desktops, remove desktops, or terminate processes. It is a transaction
+boundary, not persistence of a native desktop identity.
+
+## Deterministic evidence
+
+Run:
+
+```powershell
+.\build\vdprobe.exe workspace-engine-test
+```
+
+This test performs no COM calls and no native desktop/window mutation. It
+currently verifies:
+
+- two monitors with independent active workspaces;
+- Carrier/Parking invariant enforcement;
+- one monitor-local switch and round-trip restoration;
+- HWND reuse as a new generation;
+- close and recreate lifecycle;
+- unsupported capability fail-closed behavior;
+- interrupted transaction recovery.
+
+All checks passed on August 12, 2026 after the engine was added.
+
+## Deliberate next boundaries
+
+The engine is not yet the user-facing workspace manager. The following still
+need live integration and evidence:
+
+- discovery through top-level HWND enumeration and `GetViewForHwnd`;
+- a live move/observe adapter around `IApplicationView`;
+- `SetWinEventHook` lifecycle tracking;
+- focus and Z-order restoration;
+- durable crash journal placement and startup recovery policy;
+- minimal hotkey/UI integration.
+
+These layers should call the capability-driven engine and preserve its
+fail-closed behavior. They should not add app-name branches unless a concrete
+runtime anomaly demonstrates that a capability is insufficient.
+
