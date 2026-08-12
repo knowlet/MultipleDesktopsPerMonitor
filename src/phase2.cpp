@@ -1576,15 +1576,16 @@ struct NativeUnicodeString {
     PWSTR buffer = nullptr;
 };
 
-std::wstring ReadProcessCommandLine(DWORD pid) {
-    if (pid == 0) return {};
+bool ReadProcessCommandLine(DWORD pid, std::wstring& out) {
+    out.clear();
+    if (pid == 0) return false;
     HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == nullptr) return {};
+    if (process == nullptr) return false;
     auto query = TryGetProcAs<NtQueryInformationProcessFn>(
         L"ntdll.dll", "NtQueryInformationProcess");
     if (query == nullptr) {
         ::CloseHandle(process);
-        return {};
+        return false;
     }
 
     constexpr ULONG kProcessCommandLineInformation = 60;
@@ -1592,20 +1593,20 @@ std::wstring ReadProcessCommandLine(DWORD pid) {
     (void)query(process, kProcessCommandLineInformation, nullptr, 0, &length);
     if (length < sizeof(NativeUnicodeString) || length > (1u << 20)) {
         ::CloseHandle(process);
-        return {};
+        return false;
     }
     std::vector<unsigned char> buffer(length);
     const LONG status =
         query(process, kProcessCommandLineInformation, buffer.data(), length,
               &length);
     ::CloseHandle(process);
-    if (status < 0 || buffer.size() < sizeof(NativeUnicodeString)) return {};
+    if (status < 0 || buffer.size() < sizeof(NativeUnicodeString)) return false;
 
     const auto* command =
         reinterpret_cast<const NativeUnicodeString*>(buffer.data());
     if (command->buffer == nullptr || command->length == 0 ||
         command->length % sizeof(wchar_t) != 0) {
-        return {};
+        return false;
     }
     const size_t chars = command->length / sizeof(wchar_t);
     const wchar_t* begin = command->buffer;
@@ -1619,9 +1620,10 @@ std::wstring ReadProcessCommandLine(DWORD pid) {
         string_end < string_begin) {
         // The documented information class normally returns an inline string;
         // refuse an unexpected pointer rather than reading arbitrary memory.
-        return {};
+        return false;
     }
-    return std::wstring(begin, end);
+    out.assign(begin, end);
+    return true;
 }
 
 bool CommandLineContainsProfile(const std::wstring& command_line,
@@ -1636,26 +1638,45 @@ bool CommandLineContainsProfile(const std::wstring& command_line,
     return cmd.find(needle) != std::wstring::npos;
 }
 
-bool IsChromiumProcess(DWORD pid, const std::wstring& executable,
-                       const std::wstring& profile,
-                       std::wstring* command_line_out = nullptr) {
-    if (pid == 0 || executable.empty() || profile.empty()) return false;
+enum class ChromiumProcessMatch { NoMatch, Match, Inconclusive };
+
+ChromiumProcessMatch ClassifyChromiumProcess(
+    DWORD pid, const std::wstring& executable, const std::wstring& profile,
+    std::wstring* command_line_out = nullptr) {
+    if (pid == 0 || executable.empty() || profile.empty()) {
+        return ChromiumProcessMatch::Inconclusive;
+    }
     HANDLE process =
         ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == nullptr) return false;
+    if (process == nullptr) return ChromiumProcessMatch::Inconclusive;
     std::vector<wchar_t> path(32768);
     DWORD length = static_cast<DWORD>(path.size());
     const BOOL path_ok =
         ::QueryFullProcessImageNameW(process, 0, path.data(), &length);
     ::CloseHandle(process);
-    if (!path_ok || length == 0) return false;
+    if (!path_ok || length == 0) return ChromiumProcessMatch::Inconclusive;
     const std::wstring full(path.data(), length);
-    if (!SameFilesystemPath(full, executable)) return false;
+    if (!SameFilesystemPath(full, executable)) {
+        return ChromiumProcessMatch::NoMatch;
+    }
 
-    const std::wstring command_line = ReadProcessCommandLine(pid);
-    if (!CommandLineContainsProfile(command_line, profile)) return false;
+    std::wstring command_line;
+    if (!ReadProcessCommandLine(pid, command_line)) {
+        return ChromiumProcessMatch::Inconclusive;
+    }
+    if (!CommandLineContainsProfile(command_line, profile)) {
+        return ChromiumProcessMatch::NoMatch;
+    }
     if (command_line_out != nullptr) *command_line_out = command_line;
-    return true;
+    return ChromiumProcessMatch::Match;
+}
+
+bool IsChromiumProcess(DWORD pid, const std::wstring& executable,
+                       const std::wstring& profile,
+                       std::wstring* command_line_out = nullptr) {
+    return ClassifyChromiumProcess(pid, executable, profile,
+                                   command_line_out) ==
+           ChromiumProcessMatch::Match;
 }
 
 bool IsChromiumTopLevelWindow(const ChromiumWindowInfo& info) {
@@ -1855,31 +1876,58 @@ bool RemoveProbeProfileDirectory(const std::wstring& path,
     }
 }
 
-struct ProbeChromiumProcessScan {
-    bool complete = false;
-    bool found = false;
+enum class ProbeChromiumProcessScanResult {
+    Clean,
+    MatchesRemain,
+    Inconclusive,
 };
 
-ProbeChromiumProcessScan ScanProbeChromiumProcesses(
+ProbeChromiumProcessScanResult ScanProbeChromiumProcesses(
     const std::wstring& executable, const std::wstring& profile) {
-    ProbeChromiumProcessScan result;
-    if (executable.empty() || profile.empty()) return result;
+    if (executable.empty() || profile.empty()) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
     HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return result;
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
-    result.complete = ::Process32FirstW(snapshot, &entry) != FALSE;
-    if (result.complete) {
-        do {
-            if (IsChromiumProcess(entry.th32ProcessID, executable, profile)) {
-                result.found = true;
-                break;
-            }
-        } while (::Process32NextW(snapshot, &entry));
+    if (!::Process32FirstW(snapshot, &entry)) {
+        const DWORD error = ::GetLastError();
+        ::CloseHandle(snapshot);
+        return error == ERROR_NO_MORE_FILES
+                   ? ProbeChromiumProcessScanResult::Clean
+                   : ProbeChromiumProcessScanResult::Inconclusive;
     }
+
+    const size_t separator = executable.find_last_of(L"\\/");
+    const std::wstring executable_name =
+        executable.substr(separator == std::wstring::npos ? 0 : separator + 1);
+    bool query_inconclusive = false;
+    for (;;) {
+        if (_wcsicmp(entry.szExeFile, executable_name.c_str()) == 0) {
+            const ChromiumProcessMatch match = ClassifyChromiumProcess(
+                entry.th32ProcessID, executable, profile);
+            if (match == ChromiumProcessMatch::Match) {
+                ::CloseHandle(snapshot);
+                return ProbeChromiumProcessScanResult::MatchesRemain;
+            }
+            if (match == ChromiumProcessMatch::Inconclusive) {
+                query_inconclusive = true;
+            }
+        }
+
+        ::SetLastError(ERROR_SUCCESS);
+        if (!::Process32NextW(snapshot, &entry)) break;
+    }
+    const DWORD enumeration_error = ::GetLastError();
     ::CloseHandle(snapshot);
-    return result;
+    if (enumeration_error != ERROR_NO_MORE_FILES || query_inconclusive) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
+    return ProbeChromiumProcessScanResult::Clean;
 }
 
 bool WaitForProbeChromiumProcessesToExit(const std::wstring& executable,
@@ -1888,9 +1936,9 @@ bool WaitForProbeChromiumProcessesToExit(const std::wstring& executable,
     if (executable.empty() || profile.empty()) return false;
     const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
     for (;;) {
-        const ProbeChromiumProcessScan scan =
+        const ProbeChromiumProcessScanResult scan =
             ScanProbeChromiumProcesses(executable, profile);
-        if (scan.complete && !scan.found) return true;
+        if (scan == ProbeChromiumProcessScanResult::Clean) return true;
         if (::GetTickCount64() >= deadline) return false;
         PumpStaMessages();
         ::Sleep(100);
