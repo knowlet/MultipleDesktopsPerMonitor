@@ -4027,22 +4027,6 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine,
         return failed(error.empty() ? "complete discovery failed" : error);
     }
 
-    std::size_t managed = 0;
-    std::size_t unsupported = 0;
-    std::size_t ambiguous = 0;
-    for (const DiscoveredWindow& window : windows) {
-        switch (window.disposition) {
-            case WindowDisposition::Managed: ++managed; break;
-            case WindowDisposition::Unsupported: ++unsupported; break;
-            case WindowDisposition::Ambiguous: ++ambiguous; break;
-            case WindowDisposition::Closed: ++ambiguous; break;
-        }
-    }
-    Field("total windows", std::format("{}", windows.size()));
-    Field("managed", std::format("{}", managed));
-    Field("unsupported", std::format("{}", unsupported));
-    Field("ambiguous", std::format("{}", ambiguous));
-
     if (bootstrap_engine) {
         // This mapping is deliberately synthetic: it proves only that a live,
         // capability-augmented discovery snapshot can populate the engine's
@@ -4101,16 +4085,12 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine,
                             return item.monitor == monitor;
                         });
                     if (synthetic == synthetic_monitors.end()) {
-                        const WorkspaceId base =
-                            static_cast<WorkspaceId>(synthetic_monitors.size()) *
-                                2 +
-                            1;
-                        if (!engine.AddMonitor(monitor, base, {base, base + 1},
-                                               conversion_error)) {
-                            return false;
+                        if (conversion_error != nullptr) {
+                            *conversion_error =
+                                "live snapshot monitor changed after synthetic "
+                                "topology was frozen";
                         }
-                        synthetic_monitors.push_back({monitor, base, base + 1});
-                        synthetic = std::prev(synthetic_monitors.end());
+                        return false;
                     }
 
                     WindowRecord record;
@@ -4224,6 +4204,21 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine,
         Print("ENGINE_WINDOW_COUNT={}\n", engine.Windows().size());
         Print("ENGINE_INVARIANT=OK\n");
     }
+    std::size_t managed = 0;
+    std::size_t unsupported = 0;
+    std::size_t ambiguous = 0;
+    for (const DiscoveredWindow& window : windows) {
+        switch (window.disposition) {
+            case WindowDisposition::Managed: ++managed; break;
+            case WindowDisposition::Unsupported: ++unsupported; break;
+            case WindowDisposition::Ambiguous: ++ambiguous; break;
+            case WindowDisposition::Closed: ++ambiguous; break;
+        }
+    }
+    Field("total windows", std::format("{}", windows.size()));
+    Field("managed", std::format("{}", managed));
+    Field("unsupported", std::format("{}", unsupported));
+    Field("ambiguous", std::format("{}", ambiguous));
     Field("result", "OK");
     Field("mutation_started", "no");
     Print("mutation_started=no\n");
