@@ -3947,6 +3947,27 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
         cleanup();
         return 1;
     }
+    // The presentation executor is restricted to this explicitly created
+    // probe set.  Each logical workspace contains one root here, but recording
+    // the complete order keeps the test on the same code path as a multi-window
+    // caller.  Foreground restoration is only attempted after --confirm-mutate.
+    if (!engine.SetZOrder(monitor_a_id, a1_id, {logical_a1.identity},
+                          &engine_error) ||
+        !engine.SetZOrder(monitor_a_id, a2_id, {logical_a2.identity},
+                          &engine_error) ||
+        !engine.SetZOrder(monitor_b_id, b1_id, {logical_b1.identity},
+                          &engine_error) ||
+        !engine.SetLastForeground(monitor_a_id, a1_id, logical_a1.identity,
+                                  &engine_error) ||
+        !engine.SetLastForeground(monitor_a_id, a2_id, logical_a2.identity,
+                                  &engine_error) ||
+        !engine.SetLastForeground(monitor_b_id, b1_id, logical_b1.identity,
+                                  &engine_error)) {
+        Print("\n  logical workspace refused: could not capture probe-only "
+              "presentation state: {}\n", engine_error);
+        cleanup();
+        return 1;
+    }
 
     NotifySink* sink = new NotifySink();
     int rc = 0;
@@ -4027,6 +4048,60 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 Field("    HRESULT", HrToString(move_hr));
                 Field("    verified", moved ? "yes" : "NO");
                 return moved;
+            };
+
+            auto probe_identity_is_current = [&](const WindowRecord& record) {
+                // `all_windows` is the ownership boundary. Never apply a
+                // native presentation operation to an HWND merely because it
+                // happens to have the same class, title, or process.
+                const bool owned = std::any_of(
+                    all_windows.begin(), all_windows.end(),
+                    [&](const LogicalWindow* logical) {
+                        return logical != nullptr &&
+                               logical->identity == record.identity;
+                    });
+                WindowIdentity current;
+                RawObject view;
+                return owned && record.capabilities.Manageable() &&
+                       record.capabilities.owner_state_observable &&
+                       ReadWindowIdentity(record.identity.hwnd, current) &&
+                       current == record.identity &&
+                       ::MonitorFromWindow(record.identity.hwnd,
+                                           MONITOR_DEFAULTTONULL) ==
+                           reinterpret_cast<HMONITOR>(record.monitor) &&
+                       acquire_view(record.identity.hwnd, view) &&
+                       can_move_view(view.Get());
+            };
+            auto apply_probe_presentation =
+                [&](const WindowRecord& record,
+                    const PresentationOperation& operation) -> bool {
+                // ExecutePresentationRestore has just identity-revalidated
+                // this record. Recheck at the native boundary as well so a
+                // recycled HWND fails closed between callbacks.
+                if (!probe_identity_is_current(record) ||
+                    record.identity != operation.identity) {
+                    return false;
+                }
+                switch (operation.kind) {
+                    case PresentationOperationKind::RestorePlacement:
+                        if (!operation.presentation.placement_valid) return false;
+                        return ::SetWindowPlacement(
+                                   record.identity.hwnd,
+                                   &operation.presentation.placement) != FALSE;
+                    case PresentationOperationKind::RestoreZOrder:
+                        // Plans are bottom-to-top; HWND_TOP therefore gives a
+                        // deterministic relative order without activation.
+                        return ::SetWindowPos(
+                                   record.identity.hwnd, HWND_TOP, 0, 0, 0, 0,
+                                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                                       SWP_NOOWNERZORDER) != FALSE;
+                    case PresentationOperationKind::RestoreForeground:
+                        // This test is confirmation-gated and records only
+                        // vdprobe-owned roots; no user HWND can reach here.
+                        return ::SetForegroundWindow(record.identity.hwnd) != FALSE;
+                    default:
+                        return false;
+                }
             };
 
             WinEventLifecycleSource lifecycle_source;
@@ -4187,6 +4262,31 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                     return ReadCurrentDesktopId(mi, current) &&
                            ::IsEqualGUID(current, carrier.id);
                 }();
+                std::string presentation_error;
+                const std::optional<PresentationPlan> presentation_plan =
+                    coordinated.succeeded()
+                        ? engine.PreparePresentationRestore(
+                              monitor_a_id, incoming, &presentation_error)
+                        : std::nullopt;
+                const PresentationResult presentation =
+                    presentation_plan
+                        ? engine.ExecutePresentationRestore(
+                              *presentation_plan, probe_identity_is_current,
+                              apply_probe_presentation)
+                        : PresentationResult{};
+                Field("    probe presentation restore",
+                      presentation.completed ? "PASS" : "FAIL");
+                Field("    presentation operations",
+                      std::format("{}/{}", presentation.applied,
+                                  presentation_plan
+                                      ? presentation_plan->operations.size()
+                                      : 0));
+                if (!presentation_error.empty()) {
+                    Field("    presentation preparation error", presentation_error);
+                }
+                if (!presentation.error.empty()) {
+                    Field("    presentation execution error", presentation.error);
+                }
                 Field("    global current desktop", global_current_ok ? "unchanged"
                                                                         : "CHANGED");
                 const bool pass = lifecycle_started && coordinated.succeeded() &&
@@ -4194,7 +4294,7 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                                   CountCurrentDesktopChanged(events, start_qpc) == 0 &&
                                   callback_scope_ok && outgoing_callback_ok &&
                                   incoming_callback_ok && control_ok && state_ok &&
-                                  global_current_ok;
+                                  global_current_ok && presentation.completed;
                 Field("    logical switch verdict", pass ? "PASS" : "FAIL");
                 return pass;
             };
@@ -4218,10 +4318,13 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             // already attempted rollback and the guards remain armed.
             const bool second = first && switch_logical(a2_id, a1_id);
 
-            // Persist a real A1 -> A2 plan and apply one operation, then drive
-            // a bounded same-process interruption simulation through the same
-            // coordinator and identity-revalidating native callbacks. This
-            // exercises durable journal readback, but is not a restart test.
+            // Persist a real A1 -> A2 plan and apply one operation, then
+            // discard the running logical state. Recovery is deliberately
+            // driven by a newly constructed engine/coordinator pair: the
+            // journal is the only transaction handoff, while native callbacks
+            // still revalidate the vdprobe-owned HWND generation before every
+            // operation. A complete snapshot follows recovery to make the
+            // replacement model authoritative again.
             bool recovery_exercised = false;
             std::string recovery_error;
             const std::optional<SwitchPlan> interrupted =
@@ -4238,26 +4341,91 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                     window != nullptr && move_to_role(*window, operation.to);
             }
             CoordinatorResult recovered;
-            if (journal_began) recovered = coordinator.RecoverPending();
+            CoordinatorResult recovery_reconciled;
+            bool fresh_recovery_model = false;
+            if (journal_began) {
+                WorkspaceEngine recovered_engine(carrier.id, parking.id);
+                fresh_recovery_model =
+                    recovered_engine.AddMonitor(monitor_a_id, a1_id,
+                                                {a1_id, a2_id},
+                                                &recovery_error) &&
+                    recovered_engine.AddMonitor(monitor_b_id, b1_id, {b1_id},
+                                                &recovery_error);
+                auto add_recovery_record = [&](const LogicalWindow& logical,
+                                               MonitorId monitor,
+                                               NativeDesktopRole role) {
+                    if (!fresh_recovery_model) return;
+                    WindowRecord record{};
+                    record.identity = logical.identity;
+                    record.monitor = monitor;
+                    record.workspace = logical.workspace;
+                    // The journal plan is relative to the pre-interruption
+                    // logical model. Seed those expected roles, not the
+                    // partially-mutated native roles; RecoverPending observes
+                    // the latter through observe_role before restoring each
+                    // operation.
+                    record.native_role = role;
+                    record.capabilities = probe_capabilities;
+                    record.presentation.rect = logical.rect;
+                    record.presentation.placement = logical.placement;
+                    record.presentation.rect_valid = true;
+                    record.presentation.placement_valid = true;
+                    record.disposition = WindowDisposition::Managed;
+                    record.present = true;
+                    fresh_recovery_model =
+                        recovered_engine.UpsertWindow(std::move(record),
+                                                      &recovery_error) !=
+                        UpsertResult::Rejected;
+                };
+                add_recovery_record(logical_a1, monitor_a_id,
+                                    NativeDesktopRole::Carrier);
+                add_recovery_record(logical_a2, monitor_a_id,
+                                    NativeDesktopRole::Parking);
+                add_recovery_record(logical_b1, monitor_b_id,
+                                    NativeDesktopRole::Carrier);
+                fresh_recovery_model =
+                    fresh_recovery_model && recovered_engine.CheckInvariant(
+                                                &recovery_error);
+                if (fresh_recovery_model) {
+                    WindowLifecycleAdapter recovery_lifecycle(
+                        recovered_engine, observe_owned_window);
+                    WorkspaceCoordinator recovery_coordinator(
+                        recovered_engine, recovery_lifecycle, lifecycle_source,
+                        discover_owned_windows, move_to_role, observe_role,
+                        &journal, 3);
+                    recovered = recovery_coordinator.RecoverPending();
+                    if (recovered.succeeded()) {
+                        recovery_reconciled =
+                            recovery_coordinator.ReconcileDiscovery();
+                    }
+                    fresh_recovery_model =
+                        fresh_recovery_model && recovered_engine.CheckInvariant(
+                                                   &recovery_error);
+                }
+            }
             std::string pending_error;
             const std::optional<SwitchPlan> pending_after_recovery =
                 journal.ReadPending(&pending_error);
             recovery_exercised =
-                journal_began && interrupted_move && recovered.succeeded() &&
+                journal_began && interrupted_move && fresh_recovery_model &&
+                recovered.succeeded() && recovery_reconciled.succeeded() &&
                 recovered.recovery.recovered && !pending_after_recovery &&
                 pending_error.empty() &&
-                engine.Monitor(monitor_a_id) != nullptr &&
-                engine.Monitor(monitor_a_id)->active == a1_id &&
+                recovery_reconciled.lifecycle.discovery.updated == 3 &&
                 VerifyLogicalModel(engine, all_windows,
                                    documented_manager.Get(), carrier.id,
                                    parking.id);
-            Field("durable journal same-process recovery simulation",
+            Field("durable journal fresh-engine recovery simulation",
                   recovery_exercised ? "PASS" : "FAIL");
             if (!recovery_error.empty()) {
                 Field("  recovery setup error", recovery_error);
             }
             if (!recovered.error.empty()) {
                 Field("  coordinator recovery error", recovered.error);
+            }
+            if (!recovery_reconciled.error.empty()) {
+                Field("  replacement reconciliation error",
+                      recovery_reconciled.error);
             }
             if (!pending_error.empty()) {
                 Field("  journal readback error", pending_error);
