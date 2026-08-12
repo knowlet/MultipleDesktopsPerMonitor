@@ -159,15 +159,15 @@ research/
 Phase 4A's controlled Win32 process semantics gate is complete with a
 `GO-WITH-LIMITATIONS` result. Phase 4B-1 adds a narrowly scoped Explorer
 semantics probe, and Phase 4B-2A adds an isolated Chromium-family probe using
-Microsoft Edge as the first reference browser. The first interactive Edge run
+Microsoft Edge as the first reference browser. Two interactive Edge runs
 observed the target/sibling window-granularity contract and completed restore,
-but its one-shot temporary-profile removal was inconclusive; the probe now
-uses a bounded retry before classifying cleanup as incomplete. The Edge probe
-creates a unique temporary `--user-data-dir`, launches two same-profile
-top-level windows, attributes them using pre/post HWND snapshots plus the
-canonical Edge image path and profile-bearing command line, and moves only one
-view. It never touches an existing browser profile, closes an unattributed
-browser HWND, or terminates an existing browser process.
+but temporary-profile removal remained inconclusive; the probe now combines a
+bounded cleanup retry with Chromium's `--disable-background-mode` launch flag.
+The Edge probe creates a unique temporary `--user-data-dir`, launches two
+same-profile top-level windows, attributes them using pre/post HWND snapshots
+plus the canonical Edge image path and profile-bearing command line, and moves
+only one view. It never touches an existing browser profile, closes an
+unattributed browser HWND, or terminates an existing browser process.
 
 The current Chromium implementation is an interactive semantics probe, not a
 browser compatibility claim. Chrome, Terminal, Electron, WinUI/UWP,

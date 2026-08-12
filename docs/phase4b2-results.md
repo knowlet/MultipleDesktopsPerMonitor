@@ -20,7 +20,8 @@ The probe:
 - resolves the canonical installed Microsoft Edge executable and uses that
   absolute path for launch and attribution;
 - creates a unique temporary profile directory owned by the probe;
-- launches two `--new-window about:blank` requests against the same profile;
+- launches two `--new-window about:blank` requests against the same profile
+  with Chromium background mode disabled;
 - attributes each new normal browser root by pre/post HWND observation, full
   executable path, and a command line containing the unique profile path;
 - treats the Chromium class name (`Chrome_WidgetWin_*`) as evidence, not as an
@@ -92,14 +93,14 @@ creation:
 
 ## Interactive Edge evidence (August 12, 2026)
 
-The first interactive run completed the semantics observation on the tested
-Windows 11 host:
+Two interactive runs completed the semantics observation on the tested
+Windows 11 host. The second run measured a 32.434 ms callback latency:
 
 ```text
 target Carrier -> Parking     S_OK
 target desktop                Parking
 target on current             false
-ViewVirtualDesktopChanged     observed (41.143 ms)
+ViewVirtualDesktopChanged     observed (32.434 ms)
 sibling top-level moved       no
 CurrentVirtualDesktopChanged  0
 restore                       PASS
@@ -124,12 +125,14 @@ The parked target reported `IsWindowVisible = true` while DWM reported
 `cloaked = 2`, so product visibility decisions must use virtual-desktop
 assignment and cloaking state rather than `IsWindowVisible` alone.
 
-The temporary profile remained on disk because Edge released a profile lock
-after the one-shot cleanup attempt. The probe now retries removal for a bounded
-five seconds after probe-owned roots close. This retry is limited to the
-unique probe profile and never terminates Edge or touches an existing profile.
-Phase 4B-2A should be rerun once after this fix; until that rerun, the overall
-command remains `INCONCLUSIVE-CLEANUP`, not a clean PASS.
+The temporary profile remained on disk after both the original one-shot cleanup
+and the bounded five-second retry. The probe now also launches the isolated
+instance with `--disable-background-mode`, so the final browser process should
+not remain alive solely for background apps after probe-owned roots close. This
+flag and the retry are limited to the unique probe profile; the probe never
+terminates Edge or touches an existing profile. Phase 4B-2A should be rerun
+once after this fix; until that rerun, the overall command remains
+`INCONCLUSIVE-CLEANUP`, not a clean PASS.
 
 This milestone does not claim Chrome equivalence, browser lifecycle support,
 focus/Z-order recovery, existing-profile safety beyond the stated attribution
