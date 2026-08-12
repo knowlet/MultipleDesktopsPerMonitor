@@ -2173,6 +2173,20 @@ bool CloseProbeOwnedChromiumWindows(
     return all_closed;
 }
 
+bool WaitForNoProbeChromiumWindows(const std::wstring& executable,
+                                   const std::wstring& profile,
+                                   DWORD timeout_ms = 5000) {
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    for (;;) {
+        if (EnumerateChromiumWindows(executable, profile, true).empty()) {
+            return true;
+        }
+        if (::GetTickCount64() >= deadline) return false;
+        PumpStaMessages();
+        ::Sleep(50);
+    }
+}
+
 struct RealAppWindowSnapshot {
     RealAppWindowInfo info;
     RawObject view;
@@ -6426,7 +6440,7 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         const bool closed =
             CloseProbeOwnedChromiumWindows(created_roots, executable, profile);
         const bool no_profile_windows =
-            EnumerateChromiumWindows(executable, profile, true).empty();
+            WaitForNoProbeChromiumWindows(executable, profile);
         bool profile_removed = false;
         ProbeChromiumProcessScanResult process_scan =
             ProbeChromiumProcessScanResult::Inconclusive;
