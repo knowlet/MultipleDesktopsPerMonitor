@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <tlhelp32.h>
 #include <unordered_map>
 
 #include "notifysink.h"
@@ -1856,7 +1857,7 @@ bool WaitForNewChromiumPrimary(
 }
 
 bool RemoveProbeProfileDirectory(const std::wstring& path,
-                                 DWORD timeout_ms = 5000) {
+                                 DWORD timeout_ms = 15000) {
     if (path.empty()) return true;
 
     // Edge can keep a short-lived profile lock after the last top-level
@@ -1875,6 +1876,48 @@ bool RemoveProbeProfileDirectory(const std::wstring& path,
             }
         }
 
+        if (::GetTickCount64() >= deadline) return false;
+        PumpStaMessages();
+        ::Sleep(100);
+    }
+}
+
+struct ProbeChromiumProcessScan {
+    bool complete = false;
+    bool found = false;
+};
+
+ProbeChromiumProcessScan ScanProbeChromiumProcesses(
+    const std::wstring& executable, const std::wstring& profile) {
+    ProbeChromiumProcessScan result;
+    if (executable.empty() || profile.empty()) return result;
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return result;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    result.complete = ::Process32FirstW(snapshot, &entry) != FALSE;
+    if (result.complete) {
+        do {
+            if (IsChromiumProcess(entry.th32ProcessID, executable, profile)) {
+                result.found = true;
+                break;
+            }
+        } while (::Process32NextW(snapshot, &entry));
+    }
+    ::CloseHandle(snapshot);
+    return result;
+}
+
+bool WaitForProbeChromiumProcessesToExit(const std::wstring& executable,
+                                         const std::wstring& profile,
+                                         DWORD timeout_ms = 15000) {
+    if (executable.empty() || profile.empty()) return false;
+    const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
+    for (;;) {
+        const ProbeChromiumProcessScan scan =
+            ScanProbeChromiumProcesses(executable, profile);
+        if (scan.complete && !scan.found) return true;
         if (::GetTickCount64() >= deadline) return false;
         PumpStaMessages();
         ::Sleep(100);
@@ -5326,20 +5369,29 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         const bool no_profile_windows =
             EnumerateChromiumWindows(executable, profile, true).empty();
         bool profile_removed = false;
+        bool profile_processes_gone = false;
         if (no_profile_windows && !retain_profile) {
+            profile_processes_gone =
+                WaitForProbeChromiumProcessesToExit(executable, profile);
+        }
+        if (no_profile_windows && profile_processes_gone && !retain_profile) {
             profile_removed = RemoveProbeProfileDirectory(profile);
         }
         const bool complete =
-            closed && no_profile_windows && !retain_profile && profile_removed;
+            closed && no_profile_windows && profile_processes_gone &&
+            !retain_profile && profile_removed;
         Field("probe-owned Chromium cleanup",
               closed ? "passed" : "incomplete (retained)");
         if (profile_removed) {
             Field("temporary profile cleanup", "passed");
-        } else if (retain_profile || !no_profile_windows) {
+        } else if (retain_profile || !no_profile_windows ||
+                   !profile_processes_gone) {
             Field("temporary profile cleanup", "incomplete (retained)");
         } else {
             Field("temporary profile cleanup", "incomplete (profile retained)");
         }
+        Field("temporary profile process drain",
+              profile_processes_gone ? "passed" : "incomplete");
         return complete;
     };
 
