@@ -25,6 +25,7 @@ add_executable(vdprobe
         src/vdlayout.cpp
         src/phase1.cpp
         src/phase2.cpp
+        src/workspace_engine.cpp
         src/notifysink.cpp
 )
 

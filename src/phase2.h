@@ -87,6 +87,10 @@ int CmdChromiumSemanticsTest(const std::string& browser, bool confirm_mutate);
 // pre-existing Terminal windows or terminates an unrelated process.
 int CmdTerminalSemanticsTest(bool confirm_mutate);
 
+// Productization milestone: deterministic, non-mutating capability-driven
+// workspace state/transaction engine test.
+int CmdWorkspaceEngineTest();
+
 // Internal child-process mode used only by CmdRealAppSemanticsTest.  It creates
 // controlled ordinary Win32 windows and is not part of the public probe
 // surface.

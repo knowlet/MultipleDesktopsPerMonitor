@@ -80,6 +80,12 @@ void Usage() {
         "                      move one top-level view Carrier -> Parking and\n"
         "                      restore it; requires --confirm-mutate\n"
         "\n"
+        "productization (non-mutating state engine)\n"
+        "  workspace-engine-test\n"
+        "                      exercise capability-driven monitor/workspace\n"
+        "                      ownership, lifecycle, rollback, and journal\n"
+        "                      recovery without touching COM or native desktops\n"
+        "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
         "\n"
@@ -188,6 +194,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdChromiumSemanticsTest(browser, confirm_mutate);
     } else if (cmd == "terminal-semantics-test") {
         rc = vd::CmdTerminalSemanticsTest(confirm_mutate);
+    } else if (cmd == "workspace-engine-test") {
+        rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "real-app-child") {
         // Internal helper launched by real-app-semantics-test.  It is not
         // documented as a standalone probe command.
