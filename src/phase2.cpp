@@ -1556,8 +1556,8 @@ bool LaunchChromiumWindow(const std::wstring& executable,
     if (executable.empty() || profile.empty()) return false;
     std::wstring command =
         L"\"" + executable + L"\" --user-data-dir=\"" + profile +
-        L"\" --no-first-run --no-default-browser-check --new-window "
-        L"about:blank";
+        L"\" --no-first-run --no-default-browser-check "
+        L"--disable-background-mode --new-window about:blank";
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');
 
