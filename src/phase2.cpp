@@ -15,6 +15,7 @@
 #include "notifysink.h"
 #include "phase1.h"
 #include "util.h"
+#include "workspace_engine.h"
 
 namespace vd {
 namespace {
@@ -660,15 +661,6 @@ struct WindowDesktopState {
     DWORD cloaked = 0;
 };
 
-using WorkspaceId = std::uint64_t;
-
-struct WindowIdentity {
-    HWND hwnd = nullptr;
-    DWORD pid = 0;
-    FILETIME process_creation_time{};
-    bool process_creation_time_ok = false;
-};
-
 struct LogicalWindow {
     WindowIdentity identity;
     HMONITOR monitor = nullptr;
@@ -676,25 +668,6 @@ struct LogicalWindow {
     GUID native_desktop{};
     RECT rect{};
     WINDOWPLACEMENT placement{};
-};
-
-struct Workspace {
-    WorkspaceId id = 0;
-    HMONITOR monitor = nullptr;
-    std::vector<WindowIdentity> windows;
-};
-
-struct MonitorWorkspaceState {
-    HMONITOR monitor = nullptr;
-    WorkspaceId active = 0;
-    std::vector<WorkspaceId> workspaces;
-};
-
-struct WorkspaceState {
-    GUID carrier{};
-    GUID parking{};
-    std::unordered_map<HMONITOR, MonitorWorkspaceState> monitors;
-    std::vector<Workspace> workspaces;
 };
 
 bool ReadWindowIdentity(HWND hwnd, WindowIdentity& out) {
@@ -2193,7 +2166,7 @@ bool HasMatchingViewCallback(const std::vector<NotifyEvent>& events,
     return false;
 }
 
-bool VerifyLogicalModel(const WorkspaceState& model,
+bool VerifyLogicalModel(const WorkspaceEngine& model,
                         const std::vector<const LogicalWindow*>& windows,
                         IVirtualDesktopManager* documented_manager,
                         const GUID& carrier, const GUID& parking) {
@@ -2203,13 +2176,14 @@ bool VerifyLogicalModel(const WorkspaceState& model,
             all_ok = false;
             continue;
         }
-        const auto monitor_it = model.monitors.find(window->monitor);
-        if (monitor_it == model.monitors.end()) {
+        const MonitorId monitor_id =
+            reinterpret_cast<MonitorId>(window->monitor);
+        const MonitorWorkspaceState* monitor = model.Monitor(monitor_id);
+        if (monitor == nullptr) {
             all_ok = false;
             continue;
         }
-        const bool active =
-            monitor_it->second.active == window->workspace;
+        const bool active = monitor->active == window->workspace;
         const GUID& expected_desktop = active ? carrier : parking;
 
         WindowIdentity identity;
@@ -3677,6 +3651,12 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
     HRESULT hr = GetImmersiveShell(sp);
     if (FAILED(hr)) {
         Field("IServiceProvider", std::format("FAILED {}", HrToString(hr)));
+        if (hr == E_ACCESSDENIED) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "ImmersiveShell E_ACCESSDENIED");
+            Field("mutation_started", "no");
+            return kExitInconclusive;
+        }
         return 1;
     }
 
@@ -3841,18 +3821,13 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
         return 1;
     }
 
-    WorkspaceState model;
-    model.carrier = carrier.id;
-    model.parking = parking.id;
     const WorkspaceId a1_id = 1;
     const WorkspaceId a2_id = 2;
     const WorkspaceId b1_id = 3;
-    model.monitors.emplace(
-        monitor_a.handle,
-        MonitorWorkspaceState{monitor_a.handle, a1_id, {a1_id, a2_id}});
-    model.monitors.emplace(
-        monitor_b.handle,
-        MonitorWorkspaceState{monitor_b.handle, b1_id, {b1_id}});
+    const MonitorId monitor_a_id =
+        reinterpret_cast<MonitorId>(monitor_a.handle);
+    const MonitorId monitor_b_id =
+        reinterpret_cast<MonitorId>(monitor_b.handle);
 
     LogicalWindow logical_a1;
     LogicalWindow logical_a2;
@@ -3867,13 +3842,62 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
         cleanup();
         return 1;
     }
-    model.workspaces = {
-        Workspace{a1_id, monitor_a.handle, {logical_a1.identity}},
-        Workspace{a2_id, monitor_a.handle, {logical_a2.identity}},
-        Workspace{b1_id, monitor_b.handle, {logical_b1.identity}},
-    };
     std::vector<const LogicalWindow*> all_windows = {
         &logical_a1, &logical_a2, &logical_b1};
+
+    // The transaction engine owns the logical state.  This controlled test
+    // supplies its live shell operations through callbacks below; it does not
+    // retain an IApplicationView across a move, so each operation resolves a
+    // fresh view for the verified HWND generation.
+    WorkspaceEngine engine(carrier.id, parking.id);
+    std::string engine_error;
+    if (!engine.AddMonitor(monitor_a_id, a1_id, {a1_id, a2_id}, &engine_error) ||
+        !engine.AddMonitor(monitor_b_id, b1_id, {b1_id}, &engine_error)) {
+        Print("\n  logical workspace refused: could not initialize workspace "
+              "engine: {}\n",
+              engine_error);
+        cleanup();
+        return 1;
+    }
+
+    const WindowCapabilities probe_capabilities{
+        true, true, true, true, true};
+    auto add_probe_record = [&](const LogicalWindow& logical,
+                                MonitorId monitor,
+                                NativeDesktopRole role) -> bool {
+        WindowRecord record{};
+        record.identity = logical.identity;
+        record.monitor = monitor;
+        record.workspace = logical.workspace;
+        record.native_role = role;
+        record.capabilities = probe_capabilities;
+        record.presentation.rect = logical.rect;
+        record.presentation.placement = logical.placement;
+        record.presentation.rect_valid = true;
+        record.presentation.placement_valid = true;
+        record.presentation.foreground = false;
+        record.disposition = WindowDisposition::Managed;
+        record.present = true;
+        const UpsertResult result = engine.UpsertWindow(std::move(record),
+                                                        &engine_error);
+        if (result == UpsertResult::Added) return true;
+        Print("  workspace engine rejected probe HWND 0x{:X}: {}\n",
+              reinterpret_cast<uintptr_t>(logical.identity.hwnd), engine_error);
+        return false;
+    };
+    if (!add_probe_record(logical_a1, monitor_a_id,
+                          NativeDesktopRole::Carrier) ||
+        !add_probe_record(logical_a2, monitor_a_id,
+                          NativeDesktopRole::Parking) ||
+        !add_probe_record(logical_b1, monitor_b_id,
+                          NativeDesktopRole::Carrier) ||
+        !engine.CheckInvariant(&engine_error)) {
+        Print("\n  logical workspace refused: workspace engine initialization "
+              "failed: {}\n",
+              engine_error);
+        cleanup();
+        return 1;
+    }
 
     NotifySink* sink = new NotifySink();
     int rc = 0;
@@ -3904,47 +3928,99 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 PumpStaMessages();
                 DrainAndPrintEvents(sink, start_qpc, events);
             };
-            auto switch_logical = [&](WorkspaceId outgoing, WorkspaceId incoming,
-                                      IUnknown* outgoing_view,
-                                      IUnknown* incoming_view, HWND outgoing_hwnd,
-                                      HWND incoming_hwnd) -> bool {
+            auto observe_role = [&](const WindowRecord& record) {
+                WindowIdentity identity;
+                WindowDesktopState state;
+                if (!ReadWindowIdentity(record.identity.hwnd, identity) ||
+                    identity != record.identity ||
+                    !ReadWindowDesktopState(documented_manager.Get(),
+                                            record.identity.hwnd, state)) {
+                    return NativeDesktopRole::Unknown;
+                }
+                if (::IsEqualGUID(state.desktop, carrier.id) &&
+                    state.on_current) {
+                    return NativeDesktopRole::Carrier;
+                }
+                if (::IsEqualGUID(state.desktop, parking.id) &&
+                    !state.on_current) {
+                    return NativeDesktopRole::Parking;
+                }
+                return NativeDesktopRole::Unknown;
+            };
+            auto move_to_role = [&](const WindowRecord& record,
+                                    NativeDesktopRole target) -> bool {
+                WindowIdentity identity;
+                if (!ReadWindowIdentity(record.identity.hwnd, identity) ||
+                    identity != record.identity) {
+                    Print("  native move refused: HWND 0x{:X} identity changed\n",
+                          reinterpret_cast<uintptr_t>(record.identity.hwnd));
+                    return false;
+                }
+                RawObject view;
+                if (!acquire_view(record.identity.hwnd, view)) return false;
+                IUnknown* const desktop =
+                    target == NativeDesktopRole::Carrier ? carrier.object.Get()
+                    : target == NativeDesktopRole::Parking ? parking.object.Get()
+                                                            : nullptr;
+                const GUID& expected = target == NativeDesktopRole::Carrier
+                                           ? carrier.id
+                                           : parking.id;
+                Gate gate = Gate::Ok;
+                HRESULT move_hr = E_ABORT;
+                const bool moved = MoveViewToDesktopAndWait(
+                    mi, view.Get(), desktop, record.identity.hwnd,
+                    documented_manager.Get(), expected, carrier.id,
+                    confirm_mutate, gate, move_hr);
+                Print("  engine MoveViewToDesktop HWND 0x{:X} -> {}\n",
+                      reinterpret_cast<uintptr_t>(record.identity.hwnd),
+                      NativeDesktopRoleText(target));
+                Field("    gate", GateText(gate));
+                Field("    HRESULT", HrToString(move_hr));
+                Field("    verified", moved ? "yes" : "NO");
+                return moved;
+            };
+            auto switch_logical = [&](WorkspaceId outgoing,
+                                      WorkspaceId incoming) -> bool {
                 const ULONGLONG start_qpc = QpcNow();
                 std::vector<NotifyEvent> events;
-                Gate out_gate = Gate::Ok;
-                HRESULT out_hr = E_ABORT;
-                Gate in_gate = Gate::Ok;
-                HRESULT in_hr = E_ABORT;
-                const bool outgoing_ok = MoveViewToDesktopAndWait(
-                    mi, outgoing_view, parking.object.Get(), outgoing_hwnd,
-                    documented_manager.Get(), parking.id, carrier.id,
-                    confirm_mutate, out_gate, out_hr);
-                const bool incoming_ok = MoveViewToDesktopAndWait(
-                    mi, incoming_view, carrier.object.Get(), incoming_hwnd,
-                    documented_manager.Get(), carrier.id, carrier.id,
-                    confirm_mutate, in_gate, in_hr);
+                const std::optional<SwitchPlan> plan =
+                    engine.PrepareSwitch(monitor_a_id, incoming, &engine_error);
+                TransactionResult transaction;
+                if (plan) {
+                    transaction = engine.ExecuteSwitch(*plan, move_to_role,
+                                                       observe_role);
+                } else {
+                    transaction.error = engine_error;
+                }
                 drain_for(events, start_qpc, 250);
 
                 Field(std::format("  logical switch {} -> {}", outgoing, incoming),
-                      outgoing_ok && incoming_ok ? "core PASS" : "core FAIL");
-                Field("    outgoing gate", GateText(out_gate));
-                Field("    outgoing hr", HrToString(out_hr));
-                Field("    incoming gate", GateText(in_gate));
-                Field("    incoming hr", HrToString(in_hr));
+                      transaction.committed ? "core PASS" : "core FAIL");
+                Field("    engine committed", transaction.committed ? "yes" : "NO");
+                if (!transaction.error.empty()) {
+                    Field("    engine error", transaction.error);
+                }
+                if (transaction.rollback_attempted) {
+                    Field("    rollback", transaction.rollback_succeeded
+                                            ? "succeeded" : "FAILED");
+                }
+                Field("    recovery required",
+                      transaction.recovery_required ? "YES" : "no");
                 Field("    current changed count",
                       std::format("{}", CountCurrentDesktopChanged(events, start_qpc)));
                 Field("    view callback scope",
-                      ViewEventsOnlyExpected(events, start_qpc, outgoing_hwnd,
-                                             incoming_hwnd)
+                      ViewEventsOnlyExpected(events, start_qpc, a1.hwnd, a2.hwnd)
                           ? "A1/A2 only"
                           : "UNEXPECTED WINDOW");
 
                 const bool callback_scope_ok =
-                    ViewEventsOnlyExpected(events, start_qpc, outgoing_hwnd,
-                                           incoming_hwnd);
+                    ViewEventsOnlyExpected(events, start_qpc, a1.hwnd, a2.hwnd);
                 const bool outgoing_callback_ok =
-                    HasMatchingViewCallback(events, start_qpc, outgoing_hwnd);
+                    HasMatchingViewCallback(events, start_qpc,
+                                            outgoing == a1_id ? a1.hwnd : a2.hwnd);
                 const bool incoming_callback_ok =
-                    HasMatchingViewCallback(events, start_qpc, incoming_hwnd);
+                    HasMatchingViewCallback(events, start_qpc,
+                                            incoming == a1_id ? a1.hwnd : a2.hwnd);
                 Field("    outgoing ViewVirtualDesktopChanged",
                       outgoing_callback_ok ? "observed" : "MISSING");
                 Field("    incoming ViewVirtualDesktopChanged",
@@ -3954,7 +4030,7 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                                                  documented_manager.Get(),
                                                  carrier.id);
                 const bool state_ok =
-                    VerifyLogicalModel(model, all_windows,
+                    VerifyLogicalModel(engine, all_windows,
                                        documented_manager.Get(), carrier.id,
                                        parking.id);
                 const bool global_current_ok = [&]() {
@@ -3964,7 +4040,7 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 }();
                 Field("    global current desktop", global_current_ok ? "unchanged"
                                                                         : "CHANGED");
-                const bool pass = outgoing_ok && incoming_ok &&
+                const bool pass = transaction.committed &&
                                   CountCurrentDesktopChanged(events, start_qpc) == 0 &&
                                   callback_scope_ok && outgoing_callback_ok &&
                                   incoming_callback_ok && control_ok && state_ok &&
@@ -3984,19 +4060,20 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             restore_a2.Arm();
 
             // A1 -> A2: outgoing A1 goes to Parking, incoming A2 comes to Carrier.
-            model.monitors[monitor_a.handle].active = a2_id;
-            const bool first =
-                switch_logical(a1_id, a2_id, a1_view.Get(), a2_view.Get(),
-                               a1.hwnd, a2.hwnd);
-            // A2 -> A1: restore the original logical assignment.
-            model.monitors[monitor_a.handle].active = a1_id;
-            const bool second =
-                switch_logical(a2_id, a1_id, a2_view.Get(), a1_view.Get(),
-                               a2.hwnd, a1.hwnd);
+            const bool first = switch_logical(a1_id, a2_id);
+            // A2 -> A1: restore the original logical assignment.  Do not issue
+            // the reverse plan after a failed first transaction: ExecuteSwitch
+            // already attempted rollback and the guards remain armed.
+            const bool second = first && switch_logical(a2_id, a1_id);
 
-            const bool restored = VerifyLogicalModel(
-                model, all_windows, documented_manager.Get(), carrier.id,
+            const bool model_consistent = VerifyLogicalModel(
+                engine, all_windows, documented_manager.Get(), carrier.id,
                 parking.id);
+            // A failed reverse transaction may roll back successfully to its
+            // own A2-active baseline.  That is internally consistent with the
+            // engine, but it is not the original A1-active state promised by
+            // this round-trip test, so leave the fail-safe guards armed.
+            const bool restored = first && second && model_consistent;
             if (!restored) {
                 Print("  CRITICAL LOGICAL RESTORE FAILURE\n");
                 rc = 1;
