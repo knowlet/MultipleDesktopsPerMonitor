@@ -1931,16 +1931,20 @@ ProbeChromiumProcessScanResult ScanProbeChromiumProcesses(
     return ProbeChromiumProcessScanResult::Clean;
 }
 
-bool WaitForProbeChromiumProcessesToExit(const std::wstring& executable,
-                                         const std::wstring& profile,
-                                         DWORD timeout_ms = 15000) {
-    if (executable.empty() || profile.empty()) return false;
+ProbeChromiumProcessScanResult WaitForProbeChromiumProcessesToExit(
+    const std::wstring& executable, const std::wstring& profile,
+    DWORD timeout_ms = 15000) {
+    if (executable.empty() || profile.empty()) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
     const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
     for (;;) {
         const ProbeChromiumProcessScanResult scan =
             ScanProbeChromiumProcesses(executable, profile);
-        if (scan == ProbeChromiumProcessScanResult::Clean) return true;
-        if (::GetTickCount64() >= deadline) return false;
+        if (scan == ProbeChromiumProcessScanResult::Clean ||
+            ::GetTickCount64() >= deadline) {
+            return scan;
+        }
         PumpStaMessages();
         ::Sleep(100);
     }
@@ -5842,11 +5846,14 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         const bool no_profile_windows =
             EnumerateChromiumWindows(executable, profile, true).empty();
         bool profile_removed = false;
-        bool profile_processes_gone = false;
+        ProbeChromiumProcessScanResult process_scan =
+            ProbeChromiumProcessScanResult::Inconclusive;
         if (no_profile_windows && !retain_profile) {
-            profile_processes_gone =
+            process_scan =
                 WaitForProbeChromiumProcessesToExit(executable, profile);
         }
+        const bool profile_processes_gone =
+            process_scan == ProbeChromiumProcessScanResult::Clean;
         if (no_profile_windows && profile_processes_gone && !retain_profile) {
             profile_removed = RemoveProbeProfileDirectory(profile);
         }
@@ -5863,8 +5870,27 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         } else {
             Field("temporary profile cleanup", "incomplete (profile retained)");
         }
-        Field("temporary profile process drain",
-              profile_processes_gone ? "passed" : "incomplete");
+        if (!no_profile_windows) {
+            Field("temporary profile process drain",
+                  "not run (attributed profile windows remain)");
+        } else if (retain_profile) {
+            Field("temporary profile process drain",
+                  "not run (attribution incomplete; profile retained)");
+        } else {
+            switch (process_scan) {
+                case ProbeChromiumProcessScanResult::Clean:
+                    Field("temporary profile process drain", "passed");
+                    break;
+                case ProbeChromiumProcessScanResult::MatchesRemain:
+                    Field("temporary profile process drain",
+                          "incomplete (attributed probe processes remain)");
+                    break;
+                case ProbeChromiumProcessScanResult::Inconclusive:
+                    Field("temporary profile process drain",
+                          "inconclusive (profile retained)");
+                    break;
+            }
+        }
         return complete;
     };
 
