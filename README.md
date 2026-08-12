@@ -65,6 +65,7 @@ Gated feasibility tests:
 | `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe workspace-discovery-test` | productization boundary: deterministic, non-mutating capability-driven complete-window discovery and fail-closed classification |
 | `vdprobe workspace-live-discovery-test` | productization bootstrap: one complete, non-mutating live Carrier/Parking snapshot with `GetViewForHwnd` and `CanViewMoveDesktops` capability checks |
+| `vdprobe workspace-live-bootstrap-test` | validates that same read-only live snapshot in `WorkspaceEngine` using an explicitly synthetic, in-memory-only workspace assignment |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 

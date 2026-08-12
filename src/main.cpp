@@ -89,6 +89,9 @@ void Usage() {
         "  workspace-live-discovery-test\n"
         "                      one complete read-only live Carrier/Parking\n"
         "                      window snapshot with private capability checks\n"
+        "  workspace-live-bootstrap-test\n"
+        "                      validate that live read-only snapshot in the\n"
+        "                      engine with synthetic in-memory assignment\n"
         "  workspace-engine-test\n"
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
@@ -210,6 +213,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceDiscoveryTest();
     } else if (cmd == "workspace-live-discovery-test") {
         rc = vd::CmdWorkspaceLiveDiscoveryTest();
+    } else if (cmd == "workspace-live-bootstrap-test") {
+        rc = vd::CmdWorkspaceLiveBootstrapTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-coordinator-test") {

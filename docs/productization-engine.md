@@ -152,6 +152,7 @@ state, or branch on executable names. Run:
 ```powershell
 .\build\vdprobe.exe workspace-discovery-test
 .\build\vdprobe.exe workspace-live-discovery-test
+.\build\vdprobe.exe workspace-live-bootstrap-test
 ```
 
 This deterministic test covers the injected backend and managed/unsupported/
@@ -167,6 +168,15 @@ performs no native mutation. `E_ACCESSDENIED` is emitted as the stable
 `RESULT=ENVIRONMENT-BLOCKED` status with exit code 77. Production coordinator
 wiring, assignment policy, and lifecycle-driven rescan remain separate
 milestones.
+
+`workspace-live-bootstrap-test` reuses that live read-only discovery and
+private capability augmentation, then converts the complete snapshot into
+`WindowRecord` values and reconciles them into a fresh `WorkspaceEngine`. For
+this validation only, it creates two synthetic in-memory workspace IDs per
+observed monitor and assigns Carrier/Parking observations accordingly. This is
+not a workspace assignment policy: the command installs no move callback,
+persists nothing, and performs no native mutation. It reports machine-readable
+snapshot, monitor, engine-window, invariant, and result status.
 
 ## Deliberate next boundaries
 

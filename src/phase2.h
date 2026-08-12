@@ -93,6 +93,11 @@ int CmdTerminalSemanticsTest(bool confirm_mutate);
 // complete snapshot. It never assigns a workspace or mutates native state.
 int CmdWorkspaceLiveDiscoveryTest();
 
+// Productization bootstrap validation: feeds the same read-only live snapshot
+// into WorkspaceEngine using an explicitly synthetic in-memory assignment.
+// It installs no move callback and performs no native or persistent mutation.
+int CmdWorkspaceLiveBootstrapTest();
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();

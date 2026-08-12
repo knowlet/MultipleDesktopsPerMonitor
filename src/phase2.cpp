@@ -3861,10 +3861,12 @@ int CmdCarrierParkingTest(bool confirm_mutate) {
 
 // ---------------------------------------------- workspace-live-discovery-test
 
-int CmdWorkspaceLiveDiscoveryTest() {
-    Heading("workspace-live-discovery-test");
+int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
+    Heading(bootstrap_engine ? "workspace-live-bootstrap-test"
+                             : "workspace-live-discovery-test");
     Field("operation", "one complete read-only live window snapshot");
-    Field("workspace assignment", "none");
+    Field("workspace assignment",
+          bootstrap_engine ? "synthetic in-memory validation only" : "none");
     Field("native mutation", "none");
 
     auto environment_blocked = [](std::string_view reason) {
@@ -4035,6 +4037,83 @@ int CmdWorkspaceLiveDiscoveryTest() {
     Field("managed", std::format("{}", managed));
     Field("unsupported", std::format("{}", unsupported));
     Field("ambiguous", std::format("{}", ambiguous));
+
+    if (bootstrap_engine) {
+        // This mapping is deliberately synthetic: it proves only that a live,
+        // capability-augmented discovery snapshot can populate the engine's
+        // in-memory model.  It is not a user workspace assignment policy.
+        struct SyntheticMonitor {
+            MonitorId monitor = 0;
+            WorkspaceId carrier_workspace = 0;
+            WorkspaceId parking_workspace = 0;
+        };
+        std::vector<SyntheticMonitor> synthetic_monitors;
+        for (const DiscoveredWindow& window : windows) {
+            const MonitorId monitor =
+                reinterpret_cast<MonitorId>(window.monitor);
+            if (monitor == 0) {
+                return failed("live snapshot contains a window without a monitor");
+            }
+            const auto found = std::find_if(
+                synthetic_monitors.begin(), synthetic_monitors.end(),
+                [monitor](const SyntheticMonitor& item) {
+                    return item.monitor == monitor;
+                });
+            if (found == synthetic_monitors.end()) {
+                const WorkspaceId base =
+                    static_cast<WorkspaceId>(synthetic_monitors.size()) * 2 + 1;
+                synthetic_monitors.push_back({monitor, base, base + 1});
+            }
+        }
+
+        WorkspaceEngine engine(carrier.id, parking.id);
+        for (const SyntheticMonitor& monitor : synthetic_monitors) {
+            if (!engine.AddMonitor(monitor.monitor, monitor.carrier_workspace,
+                                   {monitor.carrier_workspace,
+                                    monitor.parking_workspace},
+                                   &error)) {
+                return failed(error.empty() ? "synthetic monitor setup failed"
+                                            : error);
+            }
+        }
+        std::vector<WindowRecord> records;
+        records.reserve(windows.size());
+        for (const DiscoveredWindow& window : windows) {
+            const MonitorId monitor =
+                reinterpret_cast<MonitorId>(window.monitor);
+            const auto synthetic = std::find_if(
+                synthetic_monitors.begin(), synthetic_monitors.end(),
+                [monitor](const SyntheticMonitor& item) {
+                    return item.monitor == monitor;
+                });
+            WindowRecord record;
+            record.identity = window.identity;
+            record.monitor = monitor;
+            record.workspace =
+                window.native_role == NativeDesktopRole::Parking
+                    ? synthetic->parking_workspace
+                    : synthetic->carrier_workspace;
+            record.native_role = window.native_role;
+            record.capabilities = window.capabilities;
+            record.presentation = window.presentation;
+            record.disposition = window.disposition;
+            records.push_back(std::move(record));
+        }
+        DiscoveryReconcileResult reconcile;
+        if (!engine.ReconcileDiscoverySnapshot(std::move(records), &reconcile,
+                                               &error) ||
+            !engine.CheckInvariant(&error)) {
+            return failed(error.empty() ? "synthetic engine bootstrap failed"
+                                        : error);
+        }
+        Field("synthetic monitors",
+              std::format("{}", synthetic_monitors.size()));
+        Field("engine windows", std::format("{}", engine.Windows().size()));
+        Print("SYNTHETIC_ASSIGNMENT=1\n");
+        Print("MONITOR_COUNT={}\n", synthetic_monitors.size());
+        Print("ENGINE_WINDOW_COUNT={}\n", engine.Windows().size());
+        Print("ENGINE_INVARIANT=OK\n");
+    }
     Field("result", "OK");
     Field("mutation_started", "no");
     Print("RESULT=OK\n");
@@ -4043,6 +4122,14 @@ int CmdWorkspaceLiveDiscoveryTest() {
     Print("UNSUPPORTED_COUNT={}\n", unsupported);
     Print("AMBIGUOUS_COUNT={}\n", ambiguous);
     return 0;
+}
+
+int CmdWorkspaceLiveDiscoveryTest() {
+    return CmdWorkspaceLiveDiscovery(false);
+}
+
+int CmdWorkspaceLiveBootstrapTest() {
+    return CmdWorkspaceLiveDiscovery(true);
 }
 
 // ---------------------------------------------------- logical-workspace-test
