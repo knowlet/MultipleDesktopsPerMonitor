@@ -1798,8 +1798,31 @@ bool CreateProbeProfileDirectory(std::wstring& out) {
     return ::CreateDirectoryW(out.c_str(), nullptr) != FALSE;
 }
 
+struct TrackedChromiumProcess {
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    DWORD parent_pid = 0;
+    FILETIME creation_time{};
+};
+
+struct ChromiumProcessTree {
+    std::vector<TrackedChromiumProcess> processes;
+    bool identity_capture_failed = false;
+
+    ChromiumProcessTree() = default;
+    ChromiumProcessTree(const ChromiumProcessTree&) = delete;
+    ChromiumProcessTree& operator=(const ChromiumProcessTree&) = delete;
+
+    ~ChromiumProcessTree() {
+        for (const TrackedChromiumProcess& process : processes) {
+            if (process.process != nullptr) ::CloseHandle(process.process);
+        }
+    }
+};
+
 bool LaunchChromiumWindow(const std::wstring& executable,
-                          const std::wstring& profile) {
+                          const std::wstring& profile,
+                          ChromiumProcessTree& process_tree) {
     if (executable.empty() || profile.empty()) return false;
     std::wstring command =
         L"\"" + executable + L"\" --user-data-dir=\"" + profile +
@@ -1815,9 +1838,19 @@ bool LaunchChromiumWindow(const std::wstring& executable,
                           nullptr, FALSE, 0, nullptr, nullptr, &startup, &pi)) {
         return false;
     }
-    (void)::WaitForInputIdle(pi.hProcess, 4000);
     ::CloseHandle(pi.hThread);
-    ::CloseHandle(pi.hProcess);
+
+    TrackedChromiumProcess launched;
+    launched.process = pi.hProcess;
+    launched.pid = pi.dwProcessId;
+    if (!ReadProcessCreationTime(pi.hProcess, launched.creation_time)) {
+        // The launch succeeded, but without its creation identity a recycled PID
+        // cannot be distinguished from this probe's root.  Keep the handle (and
+        // therefore the PID) stable, but force fail-closed profile retention.
+        process_tree.identity_capture_failed = true;
+    }
+    process_tree.processes.push_back(launched);
+    (void)::WaitForInputIdle(pi.hProcess, 4000);
     return true;
 }
 
@@ -1883,9 +1916,79 @@ enum class ProbeChromiumProcessScanResult {
     Inconclusive,
 };
 
+struct ChromiumProcessSnapshotEntry {
+    DWORD pid = 0;
+    DWORD parent_pid = 0;
+    FILETIME creation_time{};
+    bool creation_time_ok = false;
+};
+
+struct ChromiumProcessBaseline {
+    std::vector<ChromiumProcessSnapshotEntry> processes;
+    bool capture_ok = false;
+};
+
+bool SnapshotChromiumProcesses(const std::wstring& executable,
+                               std::vector<ChromiumProcessSnapshotEntry>& out) {
+    out.clear();
+    if (executable.empty()) return false;
+    const size_t separator = executable.find_last_of(L"\\/");
+    const std::wstring executable_name =
+        executable.substr(separator == std::wstring::npos ? 0 : separator + 1);
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!::Process32FirstW(snapshot, &entry)) {
+        const DWORD error = ::GetLastError();
+        ::CloseHandle(snapshot);
+        return error == ERROR_NO_MORE_FILES;
+    }
+    for (;;) {
+        if (_wcsicmp(entry.szExeFile, executable_name.c_str()) == 0) {
+            ChromiumProcessSnapshotEntry process;
+            process.pid = entry.th32ProcessID;
+            process.parent_pid = entry.th32ParentProcessID;
+            HANDLE handle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                          FALSE, process.pid);
+            if (handle != nullptr) {
+                process.creation_time_ok =
+                    ReadProcessCreationTime(handle, process.creation_time);
+                ::CloseHandle(handle);
+            }
+            out.push_back(process);
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        if (!::Process32NextW(snapshot, &entry)) break;
+    }
+    const DWORD enumeration_error = ::GetLastError();
+    ::CloseHandle(snapshot);
+    return enumeration_error == ERROR_NO_MORE_FILES;
+}
+
+ChromiumProcessBaseline CaptureChromiumProcessBaseline(
+    const std::wstring& executable) {
+    ChromiumProcessBaseline baseline;
+    baseline.capture_ok = SnapshotChromiumProcesses(executable,
+                                                    baseline.processes);
+    return baseline;
+}
+
+const TrackedChromiumProcess* FindTrackedChromiumProcess(
+    const ChromiumProcessTree& process_tree, DWORD pid) {
+    const auto it = std::find_if(
+        process_tree.processes.begin(), process_tree.processes.end(),
+        [pid](const TrackedChromiumProcess& process) {
+            return process.pid == pid;
+        });
+    return it == process_tree.processes.end() ? nullptr : &*it;
+}
+
 ProbeChromiumProcessScanResult ScanProbeChromiumProcesses(
-    const std::wstring& executable, const std::wstring& profile) {
-    if (executable.empty() || profile.empty()) {
+    ChromiumProcessTree& process_tree, const std::wstring& executable,
+    const std::wstring& profile, const ChromiumProcessBaseline& baseline) {
+    if (process_tree.identity_capture_failed || !baseline.capture_ok) {
         return ProbeChromiumProcessScanResult::Inconclusive;
     }
     HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1903,44 +2006,119 @@ ProbeChromiumProcessScanResult ScanProbeChromiumProcesses(
                    : ProbeChromiumProcessScanResult::Inconclusive;
     }
 
-    const size_t separator = executable.find_last_of(L"\\/");
-    const std::wstring executable_name =
-        executable.substr(separator == std::wstring::npos ? 0 : separator + 1);
-    bool query_inconclusive = false;
+    std::vector<ChromiumProcessSnapshotEntry> snapshot_entries;
     for (;;) {
-        if (_wcsicmp(entry.szExeFile, executable_name.c_str()) == 0) {
-            const ChromiumProcessMatch match = ClassifyChromiumProcess(
-                entry.th32ProcessID, executable, profile);
-            if (match == ChromiumProcessMatch::Match) {
-                ::CloseHandle(snapshot);
-                return ProbeChromiumProcessScanResult::MatchesRemain;
-            }
-            if (match == ChromiumProcessMatch::Inconclusive) {
-                query_inconclusive = true;
-            }
-        }
+        snapshot_entries.push_back({entry.th32ProcessID,
+                                    entry.th32ParentProcessID, {}, false});
 
         ::SetLastError(ERROR_SUCCESS);
         if (!::Process32NextW(snapshot, &entry)) break;
     }
     const DWORD enumeration_error = ::GetLastError();
     ::CloseHandle(snapshot);
-    if (enumeration_error != ERROR_NO_MORE_FILES || query_inconclusive) {
+    if (enumeration_error != ERROR_NO_MORE_FILES) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
+
+    // Retained handles prevent every known tree PID from being recycled.  A
+    // snapshot entry whose parent PID names a known process and whose creation
+    // time is not older than that parent can therefore be added to the exact
+    // launch tree without consulting unrelated msedge.exe processes.
+    bool added = false;
+    do {
+        added = false;
+        for (const ChromiumProcessSnapshotEntry& candidate : snapshot_entries) {
+            if (candidate.pid == 0 || candidate.pid == candidate.parent_pid ||
+                FindTrackedChromiumProcess(process_tree, candidate.pid) !=
+                    nullptr) {
+                continue;
+            }
+            const TrackedChromiumProcess* parent =
+                FindTrackedChromiumProcess(process_tree, candidate.parent_pid);
+            if (parent == nullptr) continue;
+
+            HANDLE process = ::OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
+                candidate.pid);
+            if (process == nullptr) {
+                // It may have exited between the snapshot and OpenProcess after
+                // spawning a still-live child.  Retain the profile rather than
+                // guessing that this branch is drained.
+                return ProbeChromiumProcessScanResult::Inconclusive;
+            }
+            FILETIME creation_time{};
+            if (!ReadProcessCreationTime(process, creation_time)) {
+                ::CloseHandle(process);
+                return ProbeChromiumProcessScanResult::Inconclusive;
+            }
+            if (::CompareFileTime(&creation_time, &parent->creation_time) < 0) {
+                // The snapshot's parent PID refers to an older, unrelated
+                // process that existed before this tracked PID incarnation.
+                ::CloseHandle(process);
+                continue;
+            }
+
+            process_tree.processes.push_back(
+                {process, candidate.pid, candidate.parent_pid, creation_time});
+            added = true;
+        }
+    } while (added);
+
+    for (const TrackedChromiumProcess& process : process_tree.processes) {
+        const DWORD wait = ::WaitForSingleObject(process.process, 0);
+        if (wait == WAIT_TIMEOUT) {
+            return ProbeChromiumProcessScanResult::MatchesRemain;
+        }
+        if (wait != WAIT_OBJECT_0) {
+            return ProbeChromiumProcessScanResult::Inconclusive;
+        }
+    }
+
+    // A short-lived intermediate can disappear before the parent-link walk and
+    // leave a live orphan outside the observed tree.  Backstop the tree with a
+    // global Edge snapshot, but exempt only identities already present before
+    // this probe launched.  This avoids querying unrelated unchanged Edge
+    // processes during cleanup while ensuring every new/reused Edge PID keeps
+    // the profile fail-closed unless it can be positively matched.
+    std::vector<ChromiumProcessSnapshotEntry> current_edge;
+    if (!SnapshotChromiumProcesses(executable, current_edge)) {
+        return ProbeChromiumProcessScanResult::Inconclusive;
+    }
+    for (const ChromiumProcessSnapshotEntry& current : current_edge) {
+        const auto old = std::find_if(
+            baseline.processes.begin(), baseline.processes.end(),
+            [&](const ChromiumProcessSnapshotEntry& candidate) {
+                return candidate.pid == current.pid;
+            });
+        if (old != baseline.processes.end()) {
+            if (old->creation_time_ok && current.creation_time_ok &&
+                SameFileTime(old->creation_time, current.creation_time)) {
+                continue;
+            }
+        }
+
+        const ChromiumProcessMatch match =
+            ClassifyChromiumProcess(current.pid, executable, profile);
+        if (match == ChromiumProcessMatch::Match) {
+            return ProbeChromiumProcessScanResult::MatchesRemain;
+        }
+        // A new/reused Edge identity may be an orphan whose short-lived parent
+        // escaped the tree walk.  Even a readable non-match is not safe evidence
+        // that every profile-owning descendant was observed, so retain.
         return ProbeChromiumProcessScanResult::Inconclusive;
     }
     return ProbeChromiumProcessScanResult::Clean;
 }
 
 ProbeChromiumProcessScanResult WaitForProbeChromiumProcessesToExit(
-    const std::wstring& executable, const std::wstring& profile,
+    ChromiumProcessTree& process_tree, const std::wstring& executable,
+    const std::wstring& profile, const ChromiumProcessBaseline& baseline,
     DWORD timeout_ms = 15000) {
-    if (executable.empty() || profile.empty()) {
-        return ProbeChromiumProcessScanResult::Inconclusive;
-    }
     const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
     for (;;) {
         const ProbeChromiumProcessScanResult scan =
-            ScanProbeChromiumProcesses(executable, profile);
+            ScanProbeChromiumProcesses(process_tree, executable, profile,
+                                       baseline);
         if (scan == ProbeChromiumProcessScanResult::Clean ||
             ::GetTickCount64() >= deadline) {
             return scan;
@@ -5829,6 +6007,15 @@ int CmdChromiumSemanticsTest(const std::string& browser,
     }
     Field("browser executable", ToUtf8(executable));
 
+    const ChromiumProcessBaseline process_baseline =
+        CaptureChromiumProcessBaseline(executable);
+    if (!process_baseline.capture_ok) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "could not capture pre-launch Edge process baseline");
+        Field("mutation_started", "no");
+        return kExitInconclusive;
+    }
+
     std::wstring profile;
     if (!CreateProbeProfileDirectory(profile)) {
         Field("result", "ENVIRONMENT-BLOCKED");
@@ -5839,6 +6026,7 @@ int CmdChromiumSemanticsTest(const std::string& browser,
     Field("probe profile", ToUtf8(profile));
 
     std::vector<ChromiumWindowInfo> created_roots;
+    ChromiumProcessTree process_tree;
     bool retain_profile = false;
     auto cleanup = [&]() {
         const bool closed =
@@ -5849,8 +6037,8 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         ProbeChromiumProcessScanResult process_scan =
             ProbeChromiumProcessScanResult::Inconclusive;
         if (no_profile_windows && !retain_profile) {
-            process_scan =
-                WaitForProbeChromiumProcessesToExit(executable, profile);
+            process_scan = WaitForProbeChromiumProcessesToExit(
+                process_tree, executable, profile, process_baseline);
         }
         const bool profile_processes_gone =
             process_scan == ProbeChromiumProcessScanResult::Clean;
@@ -5922,7 +6110,7 @@ int CmdChromiumSemanticsTest(const std::string& browser,
         const std::vector<ChromiumWindowInfo> before =
             EnumerateChromiumWindows(executable, profile, true);
         Field("Edge launch", std::format("{}", launch_index + 1));
-        if (!LaunchChromiumWindow(executable, profile)) {
+        if (!LaunchChromiumWindow(executable, profile, process_tree)) {
             Field("result", "ENVIRONMENT-BLOCKED");
             Field("reason", "Edge launch request failed");
             Field("mutation_started", created_roots.empty() ? "no" : "yes");
