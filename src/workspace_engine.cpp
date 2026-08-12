@@ -869,15 +869,11 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     const SwitchPlan& plan, const MoveCallback& move,
     const ObserveCallback& observe, const WorkspaceJournal* journal) {
     TransactionResult result;
-    const MonitorWorkspaceState* monitor = Monitor(plan.monitor);
-    if (monitor == nullptr || monitor->active != plan.from_workspace ||
-        !HasWorkspace(plan.monitor, plan.to_workspace)) {
+    std::string expected_error;
+    const std::optional<SwitchPlan> expected =
+        PrepareSwitch(plan.monitor, plan.to_workspace, &expected_error);
+    if (!expected || !PlansMatch(*expected, plan)) {
         result.error = "stale switch plan";
-        return result;
-    }
-    std::string invariant_error;
-    if (!CheckInvariant(&invariant_error)) {
-        result.error = invariant_error;
         return result;
     }
 
@@ -893,6 +889,40 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         // Verify the entire recorded baseline before declaring the transaction
         // aborted. Native side effects are not necessarily limited to the
         // operation whose callback was invoked.
+        result.rollback_succeeded =
+            RestoreOperations(plan.operations, move, observe, &error);
+        if (result.rollback_succeeded && journal) {
+            std::string abort_error;
+            if (!journal->Abort(&abort_error)) {
+                result.recovery_required = true;
+                error += "; journal abort failed: " + abort_error;
+            }
+        }
+        result.recovery_required =
+            result.recovery_required || !result.rollback_succeeded;
+        result.error = error;
+        return result;
+    }
+
+    // A move callback may pump lifecycle work, and a later move can disturb a
+    // window that was already verified. Revalidate both the complete modeled
+    // membership and every native post-state before making the transaction
+    // durable or updating the active workspace.
+    const std::optional<SwitchPlan> current =
+        PrepareSwitch(plan.monitor, plan.to_workspace, &expected_error);
+    bool post_state_matches = current && PlansMatch(*current, plan);
+    if (post_state_matches) {
+        for (const SwitchOperation& operation : plan.operations) {
+            const WindowRecord* window = FindWindow(operation.identity);
+            if (window == nullptr || observe(*window) != operation.to) {
+                post_state_matches = false;
+                break;
+            }
+        }
+    }
+    if (!post_state_matches) {
+        result.rollback_attempted = !applied.empty();
+        error = "switch state changed during execution";
         result.rollback_succeeded =
             RestoreOperations(plan.operations, move, observe, &error);
         if (result.rollback_succeeded && journal) {
@@ -1243,6 +1273,123 @@ int CmdWorkspaceEngineTest() {
          engine.CheckInvariant(&error);
     Field("failed move rolls back observed side effects",
           ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine stale_plan_engine(carrier, parking);
+    bool stale_plan_ok =
+        stale_plan_engine.AddMonitor(5, 51, {51, 52}, &error);
+    const WindowIdentity stale_a_id = identity(0x1101, 111, 1);
+    const WindowIdentity stale_b_id = identity(0x1102, 112, 1);
+    const WindowIdentity stale_added_id = identity(0x1103, 113, 1);
+    if (stale_plan_ok) {
+        stale_plan_ok =
+            stale_plan_engine.UpsertWindow(
+                {stale_a_id, 5, 51, NativeDesktopRole::Carrier, manageable,
+                 {}, {}, true},
+                &error) == UpsertResult::Added &&
+            stale_plan_engine.UpsertWindow(
+                {stale_b_id, 5, 52, NativeDesktopRole::Parking, manageable,
+                 {}, {}, true},
+                &error) == UpsertResult::Added;
+    }
+    const std::optional<SwitchPlan> prepared_stale_plan =
+        stale_plan_ok
+            ? stale_plan_engine.PrepareSwitch(5, 52, &error)
+            : std::nullopt;
+    if (stale_plan_ok) {
+        stale_plan_ok = prepared_stale_plan.has_value() &&
+            stale_plan_engine.UpsertWindow(
+                {stale_added_id, 5, 52, NativeDesktopRole::Parking,
+                 manageable, {}, {}, true},
+                &error) == UpsertResult::Added;
+    }
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        stale_roles{{stale_a_id, NativeDesktopRole::Carrier},
+                    {stale_b_id, NativeDesktopRole::Parking},
+                    {stale_added_id, NativeDesktopRole::Parking}};
+    int stale_move_calls = 0;
+    auto stale_move = [&](const WindowRecord& window,
+                          NativeDesktopRole target) {
+        ++stale_move_calls;
+        stale_roles[window.identity] = target;
+        return true;
+    };
+    auto stale_observe = [&](const WindowRecord& window) {
+        return stale_roles[window.identity];
+    };
+    std::filesystem::path stale_plan_journal_path =
+        std::filesystem::temp_directory_path() /
+        "vdprobe-workspace-engine-stale-plan-test.journal";
+    std::error_code stale_plan_ignored;
+    std::filesystem::remove(stale_plan_journal_path, stale_plan_ignored);
+    WorkspaceJournal stale_plan_journal(stale_plan_journal_path);
+    const TransactionResult stale_transaction =
+        prepared_stale_plan
+            ? stale_plan_engine.ExecuteSwitch(
+                  *prepared_stale_plan, stale_move, stale_observe,
+                  &stale_plan_journal)
+            : TransactionResult{};
+    stale_plan_ok = stale_plan_ok && !stale_transaction.committed &&
+                    stale_transaction.error == "stale switch plan" &&
+                    stale_move_calls == 0 &&
+                    !std::filesystem::exists(stale_plan_journal_path) &&
+                    stale_plan_engine.Monitor(5)->active == 51 &&
+                    stale_plan_engine.CheckInvariant(&error);
+    std::filesystem::remove(stale_plan_journal_path, stale_plan_ignored);
+    ok = ok && stale_plan_ok;
+    Field("membership change invalidates prepared plan before journal BEGIN",
+          stale_plan_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine post_state_engine(carrier, parking);
+    bool post_state_ok =
+        post_state_engine.AddMonitor(6, 61, {61, 62}, &error);
+    const WindowIdentity post_a_id = identity(0x1201, 121, 1);
+    const WindowIdentity post_b_id = identity(0x1202, 122, 1);
+    if (post_state_ok) {
+        post_state_ok =
+            post_state_engine.UpsertWindow(
+                {post_a_id, 6, 61, NativeDesktopRole::Carrier, manageable,
+                 {}, {}, true},
+                &error) == UpsertResult::Added &&
+            post_state_engine.UpsertWindow(
+                {post_b_id, 6, 62, NativeDesktopRole::Parking, manageable,
+                 {}, {}, true},
+                &error) == UpsertResult::Added;
+    }
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        post_roles{{post_a_id, NativeDesktopRole::Carrier},
+                   {post_b_id, NativeDesktopRole::Parking}};
+    auto post_observe = [&](const WindowRecord& window) {
+        return post_roles[window.identity];
+    };
+    auto disturb_earlier_move = [&](const WindowRecord& window,
+                                    NativeDesktopRole target) {
+        post_roles[window.identity] = target;
+        if (window.identity == post_b_id &&
+            target == NativeDesktopRole::Carrier) {
+            post_roles[post_a_id] = NativeDesktopRole::Carrier;
+        }
+        return true;
+    };
+    const std::optional<SwitchPlan> post_plan =
+        post_state_ok
+            ? post_state_engine.PrepareSwitch(6, 62, &error)
+            : std::nullopt;
+    const TransactionResult post_transaction =
+        post_plan ? post_state_engine.ExecuteSwitch(
+                        *post_plan, disturb_earlier_move, post_observe)
+                  : TransactionResult{};
+    post_state_ok = post_state_ok && post_plan.has_value() &&
+                    !post_transaction.committed &&
+                    post_transaction.rollback_attempted &&
+                    post_transaction.rollback_succeeded &&
+                    !post_transaction.recovery_required &&
+                    post_state_engine.Monitor(6)->active == 61 &&
+                    post_roles[post_a_id] == NativeDesktopRole::Carrier &&
+                    post_roles[post_b_id] == NativeDesktopRole::Parking &&
+                    post_state_engine.CheckInvariant(&error);
+    ok = ok && post_state_ok;
+    Field("full native post-state is verified before commit",
+          post_state_ok ? "PASS" : "FAIL");
 
     const WindowIdentity reused_id = identity(0x1002, 303, 9);
     const UpsertResult recreated = engine.UpsertWindow(
