@@ -289,13 +289,16 @@ Parking observations and preserves the engine model when discovery fails.
 `workspace-readonly-host-test` uses only injected identities, discovery, and
 hook functions. It verifies authoritative startup, a newly appeared Carrier
 window joining the configured active workspace, discovery failure preserving
-the last valid model, owner-thread shutdown, and a pending durable transaction
-blocking startup. The host intentionally installs no native move, observe, or
-recovery callback, so it cannot switch workspaces or recover a pending journal.
-It also does not choose a system discovery/capability provider, production
-monitor/workspace IDs, journal location, message-loop or periodic-rescan
-policy, focus/Z-order policy, hotkeys, or UI. It is not a long-running product
-manager and does not establish live-shell compatibility evidence.
+the last valid model, event/interval/forced polling, owner-thread shutdown,
+and a pending durable transaction blocking startup. The host intentionally
+installs no native move, observe, or recovery callback, so it cannot switch
+workspaces or recover a pending journal. Its `Poll()` boundary pumps the
+installing thread's WinEvent queue and triggers only complete authoritative
+rescans; the caller supplies the interval and remains responsible for the
+production message loop. It also does not choose a system capability provider,
+production monitor/workspace IDs, journal location, focus/Z-order policy,
+hotkeys, or UI. It is not a long-running product manager and does not
+establish live-shell compatibility evidence.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

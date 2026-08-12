@@ -125,17 +125,22 @@ complete snapshot, and `Stop()` verifies lifecycle cleanup.
 `workspace-readonly-host-test` is deterministic and non-mutating. It uses
 synthetic HWND identities and injected discovery/hook functions, performs no
 COM or native window calls, and installs no move, observe, or recovery
-callback. It checks initial population, subsequent Carrier-window discovery,
-preservation of the last valid model after discovery failure, owner-thread
-hook shutdown, and startup blocking when a durable transaction is pending.
+callback. It checks initial population, idle polling, event-triggered and
+forced complete rescans, subsequent Carrier-window discovery, preservation of
+the last valid model after discovery failure, owner-thread hook shutdown, and
+startup blocking when a durable transaction is pending.
 Because recovery requires mutation-capable callbacks, this host deliberately
 leaves a pending journal blocked and unchanged.
 
 This is a composition/test host, not a production process or live-shell host.
+Its `Poll()` boundary pumps the owner thread's out-of-context WinEvent queue
+and requests only complete authoritative rescans when a lifecycle epoch
+changes, the caller-supplied interval expires, or the caller forces a rescan.
 It does not choose the system capability provider, persistent monitor/workspace
-configuration, production journal location, message-loop or periodic-rescan
-policy, focus/Z-order policy, hotkeys, or UI. Its test is not compatibility
-evidence and does not support a `GO-PRODUCTIZATION` claim.
+configuration, production journal location, or the application's outer
+message-loop policy. Focus/Z-order policy, hotkeys, and UI remain separate.
+Its test is not compatibility evidence and does not support a
+`GO-PRODUCTIZATION` claim.
 
 This test performs no COM calls and no native desktop/window mutation. It
 currently verifies:
