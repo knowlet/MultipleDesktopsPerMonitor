@@ -83,7 +83,33 @@ Run:
 
 ```powershell
 .\build\vdprobe.exe workspace-engine-test
+.\build\vdprobe.exe workspace-assignment-test
+.\build\vdprobe.exe workspace-live-lifecycle-test
 ```
+
+`WorkspaceAssignmentAdapter` is the read-only boundary between complete
+`DiscoveredWindow` snapshots and engine-scoped `WindowRecord` values.  Its
+monitor topology must match the engine.  Exact tracked managed identities keep
+their workspace only when the observed Carrier/Parking role still matches;
+monitor migration or a role mismatch rejects the entire candidate without
+changing either the caller's output or the engine.  A new Carrier window joins
+the monitor's active workspace, while a new Parking window remains unassigned.
+Unsupported and ambiguous observations remain outside managed scope.  An HWND
+with a new process generation is evaluated as a new candidate and never
+inherits the prior generation's workspace.
+
+`workspace-live-lifecycle-test` composes the read-only discovery, lifecycle,
+assignment, engine, and coordinator boundaries without native window or
+desktop mutation. Deterministic injected probe identities exercise appeared,
+close-hint, authoritative close, reappearance, and same-HWND new-generation
+reconciliation. The explicit test registry is keyed by full `WindowIdentity`,
+so a new generation must be assigned independently. Complete snapshots are the
+sole close authority; lifecycle hints only cause bounded reconciliation. The
+candidate snapshot is rejected intact on missing assignment, monitor mismatch,
+capability loss, unstable identity, or lifecycle input that does not become
+quiet. The command uses the injectable Win32 discovery factory seam to avoid
+enumerating user HWNDs; `workspace-live-coordinator-bootstrap-test` separately
+validates the system discovery factory against the live shell.
 
 This test performs no COM calls and no native desktop/window mutation. It
 currently verifies:

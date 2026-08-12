@@ -27,9 +27,11 @@ add_executable(vdprobe
         src/phase2.cpp
         src/workspace_engine.cpp
         src/window_discovery.cpp
+        src/workspace_assignment.cpp
         src/window_lifecycle.cpp
         src/workspace_coordinator.cpp
         src/workspace_startup.cpp
+        src/workspace_live_lifecycle.cpp
         src/notifysink.cpp
 )
 

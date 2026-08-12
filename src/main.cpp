@@ -18,7 +18,9 @@
 #include "phase2.h"
 #include "util.h"
 #include "window_discovery.h"
+#include "workspace_assignment.h"
 #include "workspace_coordinator.h"
+#include "workspace_live_lifecycle.h"
 #include "workspace_startup.h"
 
 namespace {
@@ -96,10 +98,16 @@ void Usage() {
         "  workspace-live-coordinator-bootstrap-test\n"
         "                      reconcile bounded live read-only discovery via\n"
         "                      lifecycle/coordinator with synthetic assignment\n"
+        "  workspace-live-lifecycle-test\n"
+        "                      deterministic read-only lifecycle and explicit\n"
+        "                      in-memory assignment integration\n"
         "  workspace-engine-test\n"
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
         "                      recovery without touching COM or native desktops\n"
+        "  workspace-assignment-test\n"
+        "                      exercise read-only discovery-to-workspace policy,\n"
+        "                      identity preservation, and fail-closed mismatch\n"
         "  workspace-coordinator-test\n"
         "                      exercise serialized discovery, lifecycle quiet\n"
         "                      boundaries, stale-safe switching, and recovery\n"
@@ -224,8 +232,12 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveBootstrapTest();
     } else if (cmd == "workspace-live-coordinator-bootstrap-test") {
         rc = vd::CmdWorkspaceLiveCoordinatorBootstrapTest();
+    } else if (cmd == "workspace-live-lifecycle-test") {
+        rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
+    } else if (cmd == "workspace-assignment-test") {
+        rc = vd::CmdWorkspaceAssignmentTest();
     } else if (cmd == "workspace-coordinator-test") {
         rc = vd::CmdWorkspaceCoordinatorTest();
     } else if (cmd == "workspace-startup-test") {

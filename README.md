@@ -67,7 +67,9 @@ Gated feasibility tests:
 | `vdprobe workspace-live-discovery-test` | productization bootstrap: one complete, non-mutating live Carrier/Parking snapshot with `GetViewForHwnd` and `CanViewMoveDesktops` capability checks |
 | `vdprobe workspace-live-bootstrap-test` | validates that same read-only live snapshot in `WorkspaceEngine` using an explicitly synthetic, in-memory-only workspace assignment |
 | `vdprobe workspace-live-coordinator-bootstrap-test` | starts the read-only WinEvent source and reconciles bounded complete live discovery through `WorkspaceCoordinator`; assignment remains synthetic/in-memory and no move callback is installed |
+| `vdprobe workspace-live-lifecycle-test` | deterministic read-only integration of injected discovery, an explicit generation-keyed assignment registry, owner-thread lifecycle hints, and bounded authoritative coordinator snapshots; no real HWND or move callback is used |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
+| `vdprobe workspace-assignment-test` | productization boundary: deterministic, non-mutating discovery-to-workspace assignment with identity preservation and fail-closed Carrier/Parking checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 | `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |
 
@@ -233,6 +235,20 @@ uses `WorkspaceCoordinator::ReconcileDiscovery()` to require a quiet bounded
 snapshot. The resulting `WindowRecord` assignments use only synthetic
 in-memory workspace IDs. No move callback is installed, no switch is requested,
 and the lifecycle source is stopped before the command reports success.
+
+`workspace-live-lifecycle-test` advances that boundary through a complete
+appeared/closed/reappeared/HWND-generation lifecycle without inspecting or
+mutating a user window. It uses the injectable documented-Win32 discovery seam
+with deterministic probe-owned identities, an explicit in-memory assignment
+registry keyed by the full HWND/PID/process-generation tuple, a real
+owner-thread `WinEventLifecycleSource` drain boundary, and
+`WorkspaceCoordinator` bounded reconciliation. A close hint alone leaves the
+record present; only omission from a complete snapshot closes it. Missing
+assignment, monitor mismatch, capability loss, identity instability, and a
+lifecycle stream that does not become quiet all fail closed. The preceding
+live coordinator command remains the proof that the same `WindowDiscovery`
+pipeline can be built by `CreateSystemWindowDiscoveryBackend`; the deterministic
+lifecycle command deliberately does not enumerate unrelated user HWNDs.
 
 The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
