@@ -90,21 +90,46 @@ creation:
   exit = 77
 ```
 
-An interactive Edge run remains pending. The expected evidence-bearing
-success is:
+## Interactive Edge evidence (August 12, 2026)
+
+The first interactive run completed the semantics observation on the tested
+Windows 11 host:
+
+```text
+target Carrier -> Parking     S_OK
+target desktop                Parking
+target on current             false
+ViewVirtualDesktopChanged     observed (41.143 ms)
+sibling top-level moved       no
+CurrentVirtualDesktopChanged  0
+restore                       PASS
+Unregister                    S_OK
+probe-owned roots cleanup     passed
+temporary profile cleanup     incomplete (retained)
+```
+
+The evidence-bearing semantics result is:
 
 ```text
 result                        CHROMIUM-SEMANTICS-OBSERVED
 GO/NO-GO                      GO-WITH-LIMITATIONS
-target desktop                Parking
-target on current             false
-ViewVirtualDesktopChanged     observed
-sibling moved                 no
-CurrentVirtualDesktopChanged  0
-restore                       PASS
-Unregister                    S_OK
-temporary profile cleanup     passed
+overall command               INCONCLUSIVE-CLEANUP
 ```
+
+The target and sibling were two top-level `Chrome_WidgetWin_1` windows from
+the same isolated Edge profile and shared the same Edge PID. Nine additional
+internal/popup HWNDs were not sufficiently observable for desktop assignment;
+they remained observation-only and did not block the top-level semantics gate.
+The parked target reported `IsWindowVisible = true` while DWM reported
+`cloaked = 2`, so product visibility decisions must use virtual-desktop
+assignment and cloaking state rather than `IsWindowVisible` alone.
+
+The temporary profile remained on disk because Edge released a profile lock
+after the one-shot cleanup attempt. The probe now retries removal for a bounded
+five seconds after probe-owned roots close. This retry is limited to the
+unique probe profile and never terminates Edge or touches an existing profile.
+Phase 4B-2A should be rerun once after this fix; until that rerun, the overall
+command remains `INCONCLUSIVE-CLEANUP`, not a clean PASS.
 
 This milestone does not claim Chrome equivalence, browser lifecycle support,
 focus/Z-order recovery, existing-profile safety beyond the stated attribution
