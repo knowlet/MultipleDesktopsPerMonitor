@@ -66,6 +66,7 @@ Gated feasibility tests:
 | `vdprobe workspace-discovery-test` | productization boundary: deterministic, non-mutating capability-driven complete-window discovery and fail-closed classification |
 | `vdprobe workspace-live-discovery-test` | productization bootstrap: one complete, non-mutating live Carrier/Parking snapshot with `GetViewForHwnd` and `CanViewMoveDesktops` capability checks |
 | `vdprobe workspace-live-bootstrap-test` | validates that same read-only live snapshot in `WorkspaceEngine` using an explicitly synthetic, in-memory-only workspace assignment |
+| `vdprobe workspace-live-coordinator-bootstrap-test` | starts the read-only WinEvent source and reconciles bounded complete live discovery through `WorkspaceCoordinator`; assignment remains synthetic/in-memory and no move callback is installed |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 
@@ -223,6 +224,14 @@ is wired into `workspace-live-discovery-test` for a single bounded bootstrap
 snapshot, but is not yet wired into the long-running
 coordinator. Production assignment/lifecycle policy, durable journal/bootstrap
 policy, focus/Z-order execution, and UI integration remain separate milestones.
+
+`workspace-live-coordinator-bootstrap-test` is the narrow live coordinator
+bootstrap check: it starts `WinEventLifecycleSource` on the command's owner
+thread, pumps callbacks around each complete read-only discovery attempt, and
+uses `WorkspaceCoordinator::ReconcileDiscovery()` to require a quiet bounded
+snapshot. The resulting `WindowRecord` assignments use only synthetic
+in-memory workspace IDs. No move callback is installed, no switch is requested,
+and the lifecycle source is stopped before the command reports success.
 
 The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps

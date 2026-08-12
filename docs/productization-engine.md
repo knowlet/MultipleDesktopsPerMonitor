@@ -153,6 +153,7 @@ state, or branch on executable names. Run:
 .\build\vdprobe.exe workspace-discovery-test
 .\build\vdprobe.exe workspace-live-discovery-test
 .\build\vdprobe.exe workspace-live-bootstrap-test
+.\build\vdprobe.exe workspace-live-coordinator-bootstrap-test
 ```
 
 This deterministic test covers the injected backend and managed/unsupported/
@@ -177,6 +178,18 @@ observed monitor and assigns Carrier/Parking observations accordingly. This is
 not a workspace assignment policy: the command installs no move callback,
 persists nothing, and performs no native mutation. It reports machine-readable
 snapshot, monitor, engine-window, invariant, and result status.
+
+`workspace-live-coordinator-bootstrap-test` takes the next narrow integration
+step without enabling product mutation. It starts `WinEventLifecycleSource` on
+the command's owner thread, pumps the owner-thread queue around each complete
+discovery callback, and runs bounded quiet reconciliation through
+`WindowLifecycleAdapter` and `WorkspaceCoordinator`. Monitor/workspace mapping
+is explicitly synthetic and in-memory, the coordinator has no move callback,
+and the lifecycle source is stopped and checked before `RESULT=OK` is emitted.
+Environmental access denial, unavailable lifecycle hooks, or a snapshot that
+cannot become quiet within the bound reports `RESULT=ENVIRONMENT-BLOCKED` and
+`mutation_started=no`; all other failures report `RESULT=ERROR` with the same
+non-mutation marker.
 
 ## Deliberate next boundaries
 
