@@ -15,6 +15,7 @@
 #include "notifysink.h"
 #include "phase1.h"
 #include "util.h"
+#include "workspace_coordinator.h"
 #include "workspace_engine.h"
 
 namespace vd {
@@ -4027,26 +4028,126 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 Field("    verified", moved ? "yes" : "NO");
                 return moved;
             };
+
+            WinEventLifecycleSource lifecycle_source;
+            std::string lifecycle_error;
+            const bool lifecycle_started =
+                lifecycle_source.Start(&lifecycle_error);
+            Field("WinEvent lifecycle source",
+                  lifecycle_started ? "started" : "FAILED");
+            if (!lifecycle_error.empty()) {
+                Field("  lifecycle error", lifecycle_error);
+            }
+
+            auto observe_owned_window =
+                [&](HWND hwnd) -> std::optional<WindowRecord> {
+                const LogicalWindow* logical = nullptr;
+                for (const LogicalWindow* candidate : all_windows) {
+                    if (candidate != nullptr && candidate->identity.hwnd == hwnd) {
+                        logical = candidate;
+                        break;
+                    }
+                }
+                if (logical == nullptr) return std::nullopt;
+
+                WindowIdentity identity;
+                if (!ReadWindowIdentity(hwnd, identity) ||
+                    identity != logical->identity) {
+                    return std::nullopt;
+                }
+                const HMONITOR monitor =
+                    ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+                if (monitor == nullptr || monitor != logical->monitor) {
+                    return std::nullopt;
+                }
+
+                RawObject view;
+                if (!acquire_view(hwnd, view) || !can_move_view(view.Get())) {
+                    return std::nullopt;
+                }
+                WindowRecord record{};
+                record.identity = identity;
+                record.monitor = reinterpret_cast<MonitorId>(monitor);
+                record.workspace = logical->workspace;
+                record.native_role = observe_role(record);
+                if (record.native_role == NativeDesktopRole::Unknown) {
+                    return std::nullopt;
+                }
+                record.capabilities = probe_capabilities;
+                record.presentation.rect_valid =
+                    ::GetWindowRect(hwnd, &record.presentation.rect) != FALSE;
+                record.presentation.placement = {};
+                record.presentation.placement.length =
+                    sizeof(record.presentation.placement);
+                record.presentation.placement_valid =
+                    ::GetWindowPlacement(hwnd, &record.presentation.placement) !=
+                    FALSE;
+                record.presentation.foreground =
+                    ::GetForegroundWindow() == hwnd;
+                record.disposition = WindowDisposition::Managed;
+                record.present = true;
+                return record;
+            };
+            WindowLifecycleAdapter lifecycle(engine, observe_owned_window);
+            auto discover_owned_windows =
+                [&](std::vector<WindowRecord>& observed,
+                    std::string* error) -> bool {
+                observed.clear();
+                observed.reserve(all_windows.size());
+                // WinEvent hooks are out-of-context on this STA. Pump before
+                // taking the authoritative snapshot so the coordinator can
+                // establish a meaningful quiet boundary around discovery.
+                PumpStaMessages();
+                for (const LogicalWindow* logical : all_windows) {
+                    const std::optional<WindowRecord> record =
+                        logical == nullptr
+                            ? std::nullopt
+                            : observe_owned_window(logical->identity.hwnd);
+                    if (!record) {
+                        if (error) {
+                            *error = "vdprobe-owned complete discovery failed";
+                        }
+                        observed.clear();
+                        return false;
+                    }
+                    observed.push_back(*record);
+                }
+                return true;
+            };
+
+            const std::filesystem::path journal_path =
+                std::filesystem::temp_directory_path() /
+                ("vdprobe-live-coordinator-" +
+                 std::to_string(::GetCurrentProcessId()) + ".journal");
+            std::error_code journal_remove_error;
+            std::filesystem::remove(journal_path, journal_remove_error);
+            WorkspaceJournal journal(journal_path);
+            WorkspaceCoordinator coordinator(
+                engine, lifecycle, lifecycle_source, discover_owned_windows,
+                move_to_role, observe_role, &journal, 3);
+
             auto switch_logical = [&](WorkspaceId outgoing,
-                                      WorkspaceId incoming) -> bool {
+                                       WorkspaceId incoming) -> bool {
                 const ULONGLONG start_qpc = QpcNow();
                 std::vector<NotifyEvent> events;
-                const std::optional<SwitchPlan> plan =
-                    engine.PrepareSwitch(monitor_a_id, incoming, &engine_error);
-                TransactionResult transaction;
-                if (plan) {
-                    transaction = engine.ExecuteSwitch(*plan, move_to_role,
-                                                       observe_role);
-                } else {
-                    transaction.error = engine_error;
-                }
+                const CoordinatorResult coordinated =
+                    coordinator.Switch(monitor_a_id, incoming);
+                const TransactionResult& transaction = coordinated.transaction;
                 drain_for(events, start_qpc, 250);
 
                 Field(std::format("  logical switch {} -> {}", outgoing, incoming),
-                      transaction.committed ? "core PASS" : "core FAIL");
+                      coordinated.succeeded() ? "coordinator PASS"
+                                              : "coordinator FAIL");
+                Field("    coordinator",
+                      CoordinatorResultCodeText(coordinated.code));
+                Field("    discovery attempts",
+                      std::format("{}", coordinated.discovery_attempts));
                 Field("    engine committed", transaction.committed ? "yes" : "NO");
+                if (!coordinated.error.empty()) {
+                    Field("    coordinator error", coordinated.error);
+                }
                 if (!transaction.error.empty()) {
-                    Field("    engine error", transaction.error);
+                    Field("    transaction error", transaction.error);
                 }
                 if (transaction.rollback_attempted) {
                     Field("    rollback", transaction.rollback_succeeded
@@ -4088,7 +4189,8 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 }();
                 Field("    global current desktop", global_current_ok ? "unchanged"
                                                                         : "CHANGED");
-                const bool pass = transaction.committed &&
+                const bool pass = lifecycle_started && coordinated.succeeded() &&
+                                  transaction.committed &&
                                   CountCurrentDesktopChanged(events, start_qpc) == 0 &&
                                   callback_scope_ok && outgoing_callback_ok &&
                                   incoming_callback_ok && control_ok && state_ok &&
@@ -4097,15 +4199,17 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                 return pass;
             };
 
-            ViewRestoreGuard restore_a1(mi, a1_view.Get(), carrier.object.Get(),
-                                        confirm_mutate);
+            std::optional<ViewRestoreGuard> restore_a1;
+            restore_a1.emplace(mi, a1_view.Get(), carrier.object.Get(),
+                               confirm_mutate);
             // A2 starts in shared Parking, so its fail-safe target is Parking;
             // A1 starts on Carrier.  Keeping these targets distinct preserves
             // the native initial state even if the round-trip aborts midway.
-            ViewRestoreGuard restore_a2(mi, a2_view.Get(), parking.object.Get(),
-                                        confirm_mutate);
-            restore_a1.Arm();
-            restore_a2.Arm();
+            std::optional<ViewRestoreGuard> restore_a2;
+            restore_a2.emplace(mi, a2_view.Get(), parking.object.Get(),
+                               confirm_mutate);
+            restore_a1->Arm();
+            restore_a2->Arm();
 
             // A1 -> A2: outgoing A1 goes to Parking, incoming A2 comes to Carrier.
             const bool first = switch_logical(a1_id, a2_id);
@@ -4114,6 +4218,51 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             // already attempted rollback and the guards remain armed.
             const bool second = first && switch_logical(a2_id, a1_id);
 
+            // Persist a real A1 -> A2 plan and apply one operation, then drive
+            // a bounded same-process interruption simulation through the same
+            // coordinator and identity-revalidating native callbacks. This
+            // exercises durable journal readback, but is not a restart test.
+            bool recovery_exercised = false;
+            std::string recovery_error;
+            const std::optional<SwitchPlan> interrupted =
+                first && second && lifecycle_started
+                    ? engine.PrepareSwitch(monitor_a_id, a2_id, &recovery_error)
+                    : std::nullopt;
+            bool journal_began =
+                interrupted && journal.Begin(*interrupted, &recovery_error);
+            bool interrupted_move = false;
+            if (journal_began && !interrupted->operations.empty()) {
+                const SwitchOperation& operation = interrupted->operations.front();
+                const WindowRecord* window = engine.FindWindow(operation.identity);
+                interrupted_move =
+                    window != nullptr && move_to_role(*window, operation.to);
+            }
+            CoordinatorResult recovered;
+            if (journal_began) recovered = coordinator.RecoverPending();
+            std::string pending_error;
+            const std::optional<SwitchPlan> pending_after_recovery =
+                journal.ReadPending(&pending_error);
+            recovery_exercised =
+                journal_began && interrupted_move && recovered.succeeded() &&
+                recovered.recovery.recovered && !pending_after_recovery &&
+                pending_error.empty() &&
+                engine.Monitor(monitor_a_id) != nullptr &&
+                engine.Monitor(monitor_a_id)->active == a1_id &&
+                VerifyLogicalModel(engine, all_windows,
+                                   documented_manager.Get(), carrier.id,
+                                   parking.id);
+            Field("durable journal same-process recovery simulation",
+                  recovery_exercised ? "PASS" : "FAIL");
+            if (!recovery_error.empty()) {
+                Field("  recovery setup error", recovery_error);
+            }
+            if (!recovered.error.empty()) {
+                Field("  coordinator recovery error", recovered.error);
+            }
+            if (!pending_error.empty()) {
+                Field("  journal readback error", pending_error);
+            }
+
             const bool model_consistent = VerifyLogicalModel(
                 engine, all_windows, documented_manager.Get(), carrier.id,
                 parking.id);
@@ -4121,13 +4270,14 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             // own A2-active baseline.  That is internally consistent with the
             // engine, but it is not the original A1-active state promised by
             // this round-trip test, so leave the fail-safe guards armed.
-            const bool restored = first && second && model_consistent;
+            const bool restored = first && second && recovery_exercised &&
+                                  model_consistent;
             if (!restored) {
                 Print("  CRITICAL LOGICAL RESTORE FAILURE\n");
                 rc = 1;
             } else {
-                restore_a1.Disarm();
-                restore_a2.Disarm();
+                restore_a1->Disarm();
+                restore_a2->Disarm();
             }
 
             PumpStaMessages();
@@ -4142,6 +4292,36 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             }
             Field("global current desktop changed", "no (required)");
             Field("total events observed", std::format("{}", sink->TotalEventCount()));
+
+            // Destroy armed guards while lifecycle collection is still live;
+            // a failed test's last native restoration attempts must precede
+            // hook shutdown. Disarmed guards are no-ops here.
+            restore_a2.reset();
+            restore_a1.reset();
+            PumpStaMessages();
+            lifecycle_source.Stop();
+            Field("WinEvent lifecycle shutdown",
+                  lifecycle_source.shutdown_ok() ? "PASS" : "FAIL");
+            if (!lifecycle_source.shutdown_ok()) rc = 1;
+            std::string cleanup_journal_error;
+            const std::optional<SwitchPlan> pending_at_cleanup =
+                journal.ReadPending(&cleanup_journal_error);
+            if (!pending_at_cleanup && cleanup_journal_error.empty()) {
+                journal_remove_error.clear();
+                std::filesystem::remove(journal_path, journal_remove_error);
+                if (journal_remove_error) {
+                    Field("journal cleanup error",
+                          journal_remove_error.message());
+                    rc = 1;
+                }
+            } else {
+                Field("pending recovery journal retained",
+                      journal_path.string());
+                if (!cleanup_journal_error.empty()) {
+                    Field("  journal cleanup error", cleanup_journal_error);
+                }
+                rc = 1;
+            }
         }
 
         if (reg.ok()) {
