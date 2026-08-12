@@ -61,7 +61,8 @@ WorkspaceReadOnlyHost::WorkspaceReadOnlyHost(
     std::filesystem::path journal_path,
     WinEventLifecycleSource::InstallHook install_hook,
     WinEventLifecycleSource::RemoveHook remove_hook,
-    std::size_t max_snapshot_attempts)
+    std::size_t max_snapshot_attempts,
+    std::uint64_t rescan_interval_ms)
     : owner_thread_id_(GetCurrentThreadId()),
       engine_(carrier, parking),
       discovery_(std::move(discovery_backend)),
@@ -81,6 +82,7 @@ WorkspaceReadOnlyHost::WorkspaceReadOnlyHost(
               return DiscoverAssigned(records, error);
           },
           carrier, parking, std::move(journal_path), {}, max_snapshot_attempts) {
+    rescan_interval_ms_ = rescan_interval_ms;
     std::sort(monitors.begin(), monitors.end(),
               [](const ReadOnlyMonitorConfiguration& left,
                  const ReadOnlyMonitorConfiguration& right) {
@@ -152,7 +154,21 @@ ReadOnlyHostResult WorkspaceReadOnlyHost::Start() {
         return {ReadOnlyHostResultCode::StartupBlocked, {}, result.error};
     }
     running_ = true;
+    last_reconcile_tick_ = ::GetTickCount64();
+    last_reconcile_epoch_ = source_.event_epoch();
     return {};
+}
+
+ReadOnlyHostResult WorkspaceReadOnlyHost::ReconcileAfterPump() {
+    CoordinatorResult result = startup_.active_coordinator()->ReconcileDiscovery();
+    if (!result.succeeded()) {
+        std::string error = result.error;
+        return {ReadOnlyHostResultCode::ReconcileFailed, std::move(result),
+                std::move(error)};
+    }
+    last_reconcile_tick_ = ::GetTickCount64();
+    last_reconcile_epoch_ = source_.event_epoch();
+    return {ReadOnlyHostResultCode::Succeeded, std::move(result), {}};
 }
 
 ReadOnlyHostResult WorkspaceReadOnlyHost::Reconcile() {
@@ -161,13 +177,39 @@ ReadOnlyHostResult WorkspaceReadOnlyHost::Reconcile() {
         return {ReadOnlyHostResultCode::NotStarted, {},
                 "read-only host is not started"};
     }
-    CoordinatorResult result = startup_.active_coordinator()->ReconcileDiscovery();
-    if (!result.succeeded()) {
-        std::string error = result.error;
-        return {ReadOnlyHostResultCode::ReconcileFailed, std::move(result),
-                std::move(error)};
+    std::string error;
+    if (!source_.PumpOwnerThreadMessages(&error)) {
+        return {ReadOnlyHostResultCode::PumpFailed, {},
+                error.empty() ? "owner-thread message pump failed" : error};
     }
-    return {ReadOnlyHostResultCode::Succeeded, std::move(result), {}};
+    return ReconcileAfterPump();
+}
+
+ReadOnlyHostResult WorkspaceReadOnlyHost::Poll(bool force_rescan) {
+    if (GetCurrentThreadId() != owner_thread_id_) return WrongThreadResult();
+    if (!running_) {
+        return {ReadOnlyHostResultCode::NotStarted, {},
+                "read-only host is not started"};
+    }
+    std::string error;
+    if (!source_.PumpOwnerThreadMessages(&error)) {
+        return {ReadOnlyHostResultCode::PumpFailed, {},
+                error.empty() ? "owner-thread message pump failed" : error};
+    }
+    const std::uint64_t now = ::GetTickCount64();
+    const std::uint64_t epoch = source_.event_epoch();
+    const bool interval_due =
+        rescan_interval_ms_ == 0 ||
+        now - last_reconcile_tick_ >= rescan_interval_ms_;
+    if (!force_rescan && epoch == last_reconcile_epoch_ && !interval_due) {
+        return {};
+    }
+    return ReconcileAfterPump();
+}
+
+void WorkspaceReadOnlyHost::CollectLifecycleHint(WindowLifecycleEvent event) {
+    if (GetCurrentThreadId() != owner_thread_id_) return;
+    source_.Collect(std::move(event));
 }
 
 ReadOnlyHostResult WorkspaceReadOnlyHost::Stop() noexcept {
@@ -194,6 +236,7 @@ const char* ReadOnlyHostResultCodeText(ReadOnlyHostResultCode code) noexcept {
         case ReadOnlyHostResultCode::ConfigurationFailed:
             return "configuration-failed";
         case ReadOnlyHostResultCode::StartupBlocked: return "startup-blocked";
+        case ReadOnlyHostResultCode::PumpFailed: return "pump-failed";
         case ReadOnlyHostResultCode::ReconcileFailed:
             return "reconcile-failed";
         case ReadOnlyHostResultCode::ShutdownFailed: return "shutdown-failed";
@@ -220,8 +263,10 @@ int CmdWorkspaceReadOnlyHostTest() {
          TestObservation(first, 1, NativeDesktopRole::Carrier, carrier,
                          parking)}};
     bool discovery_ok = true;
+    std::size_t discovery_calls = 0;
     WindowDiscoveryBackend backend(
         [&](std::vector<HWND>& out, bool& complete, std::string*) {
+            ++discovery_calls;
             if (!discovery_ok) return false;
             out = handles;
             complete = true;
@@ -249,7 +294,7 @@ int CmdWorkspaceReadOnlyHostTest() {
     RemoveTestJournal(clean_path);
     WorkspaceReadOnlyHost host(
         carrier, parking, {{1, 10, {10, 11}}}, std::move(backend), clean_path,
-        install, remove);
+        install, remove, 3, 60000);
 
     bool ok = true;
     const ReadOnlyHostResult started = host.Start();
@@ -260,26 +305,46 @@ int CmdWorkspaceReadOnlyHostTest() {
     Field("authoritative startup", start_ok ? "PASS" : "FAIL");
     ok = ok && start_ok;
 
+    const std::size_t before_idle_poll = discovery_calls;
+    const ReadOnlyHostResult idle_poll = host.Poll();
+    const bool idle_poll_ok =
+        idle_poll.succeeded() && discovery_calls == before_idle_poll;
+    Field("idle poll avoids unnecessary rescan",
+          idle_poll_ok ? "PASS" : "FAIL");
+    ok = ok && idle_poll_ok;
+
     handles.push_back(second.hwnd);
     observations.emplace(
         second.hwnd,
         TestObservation(second, 1, NativeDesktopRole::Carrier, carrier,
-                        parking));
-    const ReadOnlyHostResult reconciled = host.Reconcile();
+                         parking));
+    const std::size_t before_hint_poll = discovery_calls;
+    host.CollectLifecycleHint(
+        {WindowLifecycleEventKind::Appeared, second.hwnd, second});
+    const ReadOnlyHostResult reconciled = host.Poll();
     const bool reconcile_ok =
         reconciled.succeeded() && host.engine().FindWindow(second) != nullptr &&
-        host.engine().FindWindow(second)->workspace == 10;
-    Field("bounded complete reconciliation",
+        host.engine().FindWindow(second)->workspace == 10 &&
+        discovery_calls > before_hint_poll;
+    Field("event-triggered complete reconciliation",
           reconcile_ok ? "PASS" : "FAIL");
     ok = ok && reconcile_ok;
 
+    const std::size_t before_forced_poll = discovery_calls;
+    const ReadOnlyHostResult forced = host.Poll(true);
+    const bool forced_ok = forced.succeeded() &&
+                           discovery_calls > before_forced_poll;
+    Field("forced complete reconciliation",
+          forced_ok ? "PASS" : "FAIL");
+    ok = ok && forced_ok;
+
     discovery_ok = false;
     const std::size_t before_failure = host.engine().Windows().size();
-    const ReadOnlyHostResult failed = host.Reconcile();
+    const ReadOnlyHostResult failed = host.Poll(true);
     const bool failure_closed =
         failed.code == ReadOnlyHostResultCode::ReconcileFailed &&
         host.engine().Windows().size() == before_failure;
-    Field("discovery failure preserves model",
+    Field("poll discovery failure preserves model",
           failure_closed ? "PASS" : "FAIL");
     ok = ok && failure_closed;
 

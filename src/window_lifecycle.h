@@ -109,6 +109,9 @@ class WinEventLifecycleSource {
     bool running() const noexcept { return running_; }
     bool shutdown_ok() const noexcept { return shutdown_ok_; }
     bool healthy() const noexcept { return running_ && shutdown_ok_; }
+    // Pump the installing thread's queue so OUTOFCONTEXT callbacks can be
+    // delivered. Must be called on the owner thread.
+    bool PumpOwnerThreadMessages(std::string* error = nullptr);
     std::uint64_t event_epoch() const noexcept {
         return event_epoch_.load(std::memory_order_acquire);
     }

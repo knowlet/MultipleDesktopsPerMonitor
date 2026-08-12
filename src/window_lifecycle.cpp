@@ -265,6 +265,28 @@ bool WinEventLifecycleSource::Start(std::string* error) {
     }
 }
 
+bool WinEventLifecycleSource::PumpOwnerThreadMessages(std::string* error) {
+    if (error) error->clear();
+    if (owner_thread_id_ == 0 || owner_thread_id_ != GetCurrentThreadId()) {
+        if (error) {
+            *error = "WinEvent message pump must run on the source owner thread";
+        }
+        return false;
+    }
+
+    MSG message{};
+    while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        if (message.message == WM_QUIT) {
+            // Preserve process shutdown semantics for the owning application.
+            ::PostQuitMessage(static_cast<int>(message.wParam));
+            break;
+        }
+        ::TranslateMessage(&message);
+        ::DispatchMessageW(&message);
+    }
+    return true;
+}
+
 void WinEventLifecycleSource::Stop() noexcept {
     if (hooks_.empty()) {
         running_ = false;
