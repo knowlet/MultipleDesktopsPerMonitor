@@ -3861,9 +3861,12 @@ int CmdCarrierParkingTest(bool confirm_mutate) {
 
 // ---------------------------------------------- workspace-live-discovery-test
 
-int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
-    Heading(bootstrap_engine ? "workspace-live-bootstrap-test"
-                             : "workspace-live-discovery-test");
+int CmdWorkspaceLiveDiscovery(bool bootstrap_engine,
+                              bool bootstrap_coordinator = false) {
+    Heading(bootstrap_coordinator
+                ? "workspace-live-coordinator-bootstrap-test"
+                : bootstrap_engine ? "workspace-live-bootstrap-test"
+                                   : "workspace-live-discovery-test");
     Field("operation", "one complete read-only live window snapshot");
     Field("workspace assignment",
           bootstrap_engine ? "synthetic in-memory validation only" : "none");
@@ -3873,6 +3876,7 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
         Field("result", "ENVIRONMENT-BLOCKED");
         Field("reason", reason);
         Field("mutation_started", "no");
+        Print("mutation_started=no\n");
         Print("RESULT=ENVIRONMENT-BLOCKED\n");
         return kExitInconclusive;
     };
@@ -3880,6 +3884,7 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
         Field("result", "ERROR");
         Field("reason", reason);
         Field("mutation_started", "no");
+        Print("mutation_started=no\n");
         Print("RESULT=ERROR\n");
         return 1;
     };
@@ -4076,35 +4081,140 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
                                             : error);
             }
         }
+        auto convert_snapshot =
+            [&](const std::vector<DiscoveredWindow>& snapshot,
+                std::vector<WindowRecord>& records,
+                std::string* conversion_error) {
+                for (const DiscoveredWindow& window : snapshot) {
+                    const MonitorId monitor =
+                        reinterpret_cast<MonitorId>(window.monitor);
+                    if (monitor == 0) {
+                        if (conversion_error != nullptr) {
+                            *conversion_error =
+                                "live snapshot contains a window without a monitor";
+                        }
+                        return false;
+                    }
+                    auto synthetic = std::find_if(
+                        synthetic_monitors.begin(), synthetic_monitors.end(),
+                        [monitor](const SyntheticMonitor& item) {
+                            return item.monitor == monitor;
+                        });
+                    if (synthetic == synthetic_monitors.end()) {
+                        const WorkspaceId base =
+                            static_cast<WorkspaceId>(synthetic_monitors.size()) *
+                                2 +
+                            1;
+                        if (!engine.AddMonitor(monitor, base, {base, base + 1},
+                                               conversion_error)) {
+                            return false;
+                        }
+                        synthetic_monitors.push_back({monitor, base, base + 1});
+                        synthetic = std::prev(synthetic_monitors.end());
+                    }
+
+                    WindowRecord record;
+                    record.identity = window.identity;
+                    record.monitor = monitor;
+                    record.workspace =
+                        window.native_role == NativeDesktopRole::Parking
+                            ? synthetic->parking_workspace
+                            : synthetic->carrier_workspace;
+                    record.native_role = window.native_role;
+                    record.capabilities = window.capabilities;
+                    record.presentation = window.presentation;
+                    record.disposition = window.disposition;
+                    records.push_back(std::move(record));
+                }
+                return true;
+            };
+
+        // Seed only the synthetic monitor definitions here. The coordinator
+        // mode obtains a fresh authoritative snapshot inside its quiet
+        // lifecycle boundary before any records enter the engine.
         std::vector<WindowRecord> records;
         records.reserve(windows.size());
-        for (const DiscoveredWindow& window : windows) {
-            const MonitorId monitor =
-                reinterpret_cast<MonitorId>(window.monitor);
-            const auto synthetic = std::find_if(
-                synthetic_monitors.begin(), synthetic_monitors.end(),
-                [monitor](const SyntheticMonitor& item) {
-                    return item.monitor == monitor;
-                });
-            WindowRecord record;
-            record.identity = window.identity;
-            record.monitor = monitor;
-            record.workspace =
-                window.native_role == NativeDesktopRole::Parking
-                    ? synthetic->parking_workspace
-                    : synthetic->carrier_workspace;
-            record.native_role = window.native_role;
-            record.capabilities = window.capabilities;
-            record.presentation = window.presentation;
-            record.disposition = window.disposition;
-            records.push_back(std::move(record));
-        }
-        DiscoveryReconcileResult reconcile;
-        if (!engine.ReconcileDiscoverySnapshot(std::move(records), &reconcile,
-                                               &error) ||
-            !engine.CheckInvariant(&error)) {
-            return failed(error.empty() ? "synthetic engine bootstrap failed"
+        if (!convert_snapshot(windows, records, &error)) {
+            return failed(error.empty() ? "synthetic monitor setup failed"
                                         : error);
+        }
+
+        if (bootstrap_coordinator) {
+            WinEventLifecycleSource lifecycle_source;
+            if (!lifecycle_source.Start(&error)) {
+                return environment_blocked(
+                    error.empty() ? "WinEvent lifecycle source unavailable"
+                                  : error);
+            }
+
+            // The initial records were used only to establish synthetic
+            // in-memory monitor/workspace IDs. They are intentionally not
+            // reconciled; the coordinator callback supplies the authoritative
+            // complete snapshot.
+            records.clear();
+            WindowLifecycleAdapter lifecycle(engine, {});
+            WorkspaceCoordinator coordinator(
+                engine, lifecycle, lifecycle_source,
+                [&](std::vector<WindowRecord>& observed,
+                    std::string* discovery_error) {
+                    PumpStaMessages();
+                    std::vector<DiscoveredWindow> latest;
+                    if (!discovery.Discover(latest, discovery_error)) {
+                        return false;
+                    }
+                    PumpStaMessages();
+                    std::vector<WindowRecord> converted;
+                    converted.reserve(latest.size());
+                    if (!convert_snapshot(latest, converted, discovery_error)) {
+                        return false;
+                    }
+                    windows = std::move(latest);
+                    observed = std::move(converted);
+                    return true;
+                },
+                {}, {});
+
+            const CoordinatorResult reconcile =
+                coordinator.ReconcileDiscovery();
+            lifecycle_source.Stop();
+            if (!lifecycle_source.shutdown_ok()) {
+                return failed("WinEvent lifecycle source shutdown failed");
+            }
+            if (!reconcile.succeeded()) {
+                const std::string reason = std::format(
+                    "coordinator {}: {}",
+                    CoordinatorResultCodeText(reconcile.code), reconcile.error);
+                if (capability_access_denied ||
+                    reconcile.code == CoordinatorResultCode::DiscoveryUnstable ||
+                    reconcile.code ==
+                        CoordinatorResultCode::LifecycleUnavailable) {
+                    return environment_blocked(reason);
+                }
+                return failed(reason);
+            }
+            if (!engine.CheckInvariant(&error)) {
+                return failed(error.empty()
+                                  ? "coordinator engine invariant failed"
+                                  : error);
+            }
+            Field("coordinator discovery attempts",
+                  std::format("{}", reconcile.discovery_attempts));
+            Field("lifecycle hints",
+                  std::format("{}", reconcile.lifecycle.events));
+            Field("move callback", "not installed");
+            Print("COORDINATOR_RECONCILE=OK\n");
+            Print("DISCOVERY_ATTEMPTS={}\n", reconcile.discovery_attempts);
+            Print("MOVE_CALLBACK_INSTALLED=0\n");
+            Print("LIFECYCLE_STOPPED=1\n");
+        } else {
+            DiscoveryReconcileResult reconcile;
+            if (!engine.ReconcileDiscoverySnapshot(std::move(records),
+                                                   &reconcile, &error) ||
+                !engine.CheckInvariant(&error)) {
+                return failed(error.empty()
+                                  ? "synthetic engine bootstrap failed"
+                                  : error);
+            }
         }
         Field("synthetic monitors",
               std::format("{}", synthetic_monitors.size()));
@@ -4116,6 +4226,7 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine) {
     }
     Field("result", "OK");
     Field("mutation_started", "no");
+    Print("mutation_started=no\n");
     Print("RESULT=OK\n");
     Print("TOTAL_COUNT={}\n", windows.size());
     Print("MANAGED_COUNT={}\n", managed);
@@ -4130,6 +4241,10 @@ int CmdWorkspaceLiveDiscoveryTest() {
 
 int CmdWorkspaceLiveBootstrapTest() {
     return CmdWorkspaceLiveDiscovery(true);
+}
+
+int CmdWorkspaceLiveCoordinatorBootstrapTest() {
+    return CmdWorkspaceLiveDiscovery(true, true);
 }
 
 // ---------------------------------------------------- logical-workspace-test

@@ -92,6 +92,9 @@ void Usage() {
         "  workspace-live-bootstrap-test\n"
         "                      validate that live read-only snapshot in the\n"
         "                      engine with synthetic in-memory assignment\n"
+        "  workspace-live-coordinator-bootstrap-test\n"
+        "                      reconcile bounded live read-only discovery via\n"
+        "                      lifecycle/coordinator with synthetic assignment\n"
         "  workspace-engine-test\n"
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
@@ -215,6 +218,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveDiscoveryTest();
     } else if (cmd == "workspace-live-bootstrap-test") {
         rc = vd::CmdWorkspaceLiveBootstrapTest();
+    } else if (cmd == "workspace-live-coordinator-bootstrap-test") {
+        rc = vd::CmdWorkspaceLiveCoordinatorBootstrapTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-coordinator-test") {

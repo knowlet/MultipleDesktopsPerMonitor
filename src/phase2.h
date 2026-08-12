@@ -98,6 +98,12 @@ int CmdWorkspaceLiveDiscoveryTest();
 // It installs no move callback and performs no native or persistent mutation.
 int CmdWorkspaceLiveBootstrapTest();
 
+// Productization coordinator bootstrap validation: starts the read-only
+// WinEvent source on the calling thread and reconciles bounded complete live
+// discovery through WorkspaceCoordinator. Logical assignment remains
+// explicitly synthetic and in-memory; no move callback is installed.
+int CmdWorkspaceLiveCoordinatorBootstrapTest();
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();
