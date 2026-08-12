@@ -84,6 +84,13 @@ struct WindowRecord {
     bool present = true;
 };
 
+struct DiscoveryReconcileResult {
+    std::size_t added = 0;
+    std::size_t updated = 0;
+    std::size_t recreated = 0;
+    std::size_t closed = 0;
+};
+
 struct WorkspaceDefinition {
     WorkspaceId id = 0;
     MonitorId monitor = 0;
@@ -109,6 +116,28 @@ struct SwitchPlan {
     WorkspaceId from_workspace = 0;
     WorkspaceId to_workspace = 0;
     std::vector<SwitchOperation> operations;
+};
+
+enum class PresentationOperationKind {
+    RestorePlacement,
+    RestoreZOrder,
+    RestoreForeground,
+};
+
+struct PresentationOperation {
+    PresentationOperationKind kind =
+        PresentationOperationKind::RestorePlacement;
+    WindowIdentity identity;
+    WindowPresentation presentation{};
+};
+
+struct PresentationPlan {
+    MonitorId monitor = 0;
+    WorkspaceId workspace = 0;
+    // Placements are emitted first, followed by relative Z-order from bottom
+    // to top, with foreground activation last.  A native adapter must preserve
+    // this order and revalidate WindowIdentity immediately before each call.
+    std::vector<PresentationOperation> operations;
 };
 
 struct TransactionResult {
@@ -168,11 +197,22 @@ class WorkspaceEngine {
     bool SetLastForeground(MonitorId monitor, WorkspaceId workspace,
                            const WindowIdentity& identity,
                            std::string* error = nullptr);
+    bool SetZOrder(MonitorId monitor, WorkspaceId workspace,
+                   std::vector<WindowIdentity> top_to_bottom,
+                   std::string* error = nullptr);
 
     UpsertResult UpsertWindow(WindowRecord record,
                               std::string* error = nullptr);
     bool CloseWindow(const WindowIdentity& identity,
                      std::string* error = nullptr);
+    // Applies one complete, point-in-time discovery snapshot after validating
+    // the full input and then using deterministic model updates. Callers must
+    // not pass a filtered or partial enumeration: tracked windows omitted from
+    // the snapshot are recorded as closed.
+    bool ReconcileDiscoverySnapshot(
+        std::vector<WindowRecord> observed,
+        DiscoveryReconcileResult* result = nullptr,
+        std::string* error = nullptr);
 
     const WindowRecord* FindWindow(const WindowIdentity& identity) const;
     const WindowRecord* FindWindowByHwnd(HWND hwnd) const;
@@ -186,6 +226,9 @@ class WorkspaceEngine {
     std::optional<SwitchPlan> PrepareSwitch(MonitorId monitor,
                                              WorkspaceId target_workspace,
                                              std::string* error = nullptr) const;
+    std::optional<PresentationPlan> PreparePresentationRestore(
+        MonitorId monitor, WorkspaceId workspace,
+        std::string* error = nullptr) const;
 
     TransactionResult ExecuteSwitch(const SwitchPlan& plan,
                                     const MoveCallback& move,

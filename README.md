@@ -178,10 +178,13 @@ The probe never maintains an executable whitelist. Chrome, Electron, other
 packaged applications, and unusual owner/popup behavior remain beta validation
 inputs rather than separate prebuilt compatibility claims.
 
-Productization work still excludes automatic lifecycle tracking, focus/Z-order
-recovery, persistence, GUI, hotkeys, tray icon, installer, Rust port, stress,
-latency benchmarking, and any form of faked or emulated native desktop
-lifecycle until those milestones are explicitly implemented.
+Productization work still excludes automatic lifecycle tracking, native
+placement/Z-order/focus execution, persistence, GUI, hotkeys, tray icon,
+installer, Rust port, stress, latency benchmarking, and any form of faked or
+emulated native desktop lifecycle until those milestones are explicitly
+implemented. The model now includes complete discovery-snapshot reconciliation
+and fail-closed presentation planning, but those APIs do not themselves
+discover windows or mutate native presentation state.
 
 The first productization core is in
 [`src/workspace_engine.{h,cpp}`](src/workspace_engine.h). It models
@@ -192,9 +195,11 @@ journal recovery. Run `workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
 `GetViewForHwnd` resolution before each move, and verifies the callback-backed
-transaction against live desktop state. Automatic WinEvent lifecycle tracking,
-focus/Z-order restoration, durable journal policy, and UI integration remain
-separate milestones.
+transaction against live desktop state. The engine also provides deterministic
+generation-safe discovery reconciliation and presentation restore planning;
+automatic WinEvent lifecycle tracking, native placement/Z-order/focus
+execution, durable journal policy, and UI integration remain separate
+milestones.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

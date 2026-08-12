@@ -334,9 +334,9 @@ bool WorkspaceEngine::AddMonitor(MonitorId monitor, WorkspaceId active,
 }
 
 bool WorkspaceEngine::SetLastForeground(MonitorId monitor,
-                                        WorkspaceId workspace,
-                                        const WindowIdentity& identity,
-                                        std::string* error) {
+                                         WorkspaceId workspace,
+                                         const WindowIdentity& identity,
+                                         std::string* error) {
     const MonitorWorkspaceState* state = Monitor(monitor);
     if (state == nullptr ||
         std::find(state->workspaces.begin(), state->workspaces.end(),
@@ -346,12 +346,64 @@ bool WorkspaceEngine::SetLastForeground(MonitorId monitor,
     }
     const WindowRecord* window = FindWindow(identity);
     if (window == nullptr || window->monitor != monitor ||
-        window->workspace != workspace || !window->present) {
+        window->workspace != workspace || !window->present ||
+        window->disposition != WindowDisposition::Managed ||
+        !window->capabilities.Manageable()) {
         if (error) *error = "foreground window is not assigned to workspace";
         return false;
     }
     WorkspaceDefinition* definition = MutableWorkspace(workspace);
+    if (definition->last_foreground &&
+        *definition->last_foreground != identity) {
+        auto previous = windows_.find(*definition->last_foreground);
+        if (previous != windows_.end()) {
+            previous->second.presentation.foreground = false;
+        }
+    }
     definition->last_foreground = identity;
+    for (const WindowIdentity& member : definition->windows) {
+        auto it = windows_.find(member);
+        if (it != windows_.end()) {
+            it->second.presentation.foreground = (member == identity);
+        }
+    }
+    return true;
+}
+
+bool WorkspaceEngine::SetZOrder(MonitorId monitor, WorkspaceId workspace,
+                                std::vector<WindowIdentity> top_to_bottom,
+                                std::string* error) {
+    const MonitorWorkspaceState* state = Monitor(monitor);
+    WorkspaceDefinition* definition = MutableWorkspace(workspace);
+    if (state == nullptr || definition == nullptr ||
+        definition->monitor != monitor) {
+        if (error) *error = "workspace does not belong to monitor";
+        return false;
+    }
+    if (top_to_bottom.size() != definition->windows.size()) {
+        if (error) *error = "Z-order snapshot must contain every workspace window";
+        return false;
+    }
+    std::unordered_set<WindowIdentity, WindowIdentityHash> seen;
+    for (const WindowIdentity& identity : top_to_bottom) {
+        const WindowRecord* window = FindWindow(identity);
+        if (window == nullptr || window->monitor != monitor ||
+            window->workspace != workspace || !window->present ||
+            window->disposition != WindowDisposition::Managed ||
+            !window->capabilities.Manageable() ||
+            !window->capabilities.owner_state_observable ||
+            !seen.insert(identity).second) {
+            if (error) *error = "Z-order snapshot contains an invalid window";
+            return false;
+        }
+    }
+    definition->z_order = std::move(top_to_bottom);
+    for (std::size_t i = 0; i < definition->z_order.size(); ++i) {
+        auto it = windows_.find(definition->z_order[i]);
+        if (it != windows_.end()) {
+            it->second.presentation.z_order = static_cast<std::int64_t>(i);
+        }
+    }
     return true;
 }
 
@@ -401,7 +453,8 @@ UpsertResult WorkspaceEngine::UpsertWindow(WindowRecord record,
     if (!ValidateRecord(record, error)) return UpsertResult::Rejected;
     record.present = true;
     if (record.disposition == WindowDisposition::Managed &&
-        !record.capabilities.Manageable()) {
+        (!record.capabilities.Manageable() ||
+         record.native_role == NativeDesktopRole::Unknown)) {
         record.disposition = WindowDisposition::Unsupported;
     }
 
@@ -453,6 +506,69 @@ bool WorkspaceEngine::CloseWindow(const WindowIdentity& identity,
     RemoveIdentityFromWorkspace(it->second.identity, it->second.workspace);
     hwnd_index_.erase(reinterpret_cast<std::uintptr_t>(identity.hwnd));
     windows_.erase(it);
+    return true;
+}
+
+bool WorkspaceEngine::ReconcileDiscoverySnapshot(
+    std::vector<WindowRecord> observed, DiscoveryReconcileResult* result,
+    std::string* error) {
+    if (result) *result = {};
+    DiscoveryReconcileResult next_result;
+    std::unordered_set<WindowIdentity, WindowIdentityHash> identities;
+    std::unordered_set<std::uintptr_t> hwnds;
+    for (const WindowRecord& record : observed) {
+        const std::uintptr_t hwnd =
+            reinterpret_cast<std::uintptr_t>(record.identity.hwnd);
+        if (!ValidateRecord(record, error) ||
+            record.disposition == WindowDisposition::Closed ||
+            !identities.insert(record.identity).second ||
+            !hwnds.insert(hwnd).second) {
+            if (error && error->empty()) {
+                *error = "discovery snapshot contains an invalid or duplicate window";
+            }
+            return false;
+        }
+    }
+
+    // Prevalidation above makes all following model mutations deterministic
+    // and non-failing under the engine's current record rules. Sorting also
+    // makes lifecycle results independent of enumeration order.
+    std::sort(observed.begin(), observed.end(),
+              [](const WindowRecord& a, const WindowRecord& b) {
+                  return reinterpret_cast<std::uintptr_t>(a.identity.hwnd) <
+                         reinterpret_cast<std::uintptr_t>(b.identity.hwnd);
+              });
+    for (WindowRecord& record : observed) {
+        const UpsertResult upsert = UpsertWindow(std::move(record), error);
+        switch (upsert) {
+            case UpsertResult::Added:
+                ++next_result.added;
+                break;
+            case UpsertResult::Updated:
+                ++next_result.updated;
+                break;
+            case UpsertResult::Recreated:
+                ++next_result.recreated;
+                break;
+            case UpsertResult::Rejected:
+                if (error && error->empty()) {
+                    *error = "validated discovery window was rejected";
+                }
+                return false;
+        }
+    }
+
+    const std::vector<const WindowRecord*> current = Windows();
+    for (const WindowRecord* window : current) {
+        if (!identities.contains(window->identity) &&
+            !hwnds.contains(reinterpret_cast<std::uintptr_t>(
+                window->identity.hwnd))) {
+            const WindowIdentity identity = window->identity;
+            if (!CloseWindow(identity, error)) return false;
+            ++next_result.closed;
+        }
+    }
+    if (result) *result = next_result;
     return true;
 }
 
@@ -607,6 +723,68 @@ std::optional<SwitchPlan> WorkspaceEngine::PrepareSwitch(
             return reinterpret_cast<std::uintptr_t>(a.identity.hwnd) <
                    reinterpret_cast<std::uintptr_t>(b.identity.hwnd);
         });
+    return plan;
+}
+
+std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
+    MonitorId monitor, WorkspaceId workspace, std::string* error) const {
+    const MonitorWorkspaceState* state = Monitor(monitor);
+    const WorkspaceDefinition* definition = Workspace(workspace);
+    if (state == nullptr || definition == nullptr ||
+        definition->monitor != monitor || state->active != workspace) {
+        if (error) *error = "presentation restore requires the active workspace";
+        return std::nullopt;
+    }
+    if (definition->z_order.size() != definition->windows.size()) {
+        if (error) *error = "workspace has no complete Z-order snapshot";
+        return std::nullopt;
+    }
+
+    std::unordered_set<WindowIdentity, WindowIdentityHash> seen;
+    for (const WindowIdentity& identity : definition->z_order) {
+        const WindowRecord* window = FindWindow(identity);
+        if (window == nullptr || window->monitor != monitor ||
+            window->workspace != workspace || !window->present ||
+            window->disposition != WindowDisposition::Managed ||
+            !window->capabilities.Manageable() ||
+            !window->capabilities.owner_state_observable ||
+            !seen.insert(identity).second) {
+            if (error) *error = "presentation snapshot is stale or unsafe";
+            return std::nullopt;
+        }
+        if (!window->presentation.placement_valid) {
+            if (error) *error = "presentation snapshot lacks placement data";
+            return std::nullopt;
+        }
+    }
+    if (definition->last_foreground &&
+        !seen.contains(*definition->last_foreground)) {
+        if (error) *error = "foreground snapshot is stale or unsafe";
+        return std::nullopt;
+    }
+
+    PresentationPlan plan{monitor, workspace, {}};
+    for (const WindowIdentity& identity : definition->z_order) {
+        const WindowRecord* window = FindWindow(identity);
+        if (window->presentation.placement_valid) {
+            plan.operations.push_back({
+                PresentationOperationKind::RestorePlacement, identity,
+                window->presentation});
+        }
+    }
+    for (auto it = definition->z_order.rbegin();
+         it != definition->z_order.rend(); ++it) {
+        const WindowRecord* window = FindWindow(*it);
+        plan.operations.push_back({PresentationOperationKind::RestoreZOrder,
+                                   *it, window->presentation});
+    }
+    if (definition->last_foreground) {
+        const WindowRecord* foreground =
+            FindWindow(*definition->last_foreground);
+        plan.operations.push_back({
+            PresentationOperationKind::RestoreForeground,
+            *definition->last_foreground, foreground->presentation});
+    }
     return plan;
 }
 
@@ -891,7 +1069,7 @@ bool WorkspaceEngine::Reconcile(const MoveCallback& move,
     if (!ApplyOperations(operations, move, observe, applied, error)) {
         std::string rollback_error;
         const bool rolled_back =
-            RestoreOperations(operations, move, observe, &rollback_error);
+            RestoreOperations(applied, move, observe, &rollback_error);
         if (!rolled_back && error) {
             *error += "; " + rollback_error + "; recovery required";
         }
@@ -907,7 +1085,7 @@ bool WorkspaceEngine::Reconcile(const MoveCallback& move,
     if (journal && !journal->Commit(&journal_error)) {
         std::string rollback_error;
         const bool rolled_back =
-            RestoreOperations(operations, move, observe, &rollback_error);
+            RestoreOperations(applied, move, observe, &rollback_error);
         if (!rolled_back && error) {
             *error = "journal reconcile commit failed: " + journal_error +
                      "; " + rollback_error;
@@ -1081,6 +1259,255 @@ int CmdWorkspaceEngineTest() {
         &error);
     ok = ok && reopened == UpsertResult::Added;
     Field("close and recreate lifecycle", ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine discovery_engine(carrier, parking);
+    bool discovery_ok =
+        discovery_engine.AddMonitor(10, 11, {11, 12}, &error);
+    const WindowIdentity d1_id = identity(0x3001, 301, 3);
+    const WindowIdentity d2_id = identity(0x3002, 302, 3);
+    const WindowIdentity d3_id = identity(0x3003, 303, 3);
+    const WindowIdentity d2_reused_id = identity(0x3002, 402, 4);
+    DiscoveryReconcileResult discovery_initial;
+    if (discovery_ok) {
+        discovery_ok = discovery_engine.ReconcileDiscoverySnapshot(
+            {{d3_id, 10, 12, NativeDesktopRole::Parking, manageable, {}, {},
+              true},
+             {d1_id, 10, 11, NativeDesktopRole::Carrier, manageable, {}, {},
+              true},
+             {d2_id, 10, 12, NativeDesktopRole::Parking, manageable, {}, {},
+              true}},
+            &discovery_initial, &error);
+    }
+    DiscoveryReconcileResult discovery_next;
+    if (discovery_ok) {
+        discovery_ok = discovery_engine.ReconcileDiscoverySnapshot(
+            {{d2_reused_id, 10, 12, NativeDesktopRole::Parking, manageable,
+              {}, {}, true},
+             {d1_id, 10, 11, NativeDesktopRole::Carrier, manageable, {}, {},
+              true}},
+            &discovery_next, &error);
+    }
+    discovery_ok = discovery_ok && discovery_initial.added == 3 &&
+                   discovery_next.updated == 1 &&
+                   discovery_next.recreated == 1 &&
+                   discovery_next.closed == 1 &&
+                   discovery_engine.FindWindow(d2_id) == nullptr &&
+                   discovery_engine.FindWindow(d2_reused_id) != nullptr &&
+                   discovery_engine.FindWindow(d3_id) == nullptr &&
+                   discovery_engine.CheckInvariant(&error);
+    ok = ok && discovery_ok;
+    Field("complete discovery snapshot reconciles generations and closes",
+          discovery_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine rejected_discovery_engine(carrier, parking);
+    bool rejected_discovery_ok =
+        rejected_discovery_engine.AddMonitor(60, 61, {61}, &error);
+    const WindowIdentity rejected_id = identity(0x7001, 801, 8);
+    DiscoveryReconcileResult rejected_result{99, 99, 99, 99};
+    if (rejected_discovery_ok) {
+        rejected_discovery_ok =
+            rejected_discovery_engine.ReconcileDiscoverySnapshot(
+                {{rejected_id, 60, 61, NativeDesktopRole::Carrier, manageable,
+                  {}, {}, true}},
+                &rejected_result, &error);
+    }
+    const DiscoveryReconcileResult before_rejected = rejected_result;
+    if (rejected_discovery_ok) {
+        rejected_discovery_ok =
+            !rejected_discovery_engine.ReconcileDiscoverySnapshot(
+                {{rejected_id, 60, 61, NativeDesktopRole::Carrier, manageable,
+                  {}, {}, true},
+                 {rejected_id, 60, 61, NativeDesktopRole::Carrier, manageable,
+                  {}, {}, true}},
+                &rejected_result, &error);
+    }
+    rejected_discovery_ok =
+        rejected_discovery_ok && before_rejected.added == 1 &&
+        rejected_result.added == 0 && rejected_result.updated == 0 &&
+        rejected_result.recreated == 0 && rejected_result.closed == 0 &&
+        rejected_discovery_engine.FindWindow(rejected_id) != nullptr &&
+        rejected_discovery_engine.CheckInvariant(&error);
+    ok = ok && rejected_discovery_ok;
+    Field("invalid discovery snapshot fails closed",
+          rejected_discovery_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine presentation_engine(carrier, parking);
+    bool presentation_ok =
+        presentation_engine.AddMonitor(20, 21, {21, 22}, &error);
+    const WindowIdentity p1_id = identity(0x4001, 501, 5);
+    const WindowIdentity p2_id = identity(0x4002, 502, 5);
+    WindowPresentation p1_presentation{};
+    p1_presentation.placement.length = sizeof(WINDOWPLACEMENT);
+    p1_presentation.placement_valid = true;
+    WindowPresentation p2_presentation{};
+    p2_presentation.placement.length = sizeof(WINDOWPLACEMENT);
+    p2_presentation.placement_valid = true;
+    if (presentation_ok) {
+        presentation_ok =
+            presentation_engine.UpsertWindow(
+                {p1_id, 20, 21, NativeDesktopRole::Carrier, manageable,
+                 p1_presentation, {}, true},
+                &error) == UpsertResult::Added &&
+            presentation_engine.UpsertWindow(
+                {p2_id, 20, 21, NativeDesktopRole::Carrier, manageable,
+                 p2_presentation, {}, true},
+                &error) == UpsertResult::Added;
+    }
+    std::string rejected_order_error;
+    const bool incomplete_order_rejected =
+        presentation_ok &&
+        !presentation_engine.SetZOrder(20, 21, {p1_id},
+                                       &rejected_order_error);
+    if (presentation_ok) {
+        presentation_ok = incomplete_order_rejected &&
+                          presentation_engine.SetZOrder(
+                              20, 21, {p1_id, p2_id}, &error) &&
+                          presentation_engine.SetLastForeground(
+                              20, 21, p1_id, &error);
+    }
+    bool foreground_state_ok = false;
+    if (presentation_ok) {
+        const WindowRecord* p1 = presentation_engine.FindWindow(p1_id);
+        const WindowRecord* p2 = presentation_engine.FindWindow(p2_id);
+        foreground_state_ok = p1 != nullptr && p2 != nullptr &&
+                              p1->presentation.foreground &&
+                              !p2->presentation.foreground &&
+                              presentation_engine.SetLastForeground(
+                                  20, 21, p2_id, &error);
+        p1 = presentation_engine.FindWindow(p1_id);
+        p2 = presentation_engine.FindWindow(p2_id);
+        foreground_state_ok = foreground_state_ok && p1 != nullptr &&
+                              p2 != nullptr && !p1->presentation.foreground &&
+                              p2->presentation.foreground &&
+                              presentation_engine.SetLastForeground(
+                                  20, 21, p1_id, &error);
+    }
+    const std::optional<PresentationPlan> presentation_plan =
+        presentation_ok && foreground_state_ok
+            ? presentation_engine.PreparePresentationRestore(20, 21, &error)
+            : std::nullopt;
+    presentation_ok =
+        presentation_ok && foreground_state_ok && presentation_plan.has_value() &&
+        presentation_plan->operations.size() == 5 &&
+        presentation_plan->operations[0].kind ==
+            PresentationOperationKind::RestorePlacement &&
+        presentation_plan->operations[0].identity == p1_id &&
+        presentation_plan->operations[1].kind ==
+            PresentationOperationKind::RestorePlacement &&
+        presentation_plan->operations[1].identity == p2_id &&
+        presentation_plan->operations[2].kind ==
+            PresentationOperationKind::RestoreZOrder &&
+        presentation_plan->operations[2].identity == p2_id &&
+        presentation_plan->operations[3].kind ==
+            PresentationOperationKind::RestoreZOrder &&
+        presentation_plan->operations[3].identity == p1_id &&
+        presentation_plan->operations[4].kind ==
+            PresentationOperationKind::RestoreForeground &&
+        presentation_plan->operations[4].identity == p1_id;
+    ok = ok && presentation_ok;
+    Field("presentation plan is complete, ordered, and fail-closed",
+          presentation_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine incomplete_presentation_engine(carrier, parking);
+    bool incomplete_presentation_ok =
+        incomplete_presentation_engine.AddMonitor(40, 41, {41}, &error);
+    WindowPresentation incomplete_presentation{};
+    if (incomplete_presentation_ok) {
+        incomplete_presentation_ok =
+            incomplete_presentation_engine.UpsertWindow(
+                {p1_id, 40, 41, NativeDesktopRole::Carrier, manageable,
+                 incomplete_presentation, {}, true},
+                &error) == UpsertResult::Added &&
+            incomplete_presentation_engine.SetZOrder(
+                40, 41, {p1_id}, &error) &&
+            incomplete_presentation_engine.SetLastForeground(
+                40, 41, p1_id, &error);
+    }
+    std::string incomplete_presentation_error;
+    const bool incomplete_presentation_rejected =
+        incomplete_presentation_ok &&
+        !incomplete_presentation_engine.PreparePresentationRestore(
+            40, 41, &incomplete_presentation_error);
+    incomplete_presentation_ok =
+        incomplete_presentation_rejected &&
+        incomplete_presentation_error == "presentation snapshot lacks placement data";
+    ok = ok && incomplete_presentation_ok;
+    Field("incomplete presentation snapshot fails closed",
+          incomplete_presentation_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine unknown_role_engine(carrier, parking);
+    bool unknown_role_ok =
+        unknown_role_engine.AddMonitor(50, 51, {51}, &error);
+    if (unknown_role_ok) {
+        const WindowIdentity unknown_id = identity(0x6001, 701, 7);
+        unknown_role_ok =
+            unknown_role_engine.UpsertWindow(
+                {unknown_id, 50, 51, NativeDesktopRole::Unknown, manageable,
+                 {}, {}, true},
+                &error) == UpsertResult::Added;
+        const WindowRecord* unknown =
+            unknown_role_engine.FindWindow(unknown_id);
+        unknown_role_ok = unknown_role_ok && unknown != nullptr &&
+                          unknown->disposition == WindowDisposition::Unsupported;
+    }
+    ok = ok && unknown_role_ok;
+    Field("unknown native role is unsupported", unknown_role_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine reconcile_engine(carrier, parking);
+    bool bounded_rollback_ok =
+        reconcile_engine.AddMonitor(30, 31, {31, 32}, &error);
+    const WindowIdentity r1_id = identity(0x5001, 601, 6);
+    const WindowIdentity r2_id = identity(0x5002, 602, 6);
+    const WindowIdentity r3_id = identity(0x5003, 603, 6);
+    if (bounded_rollback_ok) {
+        bounded_rollback_ok =
+            reconcile_engine.UpsertWindow(
+                {r1_id, 30, 31, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added &&
+            reconcile_engine.UpsertWindow(
+                {r2_id, 30, 31, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added &&
+            reconcile_engine.UpsertWindow(
+                {r3_id, 30, 31, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added;
+    }
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        reconcile_roles{{r1_id, NativeDesktopRole::Parking},
+                        {r2_id, NativeDesktopRole::Parking},
+                        {r3_id, NativeDesktopRole::Parking}};
+    std::vector<WindowIdentity> reconcile_move_calls;
+    auto reconcile_move = [&](const WindowRecord& window,
+                              NativeDesktopRole target) {
+        reconcile_move_calls.push_back(window.identity);
+        if (window.identity == r2_id &&
+            target == NativeDesktopRole::Carrier) {
+            return false;
+        }
+        reconcile_roles[window.identity] = target;
+        return true;
+    };
+    auto reconcile_observe = [&](const WindowRecord& window) {
+        return reconcile_roles[window.identity];
+    };
+    std::string reconcile_error;
+    if (bounded_rollback_ok) {
+        bounded_rollback_ok = !reconcile_engine.Reconcile(
+            reconcile_move, reconcile_observe, nullptr, &reconcile_error);
+    }
+    bounded_rollback_ok =
+        bounded_rollback_ok && reconcile_move_calls.size() == 3 &&
+        reconcile_move_calls[0] == r1_id &&
+        reconcile_move_calls[1] == r2_id &&
+        reconcile_move_calls[2] == r1_id &&
+        reconcile_roles[r1_id] == NativeDesktopRole::Parking &&
+        reconcile_roles[r2_id] == NativeDesktopRole::Parking &&
+        reconcile_roles[r3_id] == NativeDesktopRole::Parking;
+    ok = ok && bounded_rollback_ok;
+    Field("reconcile rollback touches only attempted operations",
+          bounded_rollback_ok ? "PASS" : "FAIL");
 
     const WindowIdentity unsupported_id = identity(0x2002, 202, 2);
     const WindowCapabilities unsupported{true, false, false, true, false};

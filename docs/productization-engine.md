@@ -87,11 +87,21 @@ currently verifies:
 - one monitor-local switch and round-trip restoration;
 - HWND reuse as a new generation;
 - close and recreate lifecycle;
+- complete discovery-snapshot reconciliation with HWND-generation checks;
+- deterministic Z-order capture and fail-closed presentation restore planning;
 - unsupported capability fail-closed behavior;
 - interrupted transaction recovery.
 - durable journal `BEGIN` replacement and terminal-marker flushing.
 
 All checks passed on August 12, 2026 after the engine was added.
+
+The discovery and presentation APIs are model-level boundaries, not a claim
+that the product already tracks every desktop window or changes native
+presentation state. `ReconcileDiscoverySnapshot()` requires a complete,
+point-in-time observation and treats omitted tracked windows as closed;
+generation changes are recorded as recreation. `PreparePresentationRestore()`
+emits placement, Z-order, and foreground operations only when the snapshot is
+complete, managed, capability-safe, and identity-consistent.
 
 ## Deliberate next boundaries
 
@@ -103,7 +113,7 @@ transaction with notification events and documented desktop state. It is not
 yet the user-facing workspace manager. Remaining work is:
 
 - `SetWinEventHook` lifecycle tracking;
-- focus and Z-order restoration;
+- native placement, Z-order, and focus execution;
 - durable crash-journal placement and startup recovery policy;
 - minimal hotkey/UI integration.
 
