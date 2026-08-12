@@ -17,6 +17,7 @@
 #include "phase1.h"
 #include "phase2.h"
 #include "util.h"
+#include "window_discovery.h"
 #include "workspace_coordinator.h"
 
 namespace {
@@ -82,6 +83,9 @@ void Usage() {
         "                      restore it; requires --confirm-mutate\n"
         "\n"
         "productization (non-mutating state engine)\n"
+        "  workspace-discovery-test\n"
+        "                      deterministic injected-backend discovery and\n"
+        "                      capability-classification checks\n"
         "  workspace-engine-test\n"
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
@@ -199,6 +203,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdChromiumSemanticsTest(browser, confirm_mutate);
     } else if (cmd == "terminal-semantics-test") {
         rc = vd::CmdTerminalSemanticsTest(confirm_mutate);
+    } else if (cmd == "workspace-discovery-test") {
+        rc = vd::CmdWorkspaceDiscoveryTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-coordinator-test") {
