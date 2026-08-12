@@ -126,13 +126,16 @@ The parked target reported `IsWindowVisible = true` while DWM reported
 assignment and cloaking state rather than `IsWindowVisible` alone.
 
 The temporary profile remained on disk after both the original one-shot cleanup
-and the bounded five-second retry. The probe now also launches the isolated
-instance with `--disable-background-mode`, so the final browser process should
-not remain alive solely for background apps after probe-owned roots close. This
-flag and the retry are limited to the unique probe profile; the probe never
-terminates Edge or touches an existing profile. Phase 4B-2A should be rerun
-once after this fix; until that rerun, the overall command remains
-`INCONCLUSIVE-CLEANUP`, not a clean PASS.
+and the bounded process-drain/profile-removal retry. The probe now also launches
+the isolated instance with `--disable-background-mode`, so the final browser
+process should not remain alive solely for background apps after probe-owned
+roots close. Cleanup output distinguishes an attributed probe process that is
+still present from an inconclusive process scan; in either case the profile is
+retained and no process is terminated. This flag and the retry are limited to
+the unique probe profile; the probe never terminates Edge or touches an
+existing profile. Phase 4B-2A should be rerun once after this hardening; until
+that rerun, the overall command remains `INCONCLUSIVE-CLEANUP`, not a clean
+PASS.
 
 This milestone does not claim Chrome equivalence, browser lifecycle support,
 focus/Z-order recovery, existing-profile safety beyond the stated attribution
