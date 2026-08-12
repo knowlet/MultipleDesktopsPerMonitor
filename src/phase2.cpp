@@ -17,6 +17,7 @@
 #include "util.h"
 #include "workspace_coordinator.h"
 #include "workspace_engine.h"
+#include "window_discovery.h"
 
 namespace vd {
 namespace {
@@ -354,6 +355,7 @@ struct ManagerInternal {
     HRESULT hr = E_FAIL;
     unsigned vtable_run = 0;
     std::string vtable_module;
+    bool access_denied_seen = false;
 };
 
 ManagerInternal AcquireManagerInternal(IServiceProvider* sp) {
@@ -362,6 +364,7 @@ ManagerInternal AcquireManagerInternal(IServiceProvider* sp) {
         RawObject o;
         HRESULT hr = sp->QueryService(SID_VirtualDesktopManagerInternal, *c.iid,
                                      o.PutVoid());
+        if (hr == E_ACCESSDENIED) mi.access_denied_seen = true;
         if (FAILED(hr) || !o) {
             if (mi.candidate == nullptr) mi.hr = hr;
             continue;
@@ -383,13 +386,16 @@ struct DesktopSnapshot {
     bool id_ok = false;
 };
 
-bool ReadCurrentDesktop(ManagerInternal& mi, DesktopSnapshot& out) {
+bool ReadCurrentDesktop(ManagerInternal& mi, DesktopSnapshot& out,
+                        HRESULT* call_hr = nullptr) {
+    if (call_hr != nullptr) *call_hr = E_ABORT;
     if (mi.layout == nullptr) return false;
     const MethodEntry* m = FindMethod(*mi.layout, "GetCurrentDesktop");
     if (m == nullptr) return false;
     Gate g = Gate::Ok;
     IUnknown* raw = nullptr;
     HRESULT hr = InvokeSlot(mi.obj.Get(), *mi.layout, *m, g, false, &raw);
+    if (call_hr != nullptr) *call_hr = hr;
     if (g != Gate::Ok || FAILED(hr) || raw == nullptr) return false;
     RawObject identity;
     identity.Attach(raw);
@@ -399,14 +405,17 @@ bool ReadCurrentDesktop(ManagerInternal& mi, DesktopSnapshot& out) {
     return out.id_ok && static_cast<bool>(out.object);
 }
 
-bool ReadDesktopList(ManagerInternal& mi, std::vector<DesktopSnapshot>& out) {
+bool ReadDesktopList(ManagerInternal& mi, std::vector<DesktopSnapshot>& out,
+                     HRESULT* call_hr = nullptr) {
     out.clear();
+    if (call_hr != nullptr) *call_hr = E_ABORT;
     if (mi.layout == nullptr) return false;
     const MethodEntry* m = FindMethod(*mi.layout, "GetDesktops");
     if (m == nullptr) return false;
     Gate g = Gate::Ok;
     IObjectArray* arr_raw = nullptr;
     HRESULT hr = InvokeSlot(mi.obj.Get(), *mi.layout, *m, g, false, &arr_raw);
+    if (call_hr != nullptr) *call_hr = hr;
     if (g != Gate::Ok || FAILED(hr) || arr_raw == nullptr) return false;
     Com<IObjectArray> arr;
     *arr.Put() = arr_raw;
@@ -621,6 +630,7 @@ struct ApplicationViewCollectionBinding {
     RawObject object;
     const LayoutTable* layout = nullptr;
     HRESULT hr = E_FAIL;
+    bool access_denied_seen = false;
 };
 
 ApplicationViewCollectionBinding AcquireApplicationViewCollection(IServiceProvider* sp) {
@@ -638,6 +648,7 @@ ApplicationViewCollectionBinding AcquireApplicationViewCollection(IServiceProvid
         }
         HRESULT hr =
             sp->QueryService(*service_id, *c.iid, object.PutVoid());
+        if (hr == E_ACCESSDENIED) out.access_denied_seen = true;
         out.hr = hr;
         if (FAILED(hr) || !object) continue;
         const LayoutTable* layout = LayoutForIid(*c.iid);
@@ -3846,6 +3857,192 @@ int CmdCarrierParkingTest(bool confirm_mutate) {
         Print("  sink retained because Unregister failed; avoiding possible late-callback UAF.\n");
     }
     return rc;
+}
+
+// ---------------------------------------------- workspace-live-discovery-test
+
+int CmdWorkspaceLiveDiscoveryTest() {
+    Heading("workspace-live-discovery-test");
+    Field("operation", "one complete read-only live window snapshot");
+    Field("workspace assignment", "none");
+    Field("native mutation", "none");
+
+    auto environment_blocked = [](std::string_view reason) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", reason);
+        Field("mutation_started", "no");
+        Print("RESULT=ENVIRONMENT-BLOCKED\n");
+        return kExitInconclusive;
+    };
+    auto failed = [](std::string_view reason) {
+        Field("result", "ERROR");
+        Field("reason", reason);
+        Field("mutation_started", "no");
+        Print("RESULT=ERROR\n");
+        return 1;
+    };
+
+    Com<IServiceProvider> sp;
+    const HRESULT shell_hr = GetImmersiveShell(sp);
+    if (shell_hr == E_ACCESSDENIED) {
+        return environment_blocked("ImmersiveShell E_ACCESSDENIED");
+    }
+    if (FAILED(shell_hr) || !sp) {
+        return failed(std::format("ImmersiveShell unavailable ({})",
+                                  HrToString(shell_hr)));
+    }
+
+    ManagerInternal manager = AcquireManagerInternal(sp.Get());
+    ReportManagerHeader(manager);
+    if (!manager.obj || manager.layout == nullptr) {
+        if (manager.access_denied_seen || manager.hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "IVirtualDesktopManagerInternal E_ACCESSDENIED");
+        }
+        return failed("usable IVirtualDesktopManagerInternal unavailable");
+    }
+
+    DesktopSnapshot carrier;
+    HRESULT current_hr = E_ABORT;
+    if (!ReadCurrentDesktop(manager, carrier, &current_hr)) {
+        if (current_hr == E_ACCESSDENIED) {
+            return environment_blocked("GetCurrentDesktop E_ACCESSDENIED");
+        }
+        return failed("current Carrier unavailable");
+    }
+    std::vector<DesktopSnapshot> desktops;
+    HRESULT desktops_hr = E_ABORT;
+    if (!ReadDesktopList(manager, desktops, &desktops_hr)) {
+        if (desktops_hr == E_ACCESSDENIED) {
+            return environment_blocked("GetDesktops E_ACCESSDENIED");
+        }
+        return failed("existing desktop enumeration failed");
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.id_ok || !parking.object) {
+        return failed("no existing inactive Parking desktop");
+    }
+    Field("Carrier", GuidToString(carrier.id));
+    Field("Parking", GuidToString(parking.id));
+
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    if (!views.object || views.layout == nullptr) {
+        if (views.access_denied_seen || views.hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "IApplicationViewCollection E_ACCESSDENIED");
+        }
+        return failed("usable IApplicationViewCollection unavailable");
+    }
+    const MethodEntry* get_view =
+        FindMethod(*views.layout, "GetViewForHwnd");
+    const MethodEntry* can_move =
+        FindMethod(*manager.layout, "CanViewMoveDesktops");
+    if (get_view == nullptr || can_move == nullptr) {
+        return failed("required read-only capability slots are unavailable");
+    }
+
+    bool capability_access_denied = false;
+    Win32WindowDiscoveryOptions options;
+    options.carrier = carrier.id;
+    options.parking = parking.id;
+    options.augment_capabilities =
+        [&](HWND hwnd, const WindowDiscoveryObservation& observation,
+            WindowCapabilities& capabilities, std::string* error) {
+            // Owned/tool/ambiguous HWNDs already fail closed. Avoid private
+            // calls when they cannot affect the final classification.
+            if (!observation.capabilities.independent_top_level ||
+                !observation.desktop_ok ||
+                observation.native_role == NativeDesktopRole::Unknown) {
+                return true;
+            }
+
+            RawObject view;
+            Gate view_gate = Gate::Ok;
+            const HRESULT view_hr = InvokeSlot(
+                views.object.Get(), *views.layout, *get_view, view_gate, false,
+                hwnd, view.PutVoid());
+            if (view_hr == E_ACCESSDENIED) {
+                capability_access_denied = true;
+                if (error != nullptr) {
+                    *error = "GetViewForHwnd returned E_ACCESSDENIED";
+                }
+                return false;
+            }
+            if (view_gate != Gate::Ok || FAILED(view_hr) || !view) {
+                return true;
+            }
+            capabilities.has_application_view = true;
+
+            Gate move_gate = Gate::Ok;
+            BOOL value = FALSE;
+            const HRESULT move_hr = InvokeSlot(
+                manager.obj.Get(), *manager.layout, *can_move, move_gate,
+                false, view.Get(), &value);
+            if (move_hr == E_ACCESSDENIED) {
+                capability_access_denied = true;
+                if (error != nullptr) {
+                    *error = "CanViewMoveDesktops returned E_ACCESSDENIED";
+                }
+                return false;
+            }
+            if (move_gate == Gate::Ok && SUCCEEDED(move_hr)) {
+                capabilities.can_move_desktops = value != FALSE;
+            }
+            return true;
+        };
+
+    std::string error;
+    HRESULT documented_hr = S_OK;
+    auto backend = CreateSystemWindowDiscoveryBackend(
+        std::move(options), &error, &documented_hr);
+    if (!backend) {
+        if (documented_hr == E_ACCESSDENIED) {
+            return environment_blocked(
+                "documented IVirtualDesktopManager E_ACCESSDENIED");
+        }
+        return failed(error.empty() ? "system discovery backend unavailable"
+                                    : error);
+    }
+
+    WindowDiscovery discovery(std::move(*backend));
+    std::vector<DiscoveredWindow> windows;
+    if (!discovery.Discover(windows, &error)) {
+        if (capability_access_denied) {
+            return environment_blocked(error);
+        }
+        return failed(error.empty() ? "complete discovery failed" : error);
+    }
+
+    std::size_t managed = 0;
+    std::size_t unsupported = 0;
+    std::size_t ambiguous = 0;
+    for (const DiscoveredWindow& window : windows) {
+        switch (window.disposition) {
+            case WindowDisposition::Managed: ++managed; break;
+            case WindowDisposition::Unsupported: ++unsupported; break;
+            case WindowDisposition::Ambiguous: ++ambiguous; break;
+            case WindowDisposition::Closed: ++ambiguous; break;
+        }
+    }
+    Field("total windows", std::format("{}", windows.size()));
+    Field("managed", std::format("{}", managed));
+    Field("unsupported", std::format("{}", unsupported));
+    Field("ambiguous", std::format("{}", ambiguous));
+    Field("result", "OK");
+    Field("mutation_started", "no");
+    Print("RESULT=OK\n");
+    Print("TOTAL_COUNT={}\n", windows.size());
+    Print("MANAGED_COUNT={}\n", managed);
+    Print("UNSUPPORTED_COUNT={}\n", unsupported);
+    Print("AMBIGUOUS_COUNT={}\n", ambiguous);
+    return 0;
 }
 
 // ---------------------------------------------------- logical-workspace-test

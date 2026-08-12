@@ -86,6 +86,9 @@ void Usage() {
         "  workspace-discovery-test\n"
         "                      deterministic injected-backend discovery and\n"
         "                      capability-classification checks\n"
+        "  workspace-live-discovery-test\n"
+        "                      one complete read-only live Carrier/Parking\n"
+        "                      window snapshot with private capability checks\n"
         "  workspace-engine-test\n"
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
@@ -205,6 +208,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdTerminalSemanticsTest(confirm_mutate);
     } else if (cmd == "workspace-discovery-test") {
         rc = vd::CmdWorkspaceDiscoveryTest();
+    } else if (cmd == "workspace-live-discovery-test") {
+        rc = vd::CmdWorkspaceLiveDiscoveryTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-coordinator-test") {

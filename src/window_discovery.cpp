@@ -75,8 +75,10 @@ BOOL CALLBACK CollectTopLevelWindow(HWND hwnd, LPARAM parameter) {
     }
 }
 
-Win32WindowDiscoveryApi MakeSystemApi(std::string* error) {
+Win32WindowDiscoveryApi MakeSystemApi(std::string* error,
+                                     HRESULT* bootstrap_hr) {
     Win32WindowDiscoveryApi api;
+    if (bootstrap_hr != nullptr) *bootstrap_hr = S_OK;
 
     auto manager = std::make_shared<Com<IVirtualDesktopManager>>();
     const HRESULT hr = ::CoCreateInstance(
@@ -84,6 +86,7 @@ Win32WindowDiscoveryApi MakeSystemApi(std::string* error) {
         CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
         IID_IVirtualDesktopManager, manager->PutVoid());
     if (FAILED(hr)) {
+        if (bootstrap_hr != nullptr) *bootstrap_hr = hr;
         if (error != nullptr) {
             *error = std::format(
                 "documented IVirtualDesktopManager unavailable ({})",
@@ -363,9 +366,10 @@ std::optional<WindowDiscoveryBackend> CreateWin32WindowDiscoveryBackend(
 }
 
 std::optional<WindowDiscoveryBackend> CreateSystemWindowDiscoveryBackend(
-    Win32WindowDiscoveryOptions options, std::string* error) {
+    Win32WindowDiscoveryOptions options, std::string* error,
+    HRESULT* bootstrap_hr) {
     if (error != nullptr) *error = {};
-    Win32WindowDiscoveryApi api = MakeSystemApi(error);
+    Win32WindowDiscoveryApi api = MakeSystemApi(error, bootstrap_hr);
     if (!api.enumerate) return std::nullopt;
     return CreateWin32WindowDiscoveryBackend(std::move(options),
                                               std::move(api), error);

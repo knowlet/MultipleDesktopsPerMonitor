@@ -87,6 +87,12 @@ int CmdChromiumSemanticsTest(const std::string& browser, bool confirm_mutate);
 // pre-existing Terminal windows or terminates an unrelated process.
 int CmdTerminalSemanticsTest(bool confirm_mutate);
 
+// Productization bootstrap probe: obtains the existing current Carrier and an
+// existing inactive Parking desktop, augments the system discovery backend
+// with read-only private application-view capability checks, and takes one
+// complete snapshot. It never assigns a workspace or mutates native state.
+int CmdWorkspaceLiveDiscoveryTest();
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();

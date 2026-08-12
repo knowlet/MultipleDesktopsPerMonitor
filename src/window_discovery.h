@@ -143,7 +143,8 @@ std::optional<WindowDiscoveryBackend> CreateWin32WindowDiscoveryBackend(
 // IVirtualDesktopManager reads only.  COM must already be initialized on the
 // calling thread.  No workspace assignment or native mutation is performed.
 std::optional<WindowDiscoveryBackend> CreateSystemWindowDiscoveryBackend(
-    Win32WindowDiscoveryOptions options, std::string* error = nullptr);
+    Win32WindowDiscoveryOptions options, std::string* error = nullptr,
+    HRESULT* bootstrap_hr = nullptr);
 
 class WindowDiscovery {
    public:

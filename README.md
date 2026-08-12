@@ -64,6 +64,7 @@ Gated feasibility tests:
 | `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4C: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe workspace-discovery-test` | productization boundary: deterministic, non-mutating capability-driven complete-window discovery and fail-closed classification |
+| `vdprobe workspace-live-discovery-test` | productization bootstrap: one complete, non-mutating live Carrier/Parking snapshot with `GetViewForHwnd` and `CanViewMoveDesktops` capability checks |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 
@@ -217,7 +218,8 @@ workspaces or using executable names. Incomplete enumeration, duplicate
 identity, unstable observation, invalid desktop role, or backend exceptions
 fail closed and preserve the prior snapshot. `workspace-discovery-test`
 exercises the injected seam without COM or native mutation; the system backend
-is ready for caller integration but is not yet wired into the long-running
+is wired into `workspace-live-discovery-test` for a single bounded bootstrap
+snapshot, but is not yet wired into the long-running
 coordinator. Production assignment/lifecycle policy, durable journal/bootstrap
 policy, focus/Z-order execution, and UI integration remain separate milestones.
 

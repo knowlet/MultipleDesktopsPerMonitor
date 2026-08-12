@@ -151,14 +151,22 @@ state, or branch on executable names. Run:
 
 ```powershell
 .\build\vdprobe.exe workspace-discovery-test
+.\build\vdprobe.exe workspace-live-discovery-test
 ```
 
 This deterministic test covers the injected backend and managed/unsupported/
 ambiguous classification, incomplete and duplicate enumeration, tool/ownership
 limits, invalid native roles, HWND-generation changes, and enumeration/
 observation exception containment. The system backend is read-only and ready
-for caller integration, but production coordinator wiring, assignment policy,
-and lifecycle-driven rescan remain separate milestones.
+for caller integration. `workspace-live-discovery-test` performs one bounded
+live bootstrap: it selects the existing current desktop as Carrier and one
+existing inactive desktop as Parking, augments eligible top-level HWNDs through
+gated read-only `GetViewForHwnd` and `CanViewMoveDesktops` calls, and reports
+managed/unsupported/ambiguous counts. It assigns no logical workspace and
+performs no native mutation. `E_ACCESSDENIED` is emitted as the stable
+`RESULT=ENVIRONMENT-BLOCKED` status with exit code 77. Production coordinator
+wiring, assignment policy, and lifecycle-driven rescan remain separate
+milestones.
 
 ## Deliberate next boundaries
 
