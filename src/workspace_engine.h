@@ -140,6 +140,12 @@ struct PresentationPlan {
     std::vector<PresentationOperation> operations;
 };
 
+struct PresentationResult {
+    bool completed = false;
+    std::size_t applied = 0;
+    std::string error;
+};
+
 struct TransactionResult {
     bool committed = false;
     bool rollback_attempted = false;
@@ -186,6 +192,13 @@ class WorkspaceEngine {
     using ObserveCallback =
         std::function<NativeDesktopRole(const WindowRecord&)>;
     using PreCommitCallback = std::function<bool()>;
+    // The engine has no authority to decide which HWNDs are safe to touch.
+    // The native adapter must prove that each record is still the intended,
+    // caller-owned HWND generation immediately before the operation is made.
+    using PresentationIdentityCallback =
+        std::function<bool(const WindowRecord&)>;
+    using PresentationApplyCallback =
+        std::function<bool(const WindowRecord&, const PresentationOperation&)>;
 
     WorkspaceEngine(GUID carrier, GUID parking);
 
@@ -230,6 +243,14 @@ class WorkspaceEngine {
     std::optional<PresentationPlan> PreparePresentationRestore(
         MonitorId monitor, WorkspaceId workspace,
         std::string* error = nullptr) const;
+    // Executes an already prepared restore in plan order.  This does not try
+    // to roll presentation back after a partial native failure: doing so
+    // would require a fresh, trusted snapshot.  It instead stops immediately
+    // and reports the bounded partial result.
+    PresentationResult ExecutePresentationRestore(
+        const PresentationPlan& plan,
+        const PresentationIdentityCallback& identity_is_current,
+        const PresentationApplyCallback& apply);
 
     TransactionResult ExecuteSwitch(const SwitchPlan& plan,
                                     const MoveCallback& move,

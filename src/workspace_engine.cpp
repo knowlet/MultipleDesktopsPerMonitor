@@ -72,6 +72,28 @@ bool PlansMatch(const SwitchPlan& a, const SwitchPlan& b) noexcept {
     return true;
 }
 
+bool SamePresentation(const WindowPresentation& a,
+                      const WindowPresentation& b) noexcept {
+    const auto same_rect = [](const RECT& left, const RECT& right) {
+        return left.left == right.left && left.top == right.top &&
+               left.right == right.right && left.bottom == right.bottom;
+    };
+    const auto same_point = [](const POINT& left, const POINT& right) {
+        return left.x == right.x && left.y == right.y;
+    };
+    return a.rect_valid == b.rect_valid &&
+           a.placement_valid == b.placement_valid &&
+           a.foreground == b.foreground && a.z_order == b.z_order &&
+           same_rect(a.rect, b.rect) &&
+           a.placement.length == b.placement.length &&
+           a.placement.flags == b.placement.flags &&
+           a.placement.showCmd == b.placement.showCmd &&
+           same_point(a.placement.ptMinPosition, b.placement.ptMinPosition) &&
+           same_point(a.placement.ptMaxPosition, b.placement.ptMaxPosition) &&
+           same_rect(a.placement.rcNormalPosition,
+                     b.placement.rcNormalPosition);
+}
+
 std::string Win32Error(const char* action, DWORD code = GetLastError()) {
     return std::string(action) + ": " +
            std::system_category().message(static_cast<int>(code));
@@ -797,6 +819,77 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
             *definition->last_foreground, foreground->presentation});
     }
     return plan;
+}
+
+PresentationResult WorkspaceEngine::ExecutePresentationRestore(
+    const PresentationPlan& plan,
+    const PresentationIdentityCallback& identity_is_current,
+    const PresentationApplyCallback& apply) {
+    PresentationResult result;
+    if (!identity_is_current || !apply) {
+        result.error = "presentation identity and apply callbacks are required";
+        return result;
+    }
+
+    std::string expected_error;
+    const std::optional<PresentationPlan> expected =
+        PreparePresentationRestore(plan.monitor, plan.workspace, &expected_error);
+    if (!expected || expected->operations.size() != plan.operations.size()) {
+        result.error = "stale presentation plan";
+        return result;
+    }
+    for (std::size_t i = 0; i < plan.operations.size(); ++i) {
+        const PresentationOperation& actual = plan.operations[i];
+        const PresentationOperation& current = expected->operations[i];
+        if (actual.kind != current.kind || actual.identity != current.identity ||
+            !SamePresentation(actual.presentation, current.presentation)) {
+            result.error = "stale presentation plan";
+            return result;
+        }
+    }
+
+    for (const PresentationOperation& operation : plan.operations) {
+        const WindowRecord* window = FindWindow(operation.identity);
+        if (window == nullptr || !window->present ||
+            window->disposition != WindowDisposition::Managed ||
+            !window->capabilities.Manageable() ||
+            !window->capabilities.owner_state_observable ||
+            !window->presentation.placement_valid) {
+            result.error = "presentation operation is no longer safe";
+            return result;
+        }
+        bool identity_ok = false;
+        try {
+            identity_ok = identity_is_current(*window);
+        } catch (const std::exception& exception) {
+            result.error = CallbackException("presentation identity", exception);
+            return result;
+        } catch (...) {
+            result.error = CallbackException("presentation identity");
+            return result;
+        }
+        if (!identity_ok) {
+            result.error = "presentation identity/capability mismatch";
+            return result;
+        }
+        bool applied = false;
+        try {
+            applied = apply(*window, operation);
+        } catch (const std::exception& exception) {
+            result.error = CallbackException("presentation apply", exception);
+            return result;
+        } catch (...) {
+            result.error = CallbackException("presentation apply");
+            return result;
+        }
+        if (!applied) {
+            result.error = "presentation operation failed";
+            return result;
+        }
+        ++result.applied;
+    }
+    result.completed = true;
+    return result;
 }
 
 bool WorkspaceEngine::RolesMatch(const SwitchOperation& operation,
@@ -1818,6 +1911,91 @@ int CmdWorkspaceEngineTest() {
     ok = ok && presentation_ok;
     Field("presentation plan is complete, ordered, and fail-closed",
           presentation_ok ? "PASS" : "FAIL");
+
+    std::vector<PresentationOperationKind> applied_presentation_kinds;
+    std::vector<WindowIdentity> applied_presentation_identities;
+    const PresentationResult presentation_result =
+        presentation_plan
+            ? presentation_engine.ExecutePresentationRestore(
+                  *presentation_plan,
+                  [](const WindowRecord& window) {
+                      return window.identity.IsValid() &&
+                             window.capabilities.Manageable() &&
+                             window.capabilities.owner_state_observable;
+                  },
+                  [&](const WindowRecord& window,
+                      const PresentationOperation& operation) {
+                      applied_presentation_kinds.push_back(operation.kind);
+                      applied_presentation_identities.push_back(window.identity);
+                      return window.identity == operation.identity;
+                  })
+            : PresentationResult{};
+    const bool presentation_execution_ok =
+        presentation_result.completed && presentation_result.applied == 5 &&
+        applied_presentation_kinds.size() == 5 &&
+        applied_presentation_identities.size() == 5 &&
+        applied_presentation_kinds[0] ==
+            PresentationOperationKind::RestorePlacement &&
+        applied_presentation_kinds[1] ==
+            PresentationOperationKind::RestorePlacement &&
+        applied_presentation_kinds[2] ==
+            PresentationOperationKind::RestoreZOrder &&
+        applied_presentation_kinds[3] ==
+            PresentationOperationKind::RestoreZOrder &&
+        applied_presentation_kinds[4] ==
+            PresentationOperationKind::RestoreForeground &&
+        applied_presentation_identities[0] == p1_id &&
+        applied_presentation_identities[1] == p2_id &&
+        applied_presentation_identities[2] == p2_id &&
+        applied_presentation_identities[3] == p1_id &&
+        applied_presentation_identities[4] == p1_id;
+    ok = ok && presentation_execution_ok;
+    Field("presentation executor applies deterministic native order",
+          presentation_execution_ok ? "PASS" : "FAIL");
+
+    int rejected_presentation_apply_calls = 0;
+    const PresentationResult identity_rejected =
+        presentation_plan
+            ? presentation_engine.ExecutePresentationRestore(
+                  *presentation_plan, [](const WindowRecord&) { return false; },
+                  [&](const WindowRecord&, const PresentationOperation&) {
+                      ++rejected_presentation_apply_calls;
+                      return true;
+                  })
+            : PresentationResult{};
+    const bool identity_rejected_ok =
+        !identity_rejected.completed && identity_rejected.applied == 0 &&
+        identity_rejected.error == "presentation identity/capability mismatch" &&
+        rejected_presentation_apply_calls == 0;
+    ok = ok && identity_rejected_ok;
+    Field("presentation executor rejects identity mismatch before mutation",
+          identity_rejected_ok ? "PASS" : "FAIL");
+
+    PresentationPlan tampered_presentation_plan =
+        presentation_plan.value_or(PresentationPlan{});
+    if (!tampered_presentation_plan.operations.empty()) {
+        ++tampered_presentation_plan.operations.front().presentation
+              .placement.rcNormalPosition.left;
+    }
+    int stale_presentation_apply_calls = 0;
+    const PresentationResult stale_presentation_rejected =
+        presentation_plan
+            ? presentation_engine.ExecutePresentationRestore(
+                  tampered_presentation_plan,
+                  [](const WindowRecord&) { return true; },
+                  [&](const WindowRecord&, const PresentationOperation&) {
+                      ++stale_presentation_apply_calls;
+                      return true;
+                  })
+            : PresentationResult{};
+    const bool stale_presentation_rejected_ok =
+        !stale_presentation_rejected.completed &&
+        stale_presentation_rejected.applied == 0 &&
+        stale_presentation_rejected.error == "stale presentation plan" &&
+        stale_presentation_apply_calls == 0;
+    ok = ok && stale_presentation_rejected_ok;
+    Field("presentation executor rejects altered plans before mutation",
+          stale_presentation_rejected_ok ? "PASS" : "FAIL");
 
     WorkspaceEngine incomplete_presentation_engine(carrier, parking);
     bool incomplete_presentation_ok =
