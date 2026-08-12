@@ -17,6 +17,7 @@ enum class CoordinatorResultCode {
     Succeeded,
     Busy,
     WrongThread,
+    LifecycleUnavailable,
     PendingRecovery,
     DiscoveryFailed,
     DiscoveryUnstable,
