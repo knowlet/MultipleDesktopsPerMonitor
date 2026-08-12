@@ -77,7 +77,7 @@ bool WorkspaceAssignmentAdapter::ConfigureMonitor(
         SetError(error, "assignment topology does not match the engine");
         return false;
     }
-    topology_.push_back({monitor, active, std::move(workspaces)});
+    topology_.push_back({monitor, std::move(workspaces)});
     std::sort(topology_.begin(), topology_.end(),
               [](const MonitorTopology& left, const MonitorTopology& right) {
                   return left.monitor < right.monitor;
@@ -121,6 +121,15 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
 
         const MonitorId observed_monitor =
             reinterpret_cast<MonitorId>(window.monitor);
+        const MonitorTopology* topology = Topology(observed_monitor);
+        const MonitorWorkspaceState* monitor = engine_.Monitor(observed_monitor);
+        if (topology != nullptr &&
+            (monitor == nullptr ||
+             !SameWorkspaceSet(topology->workspaces, monitor->workspaces))) {
+            SetError(error,
+                     "configured assignment topology no longer matches the engine");
+            return false;
+        }
         const WindowRecord* tracked = engine_.FindWindow(window.identity);
         if (tracked != nullptr &&
             tracked->disposition == WindowDisposition::Managed) {
@@ -128,7 +137,6 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
                 SetError(error, "tracked window changed monitors");
                 return false;
             }
-            const MonitorTopology* topology = Topology(observed_monitor);
             if (topology == nullptr ||
                 std::find(topology->workspaces.begin(),
                           topology->workspaces.end(), tracked->workspace) ==
@@ -138,7 +146,7 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
                 return false;
             }
             const NativeDesktopRole expected =
-                tracked->workspace == topology->active
+                tracked->workspace == monitor->active
                     ? NativeDesktopRole::Carrier
                     : NativeDesktopRole::Parking;
             if (window.native_role != expected) {
@@ -161,7 +169,6 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
 
         // A different generation using a tracked HWND deliberately reaches
         // this new-candidate path: no assignment is inherited by HWND alone.
-        const MonitorTopology* topology = Topology(observed_monitor);
         if (topology == nullptr) continue;
         if (window.native_role == NativeDesktopRole::Parking) continue;
         if (window.native_role != NativeDesktopRole::Carrier) {
@@ -172,7 +179,7 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
         WindowRecord record;
         record.identity = window.identity;
         record.monitor = observed_monitor;
-        record.workspace = topology->active;
+        record.workspace = monitor->active;
         record.native_role = NativeDesktopRole::Carrier;
         record.capabilities = window.capabilities;
         record.presentation = window.presentation;
@@ -282,6 +289,55 @@ int CmdWorkspaceAssignmentTest() {
     Field("recreated HWND generation does not inherit",
           generation_not_inherited ? "PASS" : "FAIL");
     ok = ok && generation_not_inherited;
+
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        native_roles;
+    for (const WindowRecord* window : engine.Windows()) {
+        native_roles.emplace(window->identity, window->native_role);
+    }
+    const std::optional<SwitchPlan> switch_plan =
+        engine.PrepareSwitch(1, 11, &error);
+    const TransactionResult switched = switch_plan
+        ? engine.ExecuteSwitch(
+              *switch_plan,
+              [&](const WindowRecord& window, NativeDesktopRole target) {
+                  native_roles[window.identity] = target;
+                  return true;
+              },
+              [&](const WindowRecord& window) {
+                  const auto found = native_roles.find(window.identity);
+                  return found == native_roles.end()
+                      ? NativeDesktopRole::Unknown
+                      : found->second;
+              })
+        : TransactionResult{};
+    const WindowIdentity after_switch = TestIdentity(9, 109, 1);
+    const bool active_tracks_engine =
+        switched.committed && engine.Monitor(1)->active == 11 &&
+        adapter.ConvertCompleteSnapshot(
+            {TestWindow(parked, 1, NativeDesktopRole::Carrier),
+             TestWindow(migrated, 1, NativeDesktopRole::Parking),
+             TestWindow(after_switch, 1, NativeDesktopRole::Carrier)},
+            records, &error) &&
+        records.size() == 3 &&
+        std::any_of(records.begin(), records.end(),
+                    [&](const WindowRecord& record) {
+                        return record.identity == parked &&
+                               record.workspace == 11;
+                    }) &&
+        std::any_of(records.begin(), records.end(),
+                    [&](const WindowRecord& record) {
+                        return record.identity == migrated &&
+                               record.workspace == 10;
+                    }) &&
+        std::any_of(records.begin(), records.end(),
+                    [&](const WindowRecord& record) {
+                        return record.identity == after_switch &&
+                               record.workspace == 11;
+                    });
+    Field("assignment follows switched active workspace",
+          active_tracks_engine ? "PASS" : "FAIL");
+    ok = ok && active_tracks_engine;
 
     const std::vector<WindowRecord> before_migration = records;
     const bool migration_closed =

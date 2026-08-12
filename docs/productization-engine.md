@@ -89,7 +89,8 @@ Run:
 
 `WorkspaceAssignmentAdapter` is the read-only boundary between complete
 `DiscoveredWindow` snapshots and engine-scoped `WindowRecord` values.  Its
-monitor topology must match the engine.  Exact tracked managed identities keep
+monitor workspace membership must match the engine, while the engine's current
+active workspace remains authoritative after each switch. Exact tracked managed identities keep
 their workspace only when the observed Carrier/Parking role still matches;
 monitor migration or a role mismatch rejects the entire candidate without
 changing either the caller's output or the engine.  A new Carrier window joins

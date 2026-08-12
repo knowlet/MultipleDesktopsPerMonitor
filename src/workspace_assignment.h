@@ -15,8 +15,10 @@ class WorkspaceAssignmentAdapter {
     explicit WorkspaceAssignmentAdapter(const WorkspaceEngine& engine)
         : engine_(engine) {}
 
-    // Adds one monitor to this adapter's assignment scope.  The supplied
-    // topology must already exist, unchanged, in the engine.
+    // Adds one monitor to this adapter's assignment scope. The supplied
+    // workspace membership must already exist, unchanged, in the engine.
+    // The engine remains authoritative for the active workspace, which may
+    // legitimately change after a successful switch.
     bool ConfigureMonitor(MonitorId monitor, WorkspaceId active,
                           std::vector<WorkspaceId> workspaces,
                           std::string* error = nullptr);
@@ -30,7 +32,6 @@ class WorkspaceAssignmentAdapter {
    private:
     struct MonitorTopology {
         MonitorId monitor = 0;
-        WorkspaceId active = 0;
         std::vector<WorkspaceId> workspaces;
     };
 

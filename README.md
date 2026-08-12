@@ -250,6 +250,13 @@ live coordinator command remains the proof that the same `WindowDiscovery`
 pipeline can be built by `CreateSystemWindowDiscoveryBackend`; the deterministic
 lifecycle command deliberately does not enumerate unrelated user HWNDs.
 
+`WorkspaceAssignmentAdapter` freezes each configured monitor's workspace
+membership but reads the active workspace from `WorkspaceEngine` for every
+complete conversion. Therefore a successful switch immediately changes both
+tracked Carrier/Parking validation and the workspace assigned to newly
+discovered Carrier windows; the adapter never retains a stale pre-switch
+active workspace.
+
 The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
 complete discovery snapshots and lifecycle hints on one owner thread, retries
