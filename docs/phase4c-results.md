@@ -91,12 +91,14 @@ DWM reported `cloaked = 2`; product visibility decisions must therefore use
 desktop assignment and cloaking, not `IsWindowVisible` alone.
 
 The original interactive run left the unique temporary profile retained after
-safe window cleanup. The probe now waits for all processes matching both the
-canonical Edge image path and that unique profile command line to exit before
-retrying profile removal. This is read-only process observation: no
-`taskkill`, `TerminateProcess`, or existing-profile mutation is allowed. The
-Edge semantics result is valid, while a clean profile-removal PASS must still
-be confirmed by a rerun after this hardening. Until then the overall Phase 4C
+safe window cleanup. The probe now retains launch-process handles and combines
+that scoped tree with a pre-launch Edge baseline before retrying profile
+removal. Only unchanged PID + valid process-creation identities from the
+baseline are ignored; new, reused, or opaque Edge identities keep the profile
+retained. This is read-only process observation: no `taskkill`,
+`TerminateProcess`, or existing-profile mutation is allowed. The Edge
+semantics result is valid, while a clean profile-removal PASS must still be
+confirmed by a rerun after this hardening. Until then the overall Phase 4C
 decision remains pending rather than `GO-PRODUCTIZATION`.
 
 ## Windows Terminal evidence

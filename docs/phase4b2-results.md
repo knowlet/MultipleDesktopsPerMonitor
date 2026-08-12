@@ -31,7 +31,11 @@ The probe:
 - observes `ViewVirtualDesktopChanged` and requires zero
   `CurrentVirtualDesktopChanged` events;
 - closes only probe-attributed browser roots with `WM_CLOSE`;
-- removes the temporary profile only when no profile-associated windows remain.
+- closes only probe-attributed browser roots, then requires a fail-closed
+  process-drain check before removing the temporary profile.  The drain
+  combines retained launch-tree handles with a pre-launch Edge baseline:
+  unchanged PID + valid process-creation identities are ignored, while any
+  new/reused or opaque Edge identity keeps the profile retained.
 
 The probe never uses an existing browser profile, never closes an
 unattributed browser HWND, never calls `SwitchDesktop`, and never terminates an
@@ -127,15 +131,16 @@ assignment and cloaking state rather than `IsWindowVisible` alone.
 
 The temporary profile remained on disk after both the original one-shot cleanup
 and the bounded process-drain/profile-removal retry. The probe now also launches
-the isolated instance with `--disable-background-mode`, so the final browser
-process should not remain alive solely for background apps after probe-owned
-roots close. Cleanup output distinguishes an attributed probe process that is
-still present from an inconclusive process scan; in either case the profile is
-retained and no process is terminated. This flag and the retry are limited to
-the unique probe profile; the probe never terminates Edge or touches an
-existing profile. Phase 4B-2A should be rerun once after this hardening; until
-that rerun, the overall command remains `INCONCLUSIVE-CLEANUP`, not a clean
-PASS.
+the isolated instance with `--disable-background-mode`, retains launch-process
+handles, and uses a pre-launch Edge baseline to avoid treating unrelated
+long-lived Edge processes as probe-owned. Cleanup output distinguishes an
+attributed probe process that is still present from an inconclusive process
+scan; in either case the profile is retained and no process is terminated.
+Opaque or PID-reused Edge identities are deliberately fail-closed rather than
+exempted. These safeguards are limited to the unique probe profile; the probe
+never terminates Edge or touches an existing profile. Phase 4B-2A should be
+rerun once after this hardening; until that rerun, the overall command remains
+`INCONCLUSIVE-CLEANUP`, not a clean PASS.
 
 This milestone does not claim Chrome equivalence, browser lifecycle support,
 focus/Z-order recovery, existing-profile safety beyond the stated attribution
