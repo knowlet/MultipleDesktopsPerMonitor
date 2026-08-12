@@ -2,7 +2,10 @@
 
 ## Decision
 
-The representative compatibility gate is complete:
+The representative compatibility gate is not yet complete. Windows Terminal
+and the Edge semantics contract have been observed, but the latest Edge run
+must still prove that the isolated temporary profile fully drains and is
+removed before the strict gate can be promoted:
 
 | Behavior type | Representative | Result |
 |---|---|---|
@@ -11,8 +14,11 @@ The representative compatibility gate is complete:
 | Chromium multi-process | isolated Microsoft Edge | `GO-WITH-LIMITATIONS` |
 | Packaged/modern Windows app | Windows Terminal | `GO-WITH-LIMITATIONS` |
 
-This is the `GO-PRODUCTIZATION` checkpoint. The engine must remain
-capability-driven; it must not grow an executable whitelist.
+This is a **pending `GO-PRODUCTIZATION` checkpoint**, not a completed
+decision. The Edge top-level semantics are valid, but the last evidence still
+ends in `INCONCLUSIVE-CLEANUP`; a clean interactive rerun is required before
+claiming the strict gate. The engine must remain capability-driven; it must not
+grow an executable whitelist.
 
 ## Engine milestone
 
@@ -133,6 +139,16 @@ yet the user-facing workspace manager. Remaining work is:
 - native placement, Z-order, and focus execution;
 - durable crash-journal placement and startup recovery policy;
 - minimal hotkey/UI integration.
+
+The serialized `WorkspaceCoordinator` boundary is now covered by the
+non-mutating `workspace-coordinator-test`. It owns an owner-thread operation
+boundary, drains lifecycle hints atomically with overflow state, retries
+complete discovery until the input is quiet, rejects late lifecycle changes
+before native mutation, and delegates stale-plan validation, rollback, and
+journal recovery to `WorkspaceEngine`. It is intentionally not yet a
+long-running manager: the caller still supplies complete discovery and native
+move/observe callbacks, pumps the WinEvent owner thread, and chooses the
+production journal/bootstrap policy.
 
 The live command was also attempted on the current host. `GetImmersiveShell`
 returned `E_ACCESSDENIED` before any probe window was spawned, so the command

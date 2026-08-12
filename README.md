@@ -64,6 +64,7 @@ Gated feasibility tests:
 | `vdprobe chromium-semantics-test --browser edge --confirm-mutate` | Phase 4C: launches one isolated temporary Edge profile, attributes two same-profile top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe terminal-semantics-test --confirm-mutate` | Phase 4C: launches two probe-owned Windows Terminal top-level windows, moves one view Carrier -> Parking -> Carrier, and restores/cleans up only probe-attributed state |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
+| `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -159,9 +160,10 @@ research/
 ## Scope
 
 Phase 4C is the representative compatibility gate. Controlled Win32,
-Explorer, isolated Edge, and Windows Terminal probes all reached
-`GO-WITH-LIMITATIONS` for the tested top-level Carrier/Parking contract.
-Evidence and limitations are recorded in
+Explorer, isolated Edge, and Windows Terminal probes have reached
+`GO-WITH-LIMITATIONS` for the tested top-level Carrier/Parking semantics.
+The strict gate remains pending until Edge also proves complete temporary
+profile process drain and cleanup. Evidence and limitations are recorded in
 [`docs/phase4c-results.md`](docs/phase4c-results.md).
 
 The project now moves from app-by-app compatibility research to productization
@@ -202,6 +204,16 @@ WinEvent hints for owner-thread draining; native destroy hints remain
 non-authoritative and require a complete snapshot before model closure.
 Production lifecycle wiring, native placement/Z-order/focus execution, durable
 journal policy, and UI integration remain separate milestones.
+
+The serialized coordinator boundary is in
+[`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
+complete discovery snapshots and lifecycle hints on one owner thread, retries
+until the lifecycle input is quiet, rejects stale plans before native mutation,
+and blocks new operations while a journal transaction is pending. Run
+`workspace-coordinator-test` for deterministic, non-mutating evidence. This is
+still a library boundary, not a long-running user-facing manager: production
+discovery policy, WinEvent message pumping, startup bootstrap, and native
+presentation execution remain separate.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

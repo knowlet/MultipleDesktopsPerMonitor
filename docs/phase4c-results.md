@@ -10,12 +10,15 @@ matrix. The tested representatives are:
 |---|---|---|
 | Classic Win32 | controlled vdprobe child | `GO-WITH-LIMITATIONS` |
 | Shell-hosted/shared process | Explorer | `GO-WITH-LIMITATIONS` |
-| Chromium multi-process | Microsoft Edge, isolated profile | `GO-WITH-LIMITATIONS` |
+| Chromium multi-process | Microsoft Edge, isolated profile | `GO-WITH-LIMITATIONS` (cleanup rerun pending) |
 | Packaged/modern Windows app | Windows Terminal | `GO-WITH-LIMITATIONS` |
 
-Together these results are sufficient to proceed to productization of the
-Carrier/Parking engine. They do not create an application whitelist and do not
-claim that every application has identical owner, popup, or grouping behavior.
+The top-level semantics evidence is sufficient to continue engineering the
+Carrier/Parking engine, but the strict representative gate is still pending:
+the latest Edge run must prove complete temporary-profile process drain and
+removal before this document can claim `GO-PRODUCTIZATION`. These results do
+not create an application whitelist and do not claim that every application
+has identical owner, popup, or grouping behavior.
 The production path is capability-driven:
 
 ```text
@@ -92,8 +95,9 @@ safe window cleanup. The probe now waits for all processes matching both the
 canonical Edge image path and that unique profile command line to exit before
 retrying profile removal. This is read-only process observation: no
 `taskkill`, `TerminateProcess`, or existing-profile mutation is allowed. The
-Edge semantics result is valid, while a clean profile-removal PASS should be
-confirmed by a rerun after this hardening.
+Edge semantics result is valid, while a clean profile-removal PASS must still
+be confirmed by a rerun after this hardening. Until then the overall Phase 4C
+decision remains pending rather than `GO-PRODUCTIZATION`.
 
 ## Windows Terminal evidence
 
