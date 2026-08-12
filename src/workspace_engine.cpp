@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "util.h"
+#include "window_lifecycle.h"
 
 namespace vd {
 namespace {
@@ -1259,6 +1260,148 @@ int CmdWorkspaceEngineTest() {
         &error);
     ok = ok && reopened == UpsertResult::Added;
     Field("close and recreate lifecycle", ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine lifecycle_engine(carrier, parking);
+    bool lifecycle_ok =
+        lifecycle_engine.AddMonitor(70, 71, {71, 72}, &error);
+    const WindowIdentity l1_id = identity(0x8001, 901, 9);
+    const WindowIdentity l1_reused_id = identity(0x8001, 902, 10);
+    std::optional<WindowRecord> lifecycle_observation = WindowRecord{
+        l1_id, 70, 71, NativeDesktopRole::Carrier, manageable, {}, {}, true};
+    WindowLifecycleAdapter lifecycle_adapter(
+        lifecycle_engine, [&](HWND hwnd) -> std::optional<WindowRecord> {
+            if (!lifecycle_observation ||
+                lifecycle_observation->identity.hwnd != hwnd) {
+                return std::nullopt;
+            }
+            return lifecycle_observation;
+        });
+    if (lifecycle_ok) {
+        lifecycle_ok =
+            lifecycle_adapter.Apply({WindowLifecycleEventKind::Appeared,
+                                     l1_id.hwnd, l1_id},
+                                    &error) == LifecycleApplyResult::Added;
+    }
+    lifecycle_observation = WindowRecord{
+        l1_reused_id, 70, 71, NativeDesktopRole::Carrier, manageable, {}, {},
+        true};
+    if (lifecycle_ok) {
+        lifecycle_ok =
+            lifecycle_adapter.Apply({WindowLifecycleEventKind::Appeared,
+                                     l1_reused_id.hwnd, l1_reused_id},
+                                    &error) == LifecycleApplyResult::Recreated &&
+            lifecycle_engine.FindWindow(l1_id) == nullptr &&
+            lifecycle_engine.FindWindow(l1_reused_id) != nullptr;
+    }
+    if (lifecycle_ok) {
+        lifecycle_ok =
+            lifecycle_adapter.Apply({WindowLifecycleEventKind::Closed,
+                                     l1_reused_id.hwnd, std::nullopt},
+                                    &error) ==
+                LifecycleApplyResult::NeedsReconcile &&
+            lifecycle_adapter.reconciliation_required() &&
+            lifecycle_engine.FindWindow(l1_reused_id) != nullptr;
+    }
+    if (lifecycle_ok) {
+        lifecycle_ok =
+            lifecycle_adapter.Apply({WindowLifecycleEventKind::Appeared,
+                                     l1_reused_id.hwnd, l1_reused_id},
+                                    &error) ==
+                LifecycleApplyResult::NeedsReconcile &&
+            lifecycle_engine.FindWindow(l1_reused_id) != nullptr;
+    }
+    if (lifecycle_ok) {
+        lifecycle_ok = lifecycle_adapter.ReconcileCompleteSnapshot(
+                           {{WindowLifecycleEventKind::Closed,
+                             l1_reused_id.hwnd, std::nullopt}},
+                           {}, nullptr, &error) &&
+                       !lifecycle_adapter.reconciliation_required() &&
+                       lifecycle_engine.FindWindow(l1_reused_id) == nullptr &&
+                       lifecycle_engine.CheckInvariant(&error);
+    }
+    ok = ok && lifecycle_ok;
+    Field("generation-safe lifecycle observation adapter",
+          lifecycle_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine lifecycle_batch_engine(carrier, parking);
+    bool lifecycle_batch_ok =
+        lifecycle_batch_engine.AddMonitor(80, 81, {81, 82}, &error);
+    const WindowIdentity lb_old_id = identity(0x8101, 911, 11);
+    const WindowIdentity lb_new_id = identity(0x8101, 912, 12);
+    const WindowIdentity lb_other_id = identity(0x8102, 913, 12);
+    WindowLifecycleAdapter lifecycle_batch_adapter(lifecycle_batch_engine, {});
+    LifecycleReconcileResult lifecycle_batch_result;
+    if (lifecycle_batch_ok) {
+        lifecycle_batch_ok = lifecycle_batch_adapter.ReconcileCompleteSnapshot(
+            {{WindowLifecycleEventKind::Appeared, lb_new_id.hwnd, lb_new_id},
+             {WindowLifecycleEventKind::Appeared, lb_new_id.hwnd, lb_new_id},
+             {WindowLifecycleEventKind::Closed, lb_old_id.hwnd, lb_old_id}},
+            {{lb_other_id, 80, 82, NativeDesktopRole::Parking, manageable, {},
+              {}, true},
+             {lb_new_id, 80, 81, NativeDesktopRole::Carrier, manageable, {},
+              {}, true}},
+            &lifecycle_batch_result, &error);
+    }
+    lifecycle_batch_ok =
+        lifecycle_batch_ok && lifecycle_batch_result.events == 3 &&
+        lifecycle_batch_result.duplicates == 1 &&
+        lifecycle_batch_result.stale_generations == 1 &&
+        lifecycle_batch_result.discovery.added == 2 &&
+        lifecycle_batch_engine.FindWindow(lb_old_id) == nullptr &&
+        lifecycle_batch_engine.FindWindow(lb_new_id) != nullptr &&
+        !lifecycle_batch_adapter.reconciliation_required() &&
+        lifecycle_batch_engine.CheckInvariant(&error);
+    ok = ok && lifecycle_batch_ok;
+    Field("complete lifecycle batch ignores duplicate/stale hints",
+          lifecycle_batch_ok ? "PASS" : "FAIL");
+
+    std::vector<HWINEVENTHOOK> removed_hooks;
+    std::uintptr_t next_fake_hook = 1;
+    {
+        WinEventLifecycleSource source(
+            [&](DWORD, DWORD, WINEVENTPROC) {
+                return reinterpret_cast<HWINEVENTHOOK>(next_fake_hook++);
+            },
+            [&](HWINEVENTHOOK hook) {
+                removed_hooks.push_back(hook);
+                return true;
+            });
+        lifecycle_batch_ok = lifecycle_batch_ok && source.Start(&error) &&
+                             source.running();
+        source.Collect({WindowLifecycleEventKind::Appeared, lb_new_id.hwnd,
+                        lb_new_id});
+        source.Collect({WindowLifecycleEventKind::Appeared, lb_new_id.hwnd,
+                        lb_new_id});
+        const std::vector<WindowLifecycleEvent> drained = source.Drain();
+        lifecycle_batch_ok = lifecycle_batch_ok && drained.size() == 2 &&
+                             source.Drain().empty();
+        source.Stop();
+        lifecycle_batch_ok = lifecycle_batch_ok && !source.running() &&
+                             source.shutdown_ok();
+    }
+    lifecycle_batch_ok = lifecycle_batch_ok && removed_hooks.size() == 1;
+
+    std::vector<HWINEVENTHOOK> partial_removed;
+    int install_attempt = 0;
+    {
+        WinEventLifecycleSource partial_source(
+            [&](DWORD, DWORD, WINEVENTPROC) -> HWINEVENTHOOK {
+                ++install_attempt;
+                return nullptr;
+            },
+            [&](HWINEVENTHOOK hook) {
+                partial_removed.push_back(hook);
+                return true;
+            });
+        std::string start_error;
+        lifecycle_batch_ok = lifecycle_batch_ok &&
+                             !partial_source.Start(&start_error) &&
+                             !partial_source.running();
+    }
+    lifecycle_batch_ok = lifecycle_batch_ok && partial_removed.empty();
+    ok = ok && lifecycle_batch_ok;
+    Field("WinEvent queue drain and owner-thread unhook cleanup",
+          lifecycle_batch_ok ? "PASS" : "FAIL");
 
     WorkspaceEngine discovery_engine(carrier, parking);
     bool discovery_ok =

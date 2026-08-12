@@ -178,7 +178,7 @@ The probe never maintains an executable whitelist. Chrome, Electron, other
 packaged applications, and unusual owner/popup behavior remain beta validation
 inputs rather than separate prebuilt compatibility claims.
 
-Productization work still excludes automatic lifecycle tracking, native
+Productization work still excludes production automatic lifecycle tracking,
 placement/Z-order/focus execution, persistence, GUI, hotkeys, tray icon,
 installer, Rust port, stress, latency benchmarking, and any form of faked or
 emulated native desktop lifecycle until those milestones are explicitly
@@ -196,10 +196,12 @@ evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
 `GetViewForHwnd` resolution before each move, and verifies the callback-backed
 transaction against live desktop state. The engine also provides deterministic
-generation-safe discovery reconciliation and presentation restore planning;
-automatic WinEvent lifecycle tracking, native placement/Z-order/focus
-execution, durable journal policy, and UI integration remain separate
-milestones.
+generation-safe discovery reconciliation and presentation restore planning. A
+bounded read-only `window_lifecycle.{h,cpp}` source collects window-object
+WinEvent hints for owner-thread draining; native destroy hints remain
+non-authoritative and require a complete snapshot before model closure.
+Production lifecycle wiring, native placement/Z-order/focus execution, durable
+journal policy, and UI integration remain separate milestones.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

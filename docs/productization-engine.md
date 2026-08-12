@@ -87,6 +87,8 @@ currently verifies:
 - one monitor-local switch and round-trip restoration;
 - HWND reuse as a new generation;
 - close and recreate lifecycle;
+- generation-safe lifecycle observations, including stale-generation
+  suppression and fail-closed handling of identity-less close events;
 - complete discovery-snapshot reconciliation with HWND-generation checks;
 - deterministic Z-order capture and fail-closed presentation restore planning;
 - unsupported capability fail-closed behavior;
@@ -97,7 +99,21 @@ All checks passed on August 12, 2026 after the engine was added.
 
 The discovery and presentation APIs are model-level boundaries, not a claim
 that the product already tracks every desktop window or changes native
-presentation state. `ReconcileDiscoverySnapshot()` requires a complete,
+presentation state. `window_lifecycle.{h,cpp}` now adds a bounded read-only
+`SetWinEventHook` source for window-object create/show/destroy hints and a separate
+model-neutral adapter. The hook callback queues window-object hints without
+doing COM or model mutation; capability/native-role resolution happens later
+in a caller-supplied observer. Native out-of-context destroy hints
+intentionally carry no identity because a dispatch-time PID/process-time lookup
+is not an event-time generation. Close hints never remove records directly;
+they set a sticky full-snapshot reconciliation requirement. The authoritative
+batch boundary deduplicates event hints, counts invalid/stale generations, and
+passes only the complete scoped
+observation to `ReconcileDiscoverySnapshot()`; events themselves never remove
+or replace model records. Hook installation/removal is RAII-managed, including
+cleanup when only part of registration succeeds. The hook source requires
+same-thread start/stop, bounded queue storage, and reports unhook failure
+through `shutdown_ok()`. `ReconcileDiscoverySnapshot()` requires a complete,
 point-in-time observation and treats omitted tracked windows as closed;
 generation changes are recorded as recreation. `PreparePresentationRestore()`
 emits placement, Z-order, and foreground operations only when the snapshot is
@@ -112,7 +128,8 @@ identity-checked move/observe callbacks to `WorkspaceEngine`, and verifies the
 transaction with notification events and documented desktop state. It is not
 yet the user-facing workspace manager. Remaining work is:
 
-- `SetWinEventHook` lifecycle tracking;
+- production wiring of lifecycle observations to full window discovery and a
+  periodic/recovery full-snapshot policy;
 - native placement, Z-order, and focus execution;
 - durable crash-journal placement and startup recovery policy;
 - minimal hotkey/UI integration.
