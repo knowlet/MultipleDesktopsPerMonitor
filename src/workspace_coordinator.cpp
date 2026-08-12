@@ -605,31 +605,40 @@ int CmdWorkspaceCoordinatorTest() {
         fresh_recovery_ok = false;
     }
 
-    WorkspaceEngine replacement_engine(recovery_carrier, recovery_parking);
-    fresh_recovery_ok =
-        fresh_recovery_ok && replacement_engine.AddMonitor(4, 40, {40, 41},
-                                                            &error);
-    if (fresh_recovery_ok) {
-        fresh_recovery_ok =
-            replacement_engine.UpsertWindow(
-                {g, 4, 40, NativeDesktopRole::Carrier, capabilities},
-                &error) == UpsertResult::Added &&
-            replacement_engine.UpsertWindow(
-                {h, 4, 41, NativeDesktopRole::Parking, capabilities},
-                &error) == UpsertResult::Added;
-    }
+    // The replacement process gets no in-memory engine state. Its startup
+    // snapshot is enough to reconstruct only the pending transaction model;
+    // BootstrapPendingRecoveryModel itself makes no native calls.
+    std::vector<WindowRecord> recovery_snapshot{
+        {g, 4, 40, NativeDesktopRole::Parking, capabilities},
+        {h, 4, 41, NativeDesktopRole::Carrier, capabilities}};
+    std::string missing_bootstrap_error;
+    const bool missing_bootstrap_rejected =
+        fresh_recovery_ok &&
+        WorkspaceEngine::BootstrapPendingRecoveryModel(
+            recovery_carrier, recovery_parking, *recovery_plan,
+            {recovery_snapshot.front()}, &missing_bootstrap_error) == nullptr &&
+        missing_bootstrap_error ==
+            "startup snapshot cannot prove every pending window identity";
+    std::unique_ptr<WorkspaceEngine> replacement_engine =
+        fresh_recovery_ok
+            ? WorkspaceEngine::BootstrapPendingRecoveryModel(
+                  recovery_carrier, recovery_parking, *recovery_plan,
+                  recovery_snapshot, &error)
+            : nullptr;
+    fresh_recovery_ok = fresh_recovery_ok && missing_bootstrap_rejected &&
+                        replacement_engine != nullptr;
+    WorkspaceEngine replacement_fallback(recovery_carrier, recovery_parking);
+    WorkspaceEngine& replacement = replacement_engine ? *replacement_engine
+                                                       : replacement_fallback;
     WinEventLifecycleSource recovery_source(
         [&](DWORD, DWORD, WINEVENTPROC) {
             return reinterpret_cast<HWINEVENTHOOK>(fake_hook_value++);
         },
         [](HWINEVENTHOOK) { return true; });
     fresh_recovery_ok = fresh_recovery_ok && recovery_source.Start(&error);
-    WindowLifecycleAdapter recovery_lifecycle(replacement_engine, {});
-    std::vector<WindowRecord> recovery_snapshot{
-        {g, 4, 40, NativeDesktopRole::Carrier, capabilities},
-        {h, 4, 41, NativeDesktopRole::Parking, capabilities}};
+    WindowLifecycleAdapter recovery_lifecycle(replacement, {});
     WorkspaceCoordinator replacement_coordinator(
-        replacement_engine, recovery_lifecycle, recovery_source,
+        replacement, recovery_lifecycle, recovery_source,
         [&](std::vector<WindowRecord>& observed, std::string*) {
             observed = recovery_snapshot;
             return true;
@@ -649,11 +658,15 @@ int CmdWorkspaceCoordinatorTest() {
     WindowIdentity replaced_new{reinterpret_cast<HWND>(9), 109, {10, 10}, true};
     WindowIdentity closed{reinterpret_cast<HWND>(10), 110, {11, 11}, true};
     if (fresh_recovery_ok && fresh_recovered.succeeded()) {
+        // The authoritative post-recovery snapshot must reflect the roles
+        // that RecoverPending just observed and restored.
+        recovery_snapshot[0].native_role = NativeDesktopRole::Carrier;
+        recovery_snapshot[1].native_role = NativeDesktopRole::Parking;
         fresh_recovery_ok =
-            replacement_engine.UpsertWindow(
+            replacement_engine->UpsertWindow(
                 {replaced_old, 4, 40, NativeDesktopRole::Carrier,
                  capabilities}, &error) == UpsertResult::Added &&
-            replacement_engine.UpsertWindow(
+            replacement_engine->UpsertWindow(
                 {closed, 4, 40, NativeDesktopRole::Carrier, capabilities},
                 &error) == UpsertResult::Added;
         recovery_snapshot.push_back(
@@ -676,14 +689,14 @@ int CmdWorkspaceCoordinatorTest() {
         fresh_reconciled.lifecycle.discovery.updated == 2 &&
         fresh_reconciled.lifecycle.discovery.recreated == 1 &&
         fresh_reconciled.lifecycle.discovery.closed == 1 &&
-        replacement_engine.FindWindow(replaced_old) == nullptr &&
-        replacement_engine.FindWindow(replaced_new) != nullptr &&
-        replacement_engine.FindWindow(closed) == nullptr &&
-        replacement_engine.Monitor(4) != nullptr &&
-        replacement_engine.Monitor(4)->active == 40 &&
+        replacement.FindWindow(replaced_old) == nullptr &&
+        replacement.FindWindow(replaced_new) != nullptr &&
+        replacement.FindWindow(closed) == nullptr &&
+        replacement.Monitor(4) != nullptr &&
+        replacement.Monitor(4)->active == 40 &&
         recovery_roles[g] == NativeDesktopRole::Carrier &&
         recovery_roles[h] == NativeDesktopRole::Parking && !fresh_pending &&
-        fresh_pending_error.empty() && replacement_engine.CheckInvariant(&error);
+        fresh_pending_error.empty() && replacement.CheckInvariant(&error);
     recovery_source.Stop();
     fresh_recovery_ok = fresh_recovery_ok && recovery_source.shutdown_ok();
     std::filesystem::remove(recovery_path, remove_error);

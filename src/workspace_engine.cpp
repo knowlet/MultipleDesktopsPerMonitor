@@ -314,6 +314,78 @@ std::optional<SwitchPlan> WorkspaceJournal::ReadPending(
 WorkspaceEngine::WorkspaceEngine(GUID carrier, GUID parking)
     : carrier_(carrier), parking_(parking) {}
 
+std::unique_ptr<WorkspaceEngine>
+WorkspaceEngine::BootstrapPendingRecoveryModel(
+    GUID carrier, GUID parking, const SwitchPlan& pending,
+    const std::vector<WindowRecord>& authoritative_snapshot,
+    std::string* error) {
+    if (error) error->clear();
+    if (pending.monitor == 0 || pending.from_workspace == 0 ||
+        pending.to_workspace == 0 ||
+        pending.from_workspace == pending.to_workspace ||
+        pending.operations.empty()) {
+        if (error) *error = "pending journal plan is not a switch transaction";
+        return nullptr;
+    }
+
+    std::unordered_map<WindowIdentity, const WindowRecord*, WindowIdentityHash>
+        snapshot_by_identity;
+    std::unordered_set<std::uintptr_t> snapshot_hwnds;
+    for (const WindowRecord& record : authoritative_snapshot) {
+        const std::uintptr_t hwnd =
+            reinterpret_cast<std::uintptr_t>(record.identity.hwnd);
+        if (!record.identity.IsValid() || record.disposition == WindowDisposition::Closed ||
+            !snapshot_by_identity.emplace(record.identity, &record).second ||
+            !snapshot_hwnds.insert(hwnd).second) {
+            if (error) *error = "startup snapshot contains an invalid or duplicate window";
+            return nullptr;
+        }
+    }
+
+    auto engine = std::make_unique<WorkspaceEngine>(carrier, parking);
+    if (!engine->AddMonitor(pending.monitor, pending.from_workspace,
+                            {pending.from_workspace, pending.to_workspace},
+                            error)) {
+        return nullptr;
+    }
+    std::unordered_set<WindowIdentity, WindowIdentityHash> operations;
+    for (const SwitchOperation& operation : pending.operations) {
+        const auto it = snapshot_by_identity.find(operation.identity);
+        if (it == snapshot_by_identity.end() ||
+            !operations.insert(operation.identity).second ||
+            operation.from == NativeDesktopRole::Unknown ||
+            operation.to == NativeDesktopRole::Unknown ||
+            operation.from == operation.to) {
+            if (error) *error = "startup snapshot cannot prove every pending window identity";
+            return nullptr;
+        }
+        WindowRecord recovered = *it->second;
+        if (recovered.monitor != pending.monitor ||
+            (recovered.workspace != pending.from_workspace &&
+             recovered.workspace != pending.to_workspace) ||
+            recovered.disposition != WindowDisposition::Managed ||
+            !recovered.capabilities.Manageable()) {
+            if (error) *error = "startup snapshot window is not recoverable for pending transaction";
+            return nullptr;
+        }
+        // RecoverPending validates the planned pre-switch model role. Native
+        // state remains observed separately, because it may reflect a partial
+        // switch when the prior process terminated.
+        recovered.native_role = operation.from;
+        if (engine->UpsertWindow(std::move(recovered), error) !=
+            UpsertResult::Added) {
+            if (error && error->empty()) *error = "failed to import pending window";
+            return nullptr;
+        }
+    }
+    std::string invariant_error;
+    if (!engine->CheckInvariant(&invariant_error)) {
+        if (error) *error = "bootstrapped recovery model is invalid: " + invariant_error;
+        return nullptr;
+    }
+    return engine;
+}
+
 bool WorkspaceEngine::HasWorkspace(MonitorId monitor,
                                    WorkspaceId workspace) const {
     return std::any_of(workspaces_.begin(), workspaces_.end(),

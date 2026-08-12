@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <unordered_map>
 #include <optional>
 #include <string>
@@ -201,6 +202,20 @@ class WorkspaceEngine {
         std::function<bool(const WindowRecord&, const PresentationOperation&)>;
 
     WorkspaceEngine(GUID carrier, GUID parking);
+
+    // Builds the smallest safe, fresh-process model needed to roll back one
+    // pending journal transaction.  This is deliberately pure model setup:
+    // it neither opens the journal nor invokes native desktop callbacks.  The
+    // caller must supply a complete, authoritative startup snapshot and then
+    // use RecoverPending with independently observed native roles.
+    //
+    // Only the journal operation identities are imported.  Their model roles
+    // are reconstructed from the pre-switch logical workspace, rather than
+    // trusting a possibly partially-mutated native role in the snapshot.
+    static std::unique_ptr<WorkspaceEngine> BootstrapPendingRecoveryModel(
+        GUID carrier, GUID parking, const SwitchPlan& pending,
+        const std::vector<WindowRecord>& authoritative_snapshot,
+        std::string* error = nullptr);
 
     const GUID& carrier() const noexcept { return carrier_; }
     const GUID& parking() const noexcept { return parking_; }
