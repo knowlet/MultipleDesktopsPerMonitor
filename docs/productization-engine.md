@@ -85,6 +85,7 @@ Run:
 .\build\vdprobe.exe workspace-engine-test
 .\build\vdprobe.exe workspace-assignment-test
 .\build\vdprobe.exe workspace-live-lifecycle-test
+.\build\vdprobe.exe workspace-readonly-host-test
 ```
 
 `WorkspaceAssignmentAdapter` is the read-only boundary between complete
@@ -111,6 +112,30 @@ capability loss, unstable identity, or lifecycle input that does not become
 quiet. The command uses the injectable Win32 discovery factory seam to avoid
 enumerating user HWNDs; `workspace-live-coordinator-bootstrap-test` separately
 validates the system discovery factory against the live shell.
+
+`WorkspaceReadOnlyHost` composes `WindowDiscovery`,
+`WorkspaceAssignmentAdapter`, `WinEventLifecycleSource`,
+`WindowLifecycleAdapter`, `WorkspaceCoordinator`, and `WorkspaceStartup` into
+one owner-thread observation boundary. The caller injects Carrier/Parking
+GUIDs, monitor/workspace topology, a complete discovery backend, a stable
+journal path, and optionally the WinEvent hook seams. `Start()` requires a
+quiet authoritative startup snapshot, `Reconcile()` requests another bounded
+complete snapshot, and `Stop()` verifies lifecycle cleanup.
+
+`workspace-readonly-host-test` is deterministic and non-mutating. It uses
+synthetic HWND identities and injected discovery/hook functions, performs no
+COM or native window calls, and installs no move, observe, or recovery
+callback. It checks initial population, subsequent Carrier-window discovery,
+preservation of the last valid model after discovery failure, owner-thread
+hook shutdown, and startup blocking when a durable transaction is pending.
+Because recovery requires mutation-capable callbacks, this host deliberately
+leaves a pending journal blocked and unchanged.
+
+This is a composition/test host, not a production process or live-shell host.
+It does not choose the system capability provider, persistent monitor/workspace
+configuration, production journal location, message-loop or periodic-rescan
+policy, focus/Z-order policy, hotkeys, or UI. Its test is not compatibility
+evidence and does not support a `GO-PRODUCTIZATION` claim.
 
 This test performs no COM calls and no native desktop/window mutation. It
 currently verifies:

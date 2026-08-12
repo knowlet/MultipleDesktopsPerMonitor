@@ -72,6 +72,7 @@ Gated feasibility tests:
 | `vdprobe workspace-assignment-test` | productization boundary: deterministic, non-mutating discovery-to-workspace assignment with identity preservation and fail-closed Carrier/Parking checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 | `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |
+| `vdprobe workspace-readonly-host-test` | productization composition boundary: deterministic, non-mutating injected discovery, assignment, owner-thread lifecycle, coordinator, and startup wiring; no real HWND, COM, move, observe, or recovery callback is used |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -274,6 +275,27 @@ requires a second full reconciliation. Malformed journals, missing pending
 identities, unavailable/unstable lifecycle input, and recovery failures remain
 blocked with the journal retained. The boundary does not choose discovery or
 native move policy; its deterministic test uses only in-memory callbacks.
+
+[`src/workspace_readonly_host.{h,cpp}`](src/workspace_readonly_host.h) composes
+those reusable boundaries into one owner-thread, observation-only runtime. A
+caller supplies Carrier/Parking GUIDs, monitor/workspace topology, a complete
+`WindowDiscoveryBackend`, a stable journal path, and optionally injectable
+WinEvent hook functions. `Start()` installs the lifecycle source and passes
+through the fail-closed startup gate; `Reconcile()` performs another bounded,
+authoritative complete reconciliation; `Stop()` verifies lifecycle-hook
+shutdown. The assignment adapter omits unsupported, ambiguous, and unassigned
+Parking observations and preserves the engine model when discovery fails.
+
+`workspace-readonly-host-test` uses only injected identities, discovery, and
+hook functions. It verifies authoritative startup, a newly appeared Carrier
+window joining the configured active workspace, discovery failure preserving
+the last valid model, owner-thread shutdown, and a pending durable transaction
+blocking startup. The host intentionally installs no native move, observe, or
+recovery callback, so it cannot switch workspaces or recover a pending journal.
+It also does not choose a system discovery/capability provider, production
+monitor/workspace IDs, journal location, message-loop or periodic-rescan
+policy, focus/Z-order policy, hotkeys, or UI. It is not a long-running product
+manager and does not establish live-shell compatibility evidence.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with
