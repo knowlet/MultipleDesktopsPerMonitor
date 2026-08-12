@@ -21,6 +21,7 @@
 #include "workspace_assignment.h"
 #include "workspace_coordinator.h"
 #include "workspace_live_lifecycle.h"
+#include "workspace_readonly_host.h"
 #include "workspace_startup.h"
 
 namespace {
@@ -115,6 +116,10 @@ void Usage() {
         "  workspace-startup-test\n"
         "                      exercise fail-closed startup ordering, stable\n"
         "                      journal recovery, and fresh-model reconciliation\n"
+        "  workspace-readonly-host-test\n"
+        "                      exercise the reusable non-mutating discovery,\n"
+        "                      assignment, lifecycle, coordinator, and startup\n"
+        "                      host boundary with injected platform seams\n"
         "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
@@ -242,6 +247,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceCoordinatorTest();
     } else if (cmd == "workspace-startup-test") {
         rc = vd::CmdWorkspaceStartupTest();
+    } else if (cmd == "workspace-readonly-host-test") {
+        rc = vd::CmdWorkspaceReadOnlyHostTest();
     } else if (cmd == "real-app-child") {
         // Internal helper launched by real-app-semantics-test.  It is not
         // documented as a standalone probe command.
