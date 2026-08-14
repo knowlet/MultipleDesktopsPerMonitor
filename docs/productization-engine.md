@@ -273,6 +273,34 @@ is refused. If ImmersiveShell access is denied before probe creation, it emits
 `RESULT=ENVIRONMENT-BLOCKED`, `mutation_started=no`, and exit status `77`.
 That status is an environment limitation, not live semantics evidence.
 
+The interactive run on the live shell completed the full gate with
+`RESULT=PASS`:
+
+```text
+RESULT=PASS
+mutation_started=yes
+
+spawned vdprobe probes A1/A2 on Monitor A, B1 on Monitor B
+setup:  A2 -> Parking                      verified
+initial authoritative reconcile           PASS
+A1 -> A2: A1 -> Parking, A2 -> Carrier     PASS
+A2 -> A1: A2 -> Parking, A1 -> Carrier     PASS
+restore: A2 -> Carrier                     verified
+probe window close                         PASS
+monitor B unchanged                        PASS
+stable journal pending                     no
+stable journal cleanup                     PASS
+probe cleanup/restoration                  PASS
+```
+
+Every native move revalidated the HWND generation, monitor, `GetViewForHwnd`,
+and `CanViewMoveDesktops`; Monitor B and the session-global Carrier stayed
+unchanged throughout, no `CurrentVirtualDesktopChanged` was reported, and the
+stable journal contained no pending transaction at exit. This closes the live
+probe-owned manager gate: the composed discovery, assignment, lifecycle,
+coordinator, and journal boundaries execute a complete monitor-local
+A1 -> A2 -> A1 round-trip on the live shell.
+
 ## Deliberate next boundaries
 
 The controlled `logical-workspace-test` now provides live integration
