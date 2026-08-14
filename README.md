@@ -221,7 +221,9 @@ assignment policy, log level, journal, tray) is documented in
 reconciliation, graceful shutdown) is documented in
 [docs/host.md](docs/host.md). Monitor topology suspend/recover, sleep/resume,
 and Shell-loss resilience are documented in
-[docs/resilience.md](docs/resilience.md). Run
+[docs/resilience.md](docs/resilience.md). Compatibility quarantine
+(auto-quarantine on rollback/anomaly, sticky exclusion, user override) is
+documented in [docs/quarantine.md](docs/quarantine.md). Run
 `workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
