@@ -66,6 +66,15 @@ the last-active workspace per monitor is persisted as `active <name>`.
 Invalid files fail safe: the previous configuration is never partially
 applied.
 
+## Runtime reload
+
+`workspace-manager --reload` (or the tray Reload item) reloads the config
+file transactionally: parse, validate, and map to the current monitors first;
+only then are hotkeys re-registered and the migration/quarantine policy
+applied. An invalid file keeps the previous configuration in full effect and
+reports the exact field/value problem. Monitor/workspace topology changes
+require a restart.
+
 ## Validation summary
 
 `workspace-manager-test` covers: valid v1 parsing, hotkey dispatch

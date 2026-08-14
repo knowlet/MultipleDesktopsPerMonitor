@@ -31,8 +31,26 @@ The host owns a hidden message window that:
   `WorkspaceCoordinator::Switch`;
 - runs a periodic authoritative reconciliation (`WM_TIMER`, 3 s interval);
 - serves a tray icon whose menu exposes switch commands, diagnostics, and
-  exit;
+  exit (Switch monitor A -> A2/A1, Status, Diagnostics, Reload configuration,
+  Exit);
 - handles `WM_QUERYENDSESSION` and `WM_CLOSE` for graceful shutdown.
+
+## Configuration reload
+
+`workspace-manager --reload` (or the tray Reload item) asks the host to
+reload the config file transactionally: the new file is parsed and validated
+and mapped to the current monitors before anything changes. An invalid file is
+rejected and the previous configuration stays fully in effect with a clear
+message; a valid file re-registers hotkeys and applies the migration and
+quarantine policy. Monitor/workspace topology changes still require a restart.
+
+## Status and diagnostics
+
+The tray Status item prints the current active workspace per monitor plus
+reconcile/switch/quarantine counters; Diagnostics prints the same counters
+with the hotkey dispatch total. The shutdown summary includes uptime
+reconciliations, hotkey dispatches, committed switches, quarantine entries,
+display-change and resume events, and shell re-acquire attempts.
 
 ## Graceful shutdown
 
