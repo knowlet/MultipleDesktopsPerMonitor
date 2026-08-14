@@ -389,14 +389,44 @@ production journal/bootstrap policy.
 ordering boundary. Its caller supplies the normal engine/coordinator,
 authoritative discovery callback, lifecycle source, stable journal path, and a
 factory for the fresh recovery runtime. It starts and verifies the WinEvent
-source, reads the journal before enabling operations, requires a complete quiet
-snapshot, and for a pending transaction bootstraps a fresh model, recovers it,
-then requires full reconciliation. Journal parse errors, unproven identities,
+source and reads the journal before enabling operations.
+
+The journal is a two-state WAL. `BEGIN` + `MOVE` records describe the
+prepared switch; the terminal `COMMIT` record now carries the logical switch
+itself (`COMMIT <monitor> <from> <to>`), so a crash between the durable
+COMMIT flush and the in-memory commit leaves a replayable logical state
+instead of an unreadable vacuum window (`ReadJournalState` returns
+`pending` or `committed`; `ReadPending` keeps its old contract). At startup:
+
+- a pending transaction bootstraps a fresh model
+  (`BootstrapPendingRecoveryModel`), rolls it back, then requires full
+  reconciliation;
+- a committed transaction replays the logical ownership into the already
+  configured normal engine (`ReplayCommitted`: monitor active = to,
+  Carrier-moved windows in `to`, Parking-moved windows in `from`) with no
+  native moves, then reconciles.
+
+The recovery snapshot is deliberately assignment-neutral: the production
+host feeds `RecoverAtStartup` a raw discovery mapping (workspace left
+unassigned) instead of the assignment adapter output, because the adapter
+drops untracked Parking-native windows and would make a partially-moved
+transaction unprovable. Logical ownership is derived from the journal plan,
+never from a snapshot guess. Journal parse errors, unproven identities,
 lifecycle instability, and every recovery failure block operations and retain
-the journal. `workspace-startup-test` is deterministic and uses only
-in-memory move/observation callbacks; it does not mutate native windows or
-desktops. This is a boundary, not a claim that a long-running product host or
-journal-location policy is complete.
+the journal.
+
+The production host (`workspace-manager --run --confirm-mutate`) wires
+`RecoverAtStartup` with a recovery-runtime factory that rebuilds the
+discovery/assignment stack against the fresh engine, so a recovered runtime
+keeps managing the full configured monitor topology. Startup reports
+`startup recovery: pending transaction rolled back and reconciled` or
+`startup recovery: committed switch replayed and reconciled`. The
+deterministic `workspace-startup-test` covers clean, pending, committed
+replay, malformed, missing-identity, unstable, and unavailable-lifecycle
+paths with in-memory move/observation callbacks; a live crash-after-COMMIT
+injection (journal copied mid-switch from the live manager gate, then
+restarted through the production host) verified the committed replay and
+reconciliation on the interactive host.
 
 The live command was also attempted on the current host. `GetImmersiveShell`
 returned `E_ACCESSDENIED` before any probe window was spawned, so the command

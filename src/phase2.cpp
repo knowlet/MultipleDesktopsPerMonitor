@@ -8125,20 +8125,6 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
                   "vdprobe-workspace-manager.journal"
             : config.journal_path;
     WorkspaceJournal journal(journal_path);
-    std::string journal_error;
-    const std::optional<SwitchPlan> existing_pending =
-        journal.ReadPending(&journal_error);
-    if (!journal_error.empty() || existing_pending) {
-        Field("journal", journal_path.string());
-        Field("result", "ENVIRONMENT-BLOCKED");
-        Field("reason",
-              !journal_error.empty()
-                  ? "stable journal could not be read: " + journal_error
-                  : "stable journal contains a pending transaction; startup "
-                    "recovery is wired in the next milestone");
-        release_mutex();
-        return kExitInconclusive;
-    }
     Field("journal", journal_path.string());
 
     Com<IServiceProvider> sp;
@@ -8321,10 +8307,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     }
 
     bool capability_access_denied = false;
-    Win32WindowDiscoveryOptions options;
-    options.carrier = carrier.id;
-    options.parking = parking.id;
-    options.augment_capabilities =
+    auto augment_capabilities =
         [&](HWND hwnd, const WindowDiscoveryObservation& observation,
             WindowCapabilities& capabilities, std::string* aug_error) {
             (void)observation;
@@ -8348,6 +8331,10 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             capabilities.can_move_desktops = value != FALSE;
             return true;
         };
+    Win32WindowDiscoveryOptions options;
+    options.carrier = carrier.id;
+    options.parking = parking.id;
+    options.augment_capabilities = augment_capabilities;
     HRESULT backend_hr = S_OK;
     auto backend = CreateSystemWindowDiscoveryBackend(
         std::move(options), &error, &backend_hr);
@@ -8367,6 +8354,36 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             !assignment.ConvertCompleteSnapshot(complete, records,
                                                 local_error)) {
             return false;
+        }
+        return true;
+    };
+    // Recovery snapshots must prove journal identities regardless of their
+    // current native role: the assignment adapter deliberately drops
+    // untracked Parking-native windows, which would make a partially-moved
+    // transaction unprovable at startup.  Workspace ownership is left
+    // unassigned (0) here and derived from the journal plan by the recovery
+    // model; assignment still governs the live discovery path.
+    auto discover_raw_snapshot = [&](std::vector<WindowRecord>& records,
+                                     std::string* local_error) {
+        std::vector<DiscoveredWindow> complete;
+        if (!discovery.Discover(complete, local_error)) return false;
+        records.clear();
+        records.reserve(complete.size());
+        for (const DiscoveredWindow& window : complete) {
+            if (!window.identity.IsValid() ||
+                window.disposition == WindowDisposition::Closed) {
+                continue;
+            }
+            WindowRecord record;
+            record.identity = window.identity;
+            record.monitor = reinterpret_cast<MonitorId>(window.monitor);
+            record.workspace = 0;
+            record.native_role = window.native_role;
+            record.capabilities = window.capabilities;
+            record.presentation = window.presentation;
+            record.disposition = window.disposition;
+            record.present = true;
+            records.push_back(std::move(record));
         }
         return true;
     };
@@ -8400,16 +8417,151 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         engine, lifecycle, source, coordinator_discovery, move_to_role,
         observe_role, &journal, 10, 5);
 
-    const CoordinatorResult initial = coordinator.ReconcileDiscovery();
-    if (!initial.succeeded()) {
+    // Pending journal transactions are rolled back and committed journal
+    // transactions are replayed by WorkspaceStartup before the host loop
+    // exposes any switch.  The recovery runtime factory rebuilds the
+    // discovery/assignment stack against the fresh engine so the recovered
+    // runtime is fully functional for the rest of the process.
+    auto make_recovery_runtime =
+        [&](std::unique_ptr<WorkspaceEngine> recovered_engine,
+            const WorkspaceJournal& recovery_journal,
+            std::string* factory_error)
+        -> std::unique_ptr<WorkspaceStartupRecoveryRuntime> {
+        if (!recovered_engine) {
+            if (factory_error) *factory_error = "recovery engine is null";
+            return nullptr;
+        }
+        auto runtime = std::make_unique<WorkspaceStartupRecoveryRuntime>();
+        runtime->engine = std::move(recovered_engine);
+        runtime->engine->SetAutoQuarantine(config.quarantine_enabled);
+        runtime->assignment =
+            std::make_unique<WorkspaceAssignmentAdapter>(*runtime->engine);
+        runtime->assignment->SetMonitorMigrationPolicy(config.migration_policy);
+
+        // The bootstrapped recovery engine only knows the journal monitor.
+        // Complete it with the remaining configured monitors so the
+        // recovered runtime keeps managing the whole topology; a monitor
+        // whose bootstrap workspace set differs from configuration fails
+        // closed (multi-workspace recovery is a later milestone).
+        for (const ManagerRuntimeTopology::MonitorBinding& binding :
+             topology.monitors) {
+            const MonitorWorkspaceState* state =
+                runtime->engine->Monitor(binding.real_monitor);
+            if (state == nullptr) {
+                if (!runtime->engine->AddMonitor(
+                        binding.real_monitor, binding.active,
+                        binding.workspace_ids, factory_error)) {
+                    return nullptr;
+                }
+                state = runtime->engine->Monitor(binding.real_monitor);
+            } else {
+                const bool same_set =
+                    state->workspaces.size() == binding.workspace_ids.size() &&
+                    std::all_of(binding.workspace_ids.begin(),
+                                binding.workspace_ids.end(),
+                                [&](WorkspaceId id) {
+                                    return std::find(state->workspaces.begin(),
+                                                     state->workspaces.end(),
+                                                     id) !=
+                                           state->workspaces.end();
+                                });
+                if (!same_set) {
+                    if (factory_error) {
+                        *factory_error =
+                            "recovery engine monitor workspace set differs "
+                            "from configuration (restart required)";
+                    }
+                    return nullptr;
+                }
+            }
+            if (!runtime->assignment->ConfigureMonitor(
+                    binding.real_monitor, state->active, state->workspaces,
+                    factory_error)) {
+                return nullptr;
+            }
+        }
+        Win32WindowDiscoveryOptions recovered_options;
+        recovered_options.carrier = carrier.id;
+        recovered_options.parking = parking.id;
+        recovered_options.augment_capabilities = augment_capabilities;
+        HRESULT recovered_backend_hr = S_OK;
+        auto recovered_backend = CreateSystemWindowDiscoveryBackend(
+            std::move(recovered_options), factory_error,
+            &recovered_backend_hr);
+        if (!recovered_backend) return nullptr;
+        runtime->discovery =
+            std::make_unique<WindowDiscovery>(std::move(*recovered_backend));
+        WorkspaceStartupRecoveryRuntime* runtime_ptr = runtime.get();
+        auto recovered_discover =
+            [runtime_ptr](std::vector<WindowRecord>& records,
+                         std::string* local_error) {
+                std::vector<DiscoveredWindow> complete;
+                if (!runtime_ptr->discovery->Discover(complete, local_error) ||
+                    !runtime_ptr->assignment->ConvertCompleteSnapshot(
+                        complete, records, local_error)) {
+                    return false;
+                }
+                return true;
+            };
+        auto recovered_observe_owned =
+            [runtime_ptr, recovered_discover](
+                HWND hwnd) -> std::optional<WindowRecord> {
+                std::vector<WindowRecord> records;
+                std::string local_error;
+                if (!recovered_discover(records, &local_error)) {
+                    return std::nullopt;
+                }
+                const auto found = std::find_if(
+                    records.begin(), records.end(),
+                    [hwnd](const WindowRecord& record) {
+                        return record.identity.hwnd == hwnd;
+                    });
+                return found == records.end()
+                           ? std::nullopt
+                           : std::optional<WindowRecord>(*found);
+            };
+        runtime->lifecycle = std::make_unique<WindowLifecycleAdapter>(
+            *runtime->engine, recovered_observe_owned);
+        auto recovered_coordinator_discovery =
+            [runtime_ptr, recovered_discover, &source](
+                std::vector<WindowRecord>& records,
+                std::string* local_error) {
+                if (!source.PumpOwnerThreadMessages(local_error)) {
+                    return false;
+                }
+                return recovered_discover(records, local_error);
+            };
+        runtime->coordinator = std::make_unique<WorkspaceCoordinator>(
+            *runtime->engine, *runtime->lifecycle, source,
+            recovered_coordinator_discovery, move_to_role, observe_role,
+            &recovery_journal, 10, 5);
+        return runtime;
+    };
+    WorkspaceStartup startup(engine, coordinator, source,
+                            discover_raw_snapshot, carrier.id, parking.id,
+                            journal_path, make_recovery_runtime, 3);
+    const WorkspaceStartupResult startup_result = startup.RecoverAtStartup();
+    if (!startup_result.ready()) {
         Field("result", capability_access_denied ? "ENVIRONMENT-BLOCKED"
                                                  : "ERROR");
-        Field("reason", "initial reconcile failed: " + initial.error);
+        Field("reason", startup_result.error.empty()
+                            ? "startup recovery blocked"
+                            : startup_result.error);
         source.Stop();
         release_mutex();
         return capability_access_denied ? kExitInconclusive : 1;
     }
-    if (!engine.CheckInvariant(&error)) {
+    WorkspaceEngine* active_engine = startup.active_engine();
+    WorkspaceCoordinator* active_coordinator = startup.active_coordinator();
+    if (startup_result.recovered_pending) {
+        Field("startup recovery",
+              "pending transaction rolled back and reconciled");
+    }
+    if (startup_result.replayed_committed) {
+        Field("startup recovery",
+              "committed switch replayed and reconciled");
+    }
+    if (!active_engine->CheckInvariant(&error)) {
         Field("result", "ERROR");
         Field("reason", "initial invariant failed: " + error);
         source.Stop();
@@ -8417,7 +8569,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         return 1;
     }
     std::size_t managed_count = 0;
-    for (const WindowRecord* window : engine.Windows()) {
+    for (const WindowRecord* window : active_engine->Windows()) {
         if (window->disposition == WindowDisposition::Managed) {
             ++managed_count;
         }
@@ -8473,15 +8625,16 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         for (const ManagerRuntimeTopology::MonitorBinding& binding :
              topology.monitors) {
             const MonitorWorkspaceState* state =
-                engine.Monitor(binding.real_monitor);
+                active_engine->Monitor(binding.real_monitor);
             if (state == nullptr) continue;
             for (WorkspaceId workspace : state->workspaces) {
                 const WorkspaceDefinition* definition =
-                    engine.Workspace(workspace);
+                    active_engine->Workspace(workspace);
                 if (definition == nullptr) continue;
                 std::vector<std::pair<std::int64_t, WindowIdentity>> ordered;
                 for (const WindowIdentity& identity : definition->windows) {
-                    const WindowRecord* record = engine.FindWindow(identity);
+                    const WindowRecord* record =
+                        active_engine->FindWindow(identity);
                     if (record != nullptr &&
                         record->disposition == WindowDisposition::Managed &&
                         record->capabilities.Manageable() &&
@@ -8501,17 +8654,17 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
                     members.push_back(entry.second);
                 }
                 std::string local_error;
-                if (!engine.SetZOrder(binding.real_monitor, workspace,
-                                      members, &local_error)) {
+                if (!active_engine->SetZOrder(binding.real_monitor, workspace,
+                                              members, &local_error)) {
                     Print("focus snapshot error: {}\n", local_error);
                     continue;
                 }
                 for (const auto& entry : ordered) {
                     const WindowRecord* record =
-                        engine.FindWindow(entry.second);
+                        active_engine->FindWindow(entry.second);
                     if (record != nullptr &&
                         record->presentation.foreground) {
-                        (void)engine.SetLastForeground(
+                        (void)active_engine->SetLastForeground(
                             binding.real_monitor, workspace, entry.second,
                             &local_error);
                         break;
@@ -8548,10 +8701,11 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     auto restore_presentation = [&](MonitorId monitor, WorkspaceId workspace) {
         std::string restore_error;
         const std::optional<PresentationPlan> plan =
-            engine.PreparePresentationRestore(monitor, workspace,
-                                              &restore_error);
+            active_engine->PreparePresentationRestore(monitor, workspace,
+                                                     &restore_error);
         if (!plan) return;
-        const PresentationResult result = engine.ExecutePresentationRestore(
+        const PresentationResult result =
+            active_engine->ExecutePresentationRestore(
             *plan,
             [&](const WindowRecord& record) {
                 WindowIdentity current;
@@ -8588,11 +8742,12 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             Field("switch blocked", "monitor suspended");
             return;
         }
-        CoordinatorResult result = coordinator.Switch(monitor, target);
+        CoordinatorResult result =
+            active_coordinator->Switch(monitor, target);
         if (!result.succeeded() && result.transaction.rollback_succeeded &&
             !result.transaction.recovery_required &&
             result.code != CoordinatorResultCode::PlanRejected) {
-            result = coordinator.Switch(monitor, target);
+            result = active_coordinator->Switch(monitor, target);
         }
         if (result.succeeded() && result.transaction.committed) {
             ++switches_committed;
@@ -8632,7 +8787,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             degraded = true;
             return;
         }
-        const CoordinatorResult result = coordinator.ReconcileDiscovery();
+        const CoordinatorResult result =
+            active_coordinator->ReconcileDiscovery();
         if (!result.succeeded() && !result.error.empty()) {
             Print("periodic reconcile error: {}\n", result.error);
             degraded = true;
@@ -8643,12 +8799,12 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         for (const ManagerRuntimeTopology::MonitorBinding& binding :
              topology.monitors) {
             const MonitorWorkspaceState* state =
-                engine.Monitor(binding.real_monitor);
+                active_engine->Monitor(binding.real_monitor);
             text += " " + std::to_string(state ? state->active : 0);
         }
         return text + std::format(" reconciles={} switches={} quarantine={}",
                                   reconcile_count, switches_committed,
-                                  engine.QuarantineLog().size());
+                                  active_engine->QuarantineLog().size());
     };
     main_context.menu_builder = [&](HMENU menu) {
         for (const auto& entry : tray_commands) {
@@ -8740,7 +8896,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         }
         config = staged;
         topology = new_topology;
-        engine.SetAutoQuarantine(config.quarantine_enabled);
+        active_engine->SetAutoQuarantine(config.quarantine_enabled);
         assignment.SetMonitorMigrationPolicy(config.migration_policy);
         Print("config reload accepted ({} hotkeys, quarantine={})\n",
               config.bindings.size(),
@@ -8851,7 +9007,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     Field("hotkey dispatches", std::format("{}", hotkey_dispatches));
     Field("switches committed", std::format("{}", switches_committed));
     Field("quarantine entries",
-          std::format("{}", engine.QuarantineLog().size()));
+          std::format("{}", active_engine->QuarantineLog().size()));
     Field("display changes handled",
           std::format("{}", resilience.display_changes_handled));
     Field("resume events handled",
@@ -8863,7 +9019,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     const std::optional<SwitchPlan> pending =
         journal.ReadPending(&pending_error);
     bool ok = !loop_error && !pending && pending_error.empty() &&
-              engine.CheckInvariant(&error);
+              active_engine->CheckInvariant(&error);
     source.Stop();
     ok = ok && source.shutdown_ok();
     Field("stable journal pending", pending ? "YES" : "no");

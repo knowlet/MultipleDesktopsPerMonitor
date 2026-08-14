@@ -128,6 +128,17 @@ struct SwitchPlan {
     std::vector<SwitchOperation> operations;
 };
 
+// Durable journal state read at startup. pending is a transaction that was
+// begun but never finished; committed is a transaction whose COMMIT record
+// was already flushed durably. A committed transaction must be replayed into
+// the logical model (native windows are already post-switch) instead of
+// being rolled back.
+struct JournalReadResult {
+    std::optional<SwitchPlan> pending;
+    std::optional<SwitchPlan> committed;
+};
+
+
 enum class PresentationOperationKind {
     RestorePlacement,
     RestoreZOrder,
@@ -190,11 +201,15 @@ class WorkspaceJournal {
     const std::filesystem::path& path() const noexcept { return path_; }
 
     bool Begin(const SwitchPlan& plan, std::string* error = nullptr) const;
-    bool Commit(std::string* error = nullptr) const;
+    // The COMMIT record carries the logical switch (monitor/from/to) so a
+    // crash between the durable COMMIT and the in-memory CommitPlan leaves a
+    // replayable logical state instead of an unreadable vacuum window.
+    bool Commit(const SwitchPlan& plan, std::string* error = nullptr) const;
     bool Abort(std::string* error = nullptr) const;
     bool Recovered(std::string* error = nullptr) const;
 
     std::optional<SwitchPlan> ReadPending(std::string* error = nullptr) const;
+    JournalReadResult ReadJournalState(std::string* error = nullptr) const;
 
    private:
     bool Append(const std::string& line, std::string* error) const;
@@ -231,6 +246,17 @@ class WorkspaceEngine {
         GUID carrier, GUID parking, const SwitchPlan& pending,
         const std::vector<WindowRecord>& authoritative_snapshot,
         std::string* error = nullptr);
+
+    // Adopts one durable committed switch into this (already configured)
+    // engine: native windows are already post-switch, so the model restores
+    // the logical ownership the COMMIT recorded (monitor active = to,
+    // Carrier-moved windows in to, Parking-moved windows in from) instead of
+    // rolling anything back. The authoritative startup snapshot must prove
+    // every committed identity. The caller reconciles afterwards.
+    bool ReplayCommitted(const SwitchPlan& committed,
+                         const std::vector<WindowRecord>&
+                             authoritative_snapshot,
+                         std::string* error = nullptr);
 
     const GUID& carrier() const noexcept { return carrier_; }
     const GUID& parking() const noexcept { return parking_; }

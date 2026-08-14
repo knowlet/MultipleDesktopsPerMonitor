@@ -29,7 +29,7 @@ WorkspaceStartup::WorkspaceStartup(
       max_snapshot_attempts_(std::max<std::size_t>(1, max_snapshot_attempts)) {}
 
 WorkspaceStartupResult WorkspaceStartup::Blocked(std::string error) const {
-    return {WorkspaceStartupState::Blocked, false, std::move(error)};
+    return {WorkspaceStartupState::Blocked, false, false, std::move(error)};
 }
 
 bool WorkspaceStartup::CaptureQuietCompleteSnapshot(
@@ -81,58 +81,92 @@ WorkspaceStartupResult WorkspaceStartup::RecoverAtStartup() {
         return Blocked("lifecycle source is unavailable at startup");
     }
 
-    const std::optional<SwitchPlan> pending = journal_.ReadPending(&error);
+    const JournalReadResult state = journal_.ReadJournalState(&error);
     if (!error.empty()) return Blocked("journal read failed: " + error);
 
-    if (!pending) {
-        const CoordinatorResult reconciled = normal_coordinator_.ReconcileDiscovery();
+    // No durable transaction: the normal model/coordinator performs the
+    // first authoritative reconciliation. A committed reconcile plan
+    // (monitor == 0) also needs no logical replay: reconcile commits only
+    // touch native roles, which every startup re-observes anyway.
+    if (!state.pending &&
+        (!state.committed || state.committed->monitor == 0)) {
+        const CoordinatorResult reconciled =
+            normal_coordinator_.ReconcileDiscovery();
         if (!reconciled.succeeded()) {
             return Blocked("initial complete reconciliation failed: " +
                            reconciled.error);
         }
-        return {WorkspaceStartupState::Ready, false, {}};
+        return {WorkspaceStartupState::Ready, false, false, {}};
     }
 
     // Do not let journal contents alone create a recovery model. A quiet,
-    // complete snapshot must independently prove every pending identity.
+    // complete snapshot must independently prove every journal identity.
     std::vector<WindowRecord> snapshot;
     if (!CaptureQuietCompleteSnapshot(snapshot, &error)) {
         return Blocked(error);
     }
-    std::unique_ptr<WorkspaceEngine> recovered =
-        WorkspaceEngine::BootstrapPendingRecoveryModel(
-            carrier_, parking_, *pending, snapshot, &error);
-    if (!recovered) {
-        return Blocked(error.empty() ? "pending recovery model bootstrap failed" : error);
+
+    if (state.pending) {
+        std::unique_ptr<WorkspaceEngine> recovered =
+            WorkspaceEngine::BootstrapPendingRecoveryModel(
+                carrier_, parking_, *state.pending, snapshot, &error);
+        if (!recovered) {
+            return Blocked(error.empty()
+                               ? "pending recovery model bootstrap failed"
+                               : error);
+        }
+        if (!make_recovery_runtime_) {
+            return Blocked(
+                "pending recovery runtime factory is unavailable");
+        }
+        std::unique_ptr<WorkspaceStartupRecoveryRuntime> runtime;
+        try {
+            runtime = make_recovery_runtime_(std::move(recovered), journal_,
+                                            &error);
+        } catch (const std::exception& exception) {
+            return Blocked(std::string(
+                           "pending recovery runtime factory threw: ") +
+                           exception.what());
+        } catch (...) {
+            return Blocked("pending recovery runtime factory threw");
+        }
+        if (!runtime || !runtime->engine || !runtime->lifecycle ||
+            !runtime->coordinator) {
+            return Blocked(error.empty()
+                               ? "pending recovery runtime is incomplete"
+                               : error);
+        }
+        const CoordinatorResult recovery =
+            runtime->coordinator->RecoverPending();
+        if (!recovery.succeeded()) {
+            return Blocked("pending recovery failed: " + recovery.error);
+        }
+        // Recovery changes native roles through caller callbacks. Require a
+        // new full reconciliation before exposing normal operations or READY.
+        const CoordinatorResult reconciled =
+            runtime->coordinator->ReconcileDiscovery();
+        if (!reconciled.succeeded()) {
+            return Blocked("post-recovery complete reconciliation failed: " +
+                           reconciled.error);
+        }
+        recovery_runtime_ = std::move(runtime);
+        return {WorkspaceStartupState::Ready, true, false, {}};
     }
-    if (!make_recovery_runtime_) {
-        return Blocked("pending recovery runtime factory is unavailable");
+
+    // A durable COMMIT means the native switch already completed: replay the
+    // committed logical state into the already-configured normal engine
+    // (which owns every configured monitor) instead of rolling anything
+    // back, then reconcile through the normal coordinator.
+    if (!normal_engine_.ReplayCommitted(*state.committed, snapshot, &error)) {
+        return Blocked(error.empty() ? "committed replay failed" : error);
     }
-    std::unique_ptr<WorkspaceStartupRecoveryRuntime> runtime;
-    try {
-        runtime = make_recovery_runtime_(std::move(recovered), journal_, &error);
-    } catch (const std::exception& exception) {
-        return Blocked(std::string("pending recovery runtime factory threw: ") +
-                       exception.what());
-    } catch (...) {
-        return Blocked("pending recovery runtime factory threw");
-    }
-    if (!runtime || !runtime->engine || !runtime->lifecycle || !runtime->coordinator) {
-        return Blocked(error.empty() ? "pending recovery runtime is incomplete" : error);
-    }
-    const CoordinatorResult recovery = runtime->coordinator->RecoverPending();
-    if (!recovery.succeeded()) {
-        return Blocked("pending recovery failed: " + recovery.error);
-    }
-    // Recovery changes native roles through caller callbacks. Require a new
-    // full reconciliation before exposing either normal operations or READY.
-    const CoordinatorResult reconciled = runtime->coordinator->ReconcileDiscovery();
+    const CoordinatorResult reconciled =
+        normal_coordinator_.ReconcileDiscovery();
     if (!reconciled.succeeded()) {
-        return Blocked("post-recovery complete reconciliation failed: " +
+        return Blocked("post-commit replay reconciliation failed: " +
                        reconciled.error);
     }
-    recovery_runtime_ = std::move(runtime);
-    return {WorkspaceStartupState::Ready, true, {}};
+    return {WorkspaceStartupState::Ready, false, true, {}};
 }
 
 WorkspaceEngine* WorkspaceStartup::active_engine() const noexcept {
@@ -262,10 +296,17 @@ int CmdWorkspaceStartupTest() {
             {first, 1, 10, roles[first], capabilities},
             {second, 1, 11, roles[second], capabilities}};
     };
+    // The production recovery snapshot is raw (workspace unassigned); the
+    // journal plan is the authority for pre-switch logical ownership.
+    auto pending_raw_snapshot = [&] {
+        return std::vector<WindowRecord>{
+            {first, 1, 0, roles[first], capabilities},
+            {second, 1, 0, roles[second], capabilities}};
+    };
     WorkspaceStartup pending_startup(
         pending_normal, pending_normal_coordinator, pending_source,
         [&](std::vector<WindowRecord>& observed, std::string*) {
-            observed = recovered_snapshot();
+            observed = pending_raw_snapshot();
             return true;
         },
         carrier, parking, pending_path,
@@ -302,6 +343,115 @@ int CmdWorkspaceStartupTest() {
                             pending_read_error.empty();
     pending_source.Stop();
     ok = ok && pending_ok && pending_source.shutdown_ok() && RemoveTestJournal(pending_path);
+
+    // A durable COMMIT (crash after COMMIT flushed, before CommitPlan) must
+    // be replayed, not rolled back: the fresh model adopts the post-switch
+    // logical state and no move callback is ever invoked.
+    const std::filesystem::path committed_path = TestJournalPath("committed");
+    RemoveTestJournal(committed_path);
+    WorkspaceEngine committed_seed(carrier, parking);
+    ok = committed_seed.AddMonitor(1, 10, {10, 11}, &error) && ok;
+    ok = (committed_seed.UpsertWindow(
+            {first, 1, 10, NativeDesktopRole::Carrier, capabilities}, &error) ==
+         UpsertResult::Added) &&
+        ok;
+    ok = (committed_seed.UpsertWindow(
+            {second, 1, 11, NativeDesktopRole::Parking, capabilities}, &error) ==
+         UpsertResult::Added) &&
+        ok;
+    const std::optional<SwitchPlan> committed_plan =
+        committed_seed.PrepareSwitch(1, 11, &error);
+    WorkspaceJournal committed_journal(committed_path);
+    const bool committed_durable =
+        committed_plan && committed_journal.Begin(*committed_plan, &error) &&
+        committed_journal.Commit(*committed_plan, &error);
+    std::string committed_read_error;
+    const JournalReadResult committed_state =
+        committed_journal.ReadJournalState(&committed_read_error);
+    const bool committed_format_ok = committed_durable &&
+                                     committed_read_error.empty() &&
+                                     !committed_state.pending &&
+                                     committed_state.committed.has_value() &&
+                                     committed_state.committed->monitor == committed_plan->monitor &&
+                                     committed_state.committed->from_workspace == committed_plan->from_workspace &&
+                                     committed_state.committed->to_workspace == committed_plan->to_workspace &&
+                                     committed_state.committed->operations.size() == committed_plan->operations.size();
+    WorkspaceEngine committed_normal(carrier, parking);
+    ok = committed_normal.AddMonitor(1, 10, {10, 11}, &error) && ok;
+    WinEventLifecycleSource committed_source(install, remove);
+    WindowLifecycleAdapter committed_normal_lifecycle(committed_normal, {});
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        committed_roles{{first, NativeDesktopRole::Parking},
+                       {second, NativeDesktopRole::Carrier}};
+    int committed_moves = 0;
+    int committed_factory_calls = 0;
+    auto committed_snapshot = [&] {
+        return std::vector<WindowRecord>{
+            {first, 1, 10, committed_roles[first], capabilities},
+            {second, 1, 11, committed_roles[second], capabilities}};
+    };
+    auto committed_raw_snapshot = [&] {
+        return std::vector<WindowRecord>{
+            {first, 1, 0, committed_roles[first], capabilities},
+            {second, 1, 0, committed_roles[second], capabilities}};
+    };
+    WorkspaceCoordinator committed_normal_coordinator(
+        committed_normal, committed_normal_lifecycle, committed_source,
+        [&](std::vector<WindowRecord>& observed, std::string*) {
+            observed = committed_snapshot();
+            return true;
+        },
+        [&](const WindowRecord& record, NativeDesktopRole target) {
+            ++committed_moves;
+            committed_roles[record.identity] = target;
+            return true;
+        },
+        [&](const WindowRecord& record) {
+            return committed_roles[record.identity];
+        },
+        &committed_journal, 2);
+    WorkspaceStartup committed_startup(
+        committed_normal, committed_normal_coordinator, committed_source,
+        [&](std::vector<WindowRecord>& observed, std::string*) {
+            observed = committed_raw_snapshot();
+            return true;
+        },
+        carrier, parking, committed_path,
+        [&](std::unique_ptr<WorkspaceEngine>, const WorkspaceJournal&,
+            std::string*) {
+            // The committed path replays into the normal engine and must
+            // never need a recovery runtime factory.
+            ++committed_factory_calls;
+            return std::unique_ptr<WorkspaceStartupRecoveryRuntime>{};
+        });
+    const WorkspaceStartupResult committed = committed_durable
+        ? committed_startup.RecoverAtStartup() : WorkspaceStartupResult{};
+    const WorkspaceEngine* committed_active = committed_startup.active_engine();
+    const MonitorWorkspaceState* committed_monitor =
+        committed_active == nullptr ? nullptr : committed_active->Monitor(1);
+    const WindowRecord* committed_first =
+        committed_active == nullptr ? nullptr
+                                   : committed_active->FindWindow(first);
+    const WindowRecord* committed_second =
+        committed_active == nullptr ? nullptr
+                                   : committed_active->FindWindow(second);
+    const bool committed_ok = committed_format_ok && committed.ready() &&
+                             committed.replayed_committed &&
+                             !committed.recovered_pending &&
+                             committed_active == &committed_normal &&
+                             committed_monitor != nullptr &&
+                             committed_monitor->active == 11 &&
+                             committed_first != nullptr &&
+                             committed_first->workspace == 10 &&
+                             committed_first->native_role == NativeDesktopRole::Parking &&
+                             committed_second != nullptr &&
+                             committed_second->workspace == 11 &&
+                             committed_second->native_role == NativeDesktopRole::Carrier &&
+                             committed_moves == 0 &&
+                             committed_factory_calls == 0;
+    committed_source.Stop();
+    ok = ok && committed_ok && committed_source.shutdown_ok() &&
+         RemoveTestJournal(committed_path);
 
     // A malformed durable record, a snapshot missing a journal identity, and
     // an unavailable lifecycle source all block before any move callback.
@@ -418,6 +568,8 @@ int CmdWorkspaceStartupTest() {
 
     Field("clean READY authoritative snapshot/no move", clean_ok ? "PASS" : "FAIL");
     Field("pending fresh recovery then reconcile", pending_ok ? "PASS" : "FAIL");
+    Field("committed replay adopts logical state without moves",
+          committed_ok ? "PASS" : "FAIL");
     Field("malformed journal blocks and remains", malformed_ok ? "PASS" : "FAIL");
     Field("missing pending identity blocks and remains", missing_ok ? "PASS" : "FAIL");
     Field("unstable lifecycle blocks and remains", unstable_ok ? "PASS" : "FAIL");

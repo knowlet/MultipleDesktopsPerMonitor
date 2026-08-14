@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "workspace_coordinator.h"
+#include "window_discovery.h"
+#include "workspace_assignment.h"
 
 namespace vd {
 
@@ -19,6 +21,7 @@ enum class WorkspaceStartupState {
 struct WorkspaceStartupResult {
     WorkspaceStartupState state = WorkspaceStartupState::Blocked;
     bool recovered_pending = false;
+    bool replayed_committed = false;
     std::string error;
 
     bool ready() const noexcept { return state == WorkspaceStartupState::Ready; }
@@ -31,6 +34,10 @@ struct WorkspaceStartupRecoveryRuntime {
     std::unique_ptr<WorkspaceEngine> engine;
     std::unique_ptr<WindowLifecycleAdapter> lifecycle;
     std::unique_ptr<WorkspaceCoordinator> coordinator;
+    // The discovery/assignment stack is owned here so the coordinator's
+    // complete-snapshot callbacks remain valid for the whole runtime.
+    std::unique_ptr<WindowDiscovery> discovery;
+    std::unique_ptr<WorkspaceAssignmentAdapter> assignment;
 };
 
 class WorkspaceStartup {

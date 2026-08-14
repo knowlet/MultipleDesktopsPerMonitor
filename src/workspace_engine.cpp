@@ -243,8 +243,15 @@ bool WorkspaceJournal::Begin(const SwitchPlan& plan, std::string* error) const {
     }
 }
 
-bool WorkspaceJournal::Commit(std::string* error) const {
-    return Append("COMMIT", error);
+bool WorkspaceJournal::Commit(const SwitchPlan& plan, std::string* error) const {
+    // The COMMIT record persists the logical switch itself.  If the process
+    // terminates after this line is flushed but before CommitPlan() runs,
+    // startup can replay monitor/from/to instead of treating the transaction
+    // as rolled back (which would orphan the parked windows' ownership).
+    return Append("COMMIT " + std::to_string(plan.monitor) + " " +
+                  std::to_string(plan.from_workspace) + " " +
+                  std::to_string(plan.to_workspace),
+                  error);
 }
 
 bool WorkspaceJournal::Abort(std::string* error) const {
@@ -311,6 +318,72 @@ std::optional<SwitchPlan> WorkspaceJournal::ReadPending(
     }
 }
 
+JournalReadResult WorkspaceJournal::ReadJournalState(
+    std::string* error) const {
+    JournalReadResult result;
+    try {
+        std::ifstream in(path_, std::ios::binary);
+        if (!in) return result;
+
+        std::string line;
+        SwitchPlan plan;
+        bool in_transaction = false;
+        while (std::getline(in, line)) {
+            std::istringstream row(line);
+            std::string tag;
+            row >> tag;
+            if (tag == "BEGIN") {
+                plan = {};
+                if (!(row >> plan.monitor >> plan.from_workspace >>
+                      plan.to_workspace)) {
+                    if (error) *error = "invalid BEGIN record";
+                    return {};
+                }
+                in_transaction = true;
+                continue;
+            }
+            if (!in_transaction) continue;
+            if (tag == "MOVE") {
+                SwitchOperation operation;
+                std::string from;
+                std::string to;
+                if (!ParseIdentity(row, operation.identity) ||
+                    !(row >> from >> to)) {
+                    if (error) *error = "invalid MOVE record";
+                    return {};
+                }
+                operation.from = ParseRole(from);
+                operation.to = ParseRole(to);
+                if (operation.from == NativeDesktopRole::Unknown ||
+                    operation.to == NativeDesktopRole::Unknown) {
+                    if (error) *error = "invalid MOVE role";
+                    return {};
+                }
+                plan.operations.push_back(operation);
+                continue;
+            }
+            if (tag == "COMMIT") {
+                // Keep the whole plan so startup can replay the logical
+                // switch.  Legacy journals wrote a bare COMMIT; the BEGIN
+                // record still carries monitor/from/to in that case.
+                result.committed = std::move(plan);
+                in_transaction = false;
+                break;
+            }
+            if (tag == "ABORT" || tag == "RECOVERED") {
+                in_transaction = false;
+                plan = {};
+                break;
+            }
+        }
+        if (in_transaction) result.pending = std::move(plan);
+        return result;
+    } catch (const std::exception& ex) {
+        if (error) *error = ex.what();
+        return {};
+    }
+}
+
 WorkspaceEngine::WorkspaceEngine(GUID carrier, GUID parking)
     : carrier_(carrier), parking_(parking) {}
 
@@ -361,8 +434,6 @@ WorkspaceEngine::BootstrapPendingRecoveryModel(
         }
         WindowRecord recovered = *it->second;
         if (recovered.monitor != pending.monitor ||
-            (recovered.workspace != pending.from_workspace &&
-             recovered.workspace != pending.to_workspace) ||
             recovered.disposition != WindowDisposition::Managed ||
             !recovered.capabilities.Manageable()) {
             if (error) *error = "startup snapshot window is not recoverable for pending transaction";
@@ -372,6 +443,15 @@ WorkspaceEngine::BootstrapPendingRecoveryModel(
         // state remains observed separately, because it may reflect a partial
         // switch when the prior process terminated.
         recovered.native_role = operation.from;
+        // The journal plan is the authority for pre-switch logical ownership:
+        // from-workspace windows were Carrier, to-workspace windows Parking.
+        // A raw startup snapshot may leave workspace unassigned (0); the
+        // caller's assignment adapter would otherwise drop Parking-native
+        // windows before the journal identities could be proven.
+        recovered.workspace =
+            operation.from == NativeDesktopRole::Carrier
+                ? pending.from_workspace
+                : pending.to_workspace;
         if (engine->UpsertWindow(std::move(recovered), error) !=
             UpsertResult::Added) {
             if (error && error->empty()) *error = "failed to import pending window";
@@ -384,6 +464,90 @@ WorkspaceEngine::BootstrapPendingRecoveryModel(
         return nullptr;
     }
     return engine;
+}
+
+bool WorkspaceEngine::ReplayCommitted(
+    const SwitchPlan& committed,
+    const std::vector<WindowRecord>& authoritative_snapshot,
+    std::string* error) {
+    if (error) error->clear();
+    if (committed.monitor == 0 || committed.from_workspace == 0 ||
+        committed.to_workspace == 0 ||
+        committed.from_workspace == committed.to_workspace ||
+        committed.operations.empty()) {
+        if (error) *error = "committed journal plan is not a switch transaction";
+        return false;
+    }
+    MonitorWorkspaceState* monitor = MutableMonitor(committed.monitor);
+    if (monitor == nullptr) {
+        if (error) *error = "committed monitor is not configured in the engine";
+        return false;
+    }
+    if (!HasWorkspace(committed.monitor, committed.from_workspace) ||
+        !HasWorkspace(committed.monitor, committed.to_workspace)) {
+        if (error) *error =
+            "committed workspaces are not configured on the monitor";
+        return false;
+    }
+
+    std::unordered_map<WindowIdentity, const WindowRecord*, WindowIdentityHash>
+        snapshot_by_identity;
+    std::unordered_set<std::uintptr_t> snapshot_hwnds;
+    for (const WindowRecord& record : authoritative_snapshot) {
+        const std::uintptr_t hwnd =
+            reinterpret_cast<std::uintptr_t>(record.identity.hwnd);
+        if (!record.identity.IsValid() ||
+            record.disposition == WindowDisposition::Closed ||
+            !snapshot_by_identity.emplace(record.identity, &record).second ||
+            !snapshot_hwnds.insert(hwnd).second) {
+            if (error) *error =
+                "startup snapshot contains an invalid or duplicate window";
+            return false;
+        }
+    }
+
+    // The commit already moved native windows; the model must adopt the
+    // post-switch logical ownership: Carrier-moved windows belong to the
+    // now-active workspace, Parking-moved windows to the workspace the
+    // switch left. The snapshot must prove every committed identity.
+    monitor->active = committed.to_workspace;
+    std::unordered_set<WindowIdentity, WindowIdentityHash> operations;
+    for (const SwitchOperation& operation : committed.operations) {
+        const auto it = snapshot_by_identity.find(operation.identity);
+        if (it == snapshot_by_identity.end() ||
+            !operations.insert(operation.identity).second ||
+            operation.from == NativeDesktopRole::Unknown ||
+            operation.to == NativeDesktopRole::Unknown ||
+            operation.from == operation.to) {
+            if (error) *error =
+                "startup snapshot cannot prove every committed window identity";
+            return false;
+        }
+        WindowRecord replayed = *it->second;
+        if (replayed.monitor != committed.monitor ||
+            replayed.disposition != WindowDisposition::Managed ||
+            !replayed.capabilities.Manageable()) {
+            if (error) *error =
+                "startup snapshot window is not replayable for committed transaction";
+            return false;
+        }
+        replayed.workspace =
+            operation.to == NativeDesktopRole::Carrier
+                ? committed.to_workspace
+                : committed.from_workspace;
+        replayed.native_role = operation.to;
+        if (UpsertWindow(std::move(replayed), error) == UpsertResult::Rejected) {
+            if (error && error->empty()) *error = "failed to import committed window";
+            return false;
+        }
+    }
+    std::string invariant_error;
+    if (!CheckInvariant(&invariant_error)) {
+        if (error) *error =
+            "committed replay model is invalid: " + invariant_error;
+        return false;
+    }
+    return true;
 }
 
 bool WorkspaceEngine::HasWorkspace(MonitorId monitor,
@@ -1269,7 +1433,7 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         return result;
     }
 
-    if (journal && !journal->Commit(&journal_error)) {
+    if (journal && !journal->Commit(plan, &journal_error)) {
         result.rollback_attempted = true;
         std::string rollback_error;
         result.rollback_succeeded =
@@ -1456,7 +1620,7 @@ bool WorkspaceEngine::Reconcile(const MoveCallback& move,
         }
         return false;
     }
-    if (journal && !journal->Commit(&journal_error)) {
+    if (journal && !journal->Commit(plan, &journal_error)) {
         std::string rollback_error;
         const bool rolled_back =
             RestoreOperations(applied, move, observe, &rollback_error);
