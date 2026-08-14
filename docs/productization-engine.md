@@ -317,6 +317,20 @@ plan is rejected before mutation, and an incomplete Z-order snapshot cannot
 produce a restore plan. Monitor B control windows never appear in the plan.
 The command performs no COM, native window, desktop, or foreground mutation.
 
+`workspace-live-focus-restore-test --confirm-mutate` is the live focus gate.
+It spawns four vdprobe-owned windows (A1 top/bottom, A2, and B1), derives
+per-workspace Z-order and a confirmation-gated foreground target, and runs one
+monitor-local A1 -> A2 -> A1 switch through the coordinator. After each switch
+it executes `PreparePresentationRestore` and `ExecutePresentationRestore`
+with an identity-checked native adapter that applies `SetWindowPlacement`,
+non-activating `SetWindowPos(HWND_TOP)`, and best-effort
+`SetForegroundWindow` to the real probe HWNDs. Placement is re-verified with
+`GetWindowRect` and the relative Z-order of the two-window A1 workspace is
+re-verified with `GetWindow` ordering; foreground denials are recorded as
+best-effort failures. Monitor B and the session-global Carrier stay unchanged,
+the stable journal has no pending transaction, and all probe windows are
+restored and closed before cleanup. The live run reports `RESULT=PASS`.
+
 ## Deliberate next boundaries
 
 The controlled `logical-workspace-test` now provides live integration

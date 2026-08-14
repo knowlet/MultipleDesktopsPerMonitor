@@ -74,6 +74,7 @@ Gated feasibility tests:
 | `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |
 | `vdprobe workspace-readonly-host-test` | productization composition boundary: deterministic, non-mutating injected discovery, assignment, owner-thread lifecycle, coordinator, and startup wiring; no real HWND, COM, move, observe, or recovery callback is used |
 | `vdprobe workspace-live-manager-test --confirm-mutate` | bounded mutable integration: creates exactly three vdprobe-owned windows, uses system discovery plus capability checks, and runs one monitor-local A1 -> A2 -> A1 round-trip; no user HWNDs or native desktop lifecycle are touched |
+| `vdprobe workspace-live-focus-restore-test --confirm-mutate` | bounded mutable live focus gate: four vdprobe-owned windows, one monitor-local A1 -> A2 -> A1 switch, and identity-checked placement/Z-order restore verified on the real HWNDs after each switch (foreground best-effort); no user HWNDs or native desktop lifecycle are touched |
 | `vdprobe workspace-live-focus-test` | productization focus boundary: deterministic, non-mutating injected per-workspace foreground/Z-order capture, switch, and identity-checked presentation restore planning/execution, including fail-closed identity/altered-plan/incomplete-snapshot cases |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
