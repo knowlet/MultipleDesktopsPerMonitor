@@ -129,7 +129,7 @@ int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate);
 // a tray icon, drives one monitor-local A1 -> A2 -> A1 round-trip through
 // WM_HOTKEY dispatch, and cleans all UI resources before exit. Never calls
 // SwitchDesktop or creates/removes a native desktop.
-int CmdWorkspaceManager(bool confirm_mutate);
+int CmdWorkspaceManager(bool confirm_mutate, const char* config_path = nullptr);
 
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.

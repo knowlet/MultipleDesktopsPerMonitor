@@ -156,6 +156,7 @@ void Usage() {
         "                      original -> other -> original, with required restore\n"
         "  --confirm-mutate    unlock explicitly gated desktop/window mutations\n"
         "  --seconds N         'notify-watch': how long to watch (default 20)\n"
+        "  --config PATH       'workspace-manager': load a schema-v1 config file\n"
         "  --help, -h          this text\n"
         "\n"
         "This build never invokes a vtable slot that is not recorded with an agreed\n"
@@ -189,6 +190,7 @@ int main(int argc, char** argv) {
     bool confirm_register = false;
     bool self_trigger = false;
     bool confirm_mutate = false;
+    std::string config_path;
     std::string browser;
     int seconds = 20;
     for (int i = 1; i < argc; ++i) {
@@ -203,6 +205,8 @@ int main(int argc, char** argv) {
             confirm_mutate = true;
         } else if (a == "--browser" && i + 1 < argc) {
             browser = vd::ToLowerAscii(argv[++i]);
+        } else if (a == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
         } else if (a == "--seconds" && i + 1 < argc) {
             seconds = std::atoi(argv[++i]);
             if (seconds <= 0) seconds = 20;
@@ -269,7 +273,9 @@ int main(int argc, char** argv) {
     } else if (cmd == "workspace-live-focus-restore-test") {
         rc = vd::CmdWorkspaceLiveFocusRestoreTest(confirm_mutate);
     } else if (cmd == "workspace-manager") {
-        rc = vd::CmdWorkspaceManager(confirm_mutate);
+        rc = vd::CmdWorkspaceManager(confirm_mutate,
+                                     config_path.empty() ? nullptr
+                                                         : config_path.c_str());
     } else if (cmd == "workspace-manager-test") {
         rc = vd::CmdWorkspaceManagerTest();
     } else if (cmd == "workspace-live-lifecycle-test") {

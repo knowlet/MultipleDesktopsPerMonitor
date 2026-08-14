@@ -4555,9 +4555,9 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate) {
         reinterpret_cast<MonitorId>(monitor_a.handle);
     const MonitorId monitor_b_id =
         reinterpret_cast<MonitorId>(monitor_b.handle);
-    constexpr WorkspaceId kA1 = 1;
-    constexpr WorkspaceId kA2 = 2;
-    constexpr WorkspaceId kB1 = 3;
+    WorkspaceId kA1 = 1;
+    WorkspaceId kA2 = 2;
+    WorkspaceId kB1 = 3;
     Field("monitor A", ToUtf8(monitor_a.device));
     Field("monitor B", ToUtf8(monitor_b.device));
 
@@ -5958,7 +5958,7 @@ bool EnsureManagerHotkeyClass() {
 
 }  // namespace
 
-int CmdWorkspaceManager(bool confirm_mutate) {
+int CmdWorkspaceManager(bool confirm_mutate, const char* config_path) {
     Heading("workspace-manager");
     Field("scope", "hotkey-driven probe-owned workspace switches (self-test)");
     Field("discovery", "complete system EnumWindows + capability augmentation");
@@ -5992,9 +5992,11 @@ int CmdWorkspaceManager(bool confirm_mutate) {
         reinterpret_cast<MonitorId>(monitor_a.handle);
     const MonitorId monitor_b_id =
         reinterpret_cast<MonitorId>(monitor_b.handle);
-    constexpr WorkspaceId kA1 = 1;
-    constexpr WorkspaceId kA2 = 2;
-    constexpr WorkspaceId kB1 = 3;
+    WorkspaceId kA1 = 1;
+    WorkspaceId kA2 = 2;
+    WorkspaceId kB1 = 3;
+    std::vector<WorkspaceId> monitor_a_workspaces{kA1, kA2};
+    std::vector<WorkspaceId> monitor_b_workspaces{kB1};
     Field("monitor A", ToUtf8(monitor_a.device));
     Field("monitor B", ToUtf8(monitor_b.device));
 
@@ -6017,12 +6019,68 @@ int CmdWorkspaceManager(bool confirm_mutate) {
     WorkspaceManagerConfig hotkey_config;
     hotkey_config.journal_path = journal_path;
     hotkey_config.tray_icon = true;
-    hotkey_config.bindings = {
-        {{MOD_CONTROL | MOD_ALT, VK_F9}, monitor_a_id, kA2},
-        {{MOD_CONTROL | MOD_ALT, VK_F10}, monitor_a_id, kA1},
-    };
-    Field("hotkey Ctrl+Alt+F9", "monitor A -> A2");
-    Field("hotkey Ctrl+Alt+F10", "monitor A -> A1");
+    const WorkspaceHotkey* target_hotkey = nullptr;
+    const WorkspaceHotkey* active_hotkey = nullptr;
+    if (config_path != nullptr && *config_path != '\0') {
+        std::string config_error;
+        if (!LoadManagerConfig(std::filesystem::path(config_path),
+                               hotkey_config, &config_error)) {
+            Field("result", "ERROR");
+            Field("reason", "config load failed: " + config_error);
+            Field("mutation_started", "no");
+            return 1;
+        }
+        Field("config", config_path);
+        std::vector<HMONITOR> real_monitors;
+        for (const MonitorRec& monitor : monitors) {
+            real_monitors.push_back(monitor.handle);
+        }
+        ManagerRuntimeTopology topology;
+        if (!DeriveManagerRuntimeTopology(hotkey_config, real_monitors,
+                                          topology, &config_error)) {
+            Field("result", "ERROR");
+            Field("reason", "config topology failed: " + config_error);
+            Field("mutation_started", "no");
+            return 1;
+        }
+        if (topology.monitors.size() < 2 ||
+            topology.monitors[0].workspace_count < 2) {
+            Field("result", "ERROR");
+            Field("reason", "config must define at least two monitors and two "
+                            "workspaces on monitor 1");
+            Field("mutation_started", "no");
+            return 1;
+        }
+        kA1 = topology.monitors[0].active;
+        kB1 = topology.monitors[1].active;
+        monitor_a_workspaces = topology.monitors[0].workspace_ids;
+        monitor_b_workspaces = topology.monitors[1].workspace_ids;
+        kA2 = monitor_a_workspaces.size() > 1 ? monitor_a_workspaces[1] : kA1;
+        hotkey_config.bindings = topology.bindings;
+        for (const WorkspaceHotkeyBinding& binding : hotkey_config.bindings) {
+            if (binding.monitor != monitor_a_id) continue;
+            if (binding.workspace == kA2) target_hotkey = &binding.hotkey;
+            if (binding.workspace == kA1) active_hotkey = &binding.hotkey;
+        }
+        if (target_hotkey == nullptr || active_hotkey == nullptr) {
+            Field("result", "ERROR");
+            Field("reason", "config must bind hotkeys to monitor 1's target "
+                            "workspace and active workspace");
+            Field("mutation_started", "no");
+            return 1;
+        }
+        Field("config bindings",
+              std::format("{}", hotkey_config.bindings.size()));
+    } else {
+        hotkey_config.bindings = {
+            {{MOD_CONTROL | MOD_ALT, VK_F9}, monitor_a_id, 2},
+            {{MOD_CONTROL | MOD_ALT, VK_F10}, monitor_a_id, 1},
+        };
+        target_hotkey = &hotkey_config.bindings[0].hotkey;
+        active_hotkey = &hotkey_config.bindings[1].hotkey;
+        Field("hotkey Ctrl+Alt+F9", "monitor A -> A2");
+        Field("hotkey Ctrl+Alt+F10", "monitor A -> A1");
+    }
 
     Com<IServiceProvider> sp;
     const HRESULT shell_hr = GetImmersiveShell(sp);
@@ -6443,15 +6501,19 @@ int CmdWorkspaceManager(bool confirm_mutate) {
         WindowDiscovery discovery(std::move(*backend));
 
         WorkspaceEngine engine(carrier.id, parking.id);
-        if (!engine.AddMonitor(monitor_a_id, kA1, {kA1, kA2}, &error) ||
-            !engine.AddMonitor(monitor_b_id, kB1, {kB1}, &error)) {
+        if (!engine.AddMonitor(monitor_a_id, kA1, monitor_a_workspaces,
+                               &error) ||
+            !engine.AddMonitor(monitor_b_id, kB1, monitor_b_workspaces,
+                               &error)) {
             Field("integration error", error);
             return 1;
         }
         WorkspaceAssignmentAdapter assignment(engine);
-        if (!assignment.ConfigureMonitor(monitor_a_id, kA1, {kA1, kA2},
+        if (!assignment.ConfigureMonitor(monitor_a_id, kA1,
+                                         monitor_a_workspaces,
                                          &error) ||
-            !assignment.ConfigureMonitor(monitor_b_id, kB1, {kB1}, &error)) {
+            !assignment.ConfigureMonitor(monitor_b_id, kB1,
+                                         monitor_b_workspaces, &error)) {
             Field("assignment error", error);
             return 1;
         }
@@ -6600,9 +6662,8 @@ int CmdWorkspaceManager(bool confirm_mutate) {
         CoordinatorResult forward;
         CoordinatorResult reverse;
         if (ok) {
-            const bool dispatched =
-                dispatch_hotkey({MOD_CONTROL | MOD_ALT, VK_F9}, forward);
-            Field("WM_HOTKEY Ctrl+Alt+F9 dispatched",
+            const bool dispatched = dispatch_hotkey(*target_hotkey, forward);
+            Field("WM_HOTKEY target-workspace dispatched",
                   dispatched ? "PASS" : "FAIL");
             Field("A1 -> A2 switch", forward.succeeded() ? "PASS" : "FAIL");
             ok = dispatched && forward.succeeded() &&
@@ -6612,9 +6673,8 @@ int CmdWorkspaceManager(bool confirm_mutate) {
                  control_unchanged();
         }
         if (ok) {
-            const bool dispatched =
-                dispatch_hotkey({MOD_CONTROL | MOD_ALT, VK_F10}, reverse);
-            Field("WM_HOTKEY Ctrl+Alt+F10 dispatched",
+            const bool dispatched = dispatch_hotkey(*active_hotkey, reverse);
+            Field("WM_HOTKEY active-workspace dispatched",
                   dispatched ? "PASS" : "FAIL");
             Field("A2 -> A1 switch", reverse.succeeded() ? "PASS" : "FAIL");
             ok = dispatched && reverse.succeeded() &&
