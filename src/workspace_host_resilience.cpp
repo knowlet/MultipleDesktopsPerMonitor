@@ -42,7 +42,19 @@ void MonitorTopologyMapper::Update(
             ++real_index;
             continue;
         }
-        const std::size_t config_index = next.size();
+        // A new monitor takes the lowest missing config index, never
+        // next.size(): pass 1 may have preserved a higher-numbered binding
+        // (e.g. only config 1 survived a suspend), and next.size() would
+        // collide with it and leave the lower index permanently missing.
+        std::size_t config_index = 0;
+        while (config_index < expected_count &&
+               std::any_of(next.begin(), next.end(),
+                           [config_index](const BoundMonitor& monitor) {
+                               return monitor.config_index == config_index;
+                           })) {
+            ++config_index;
+        }
+        if (config_index >= expected_count) break;
         next.push_back(
             {config_index, real[real_index].first, real[real_index].second});
         real_used[real_index] = true;
@@ -117,6 +129,28 @@ int CmdWorkspaceHostResilienceTest() {
         missing.empty();
     Field("device identity survives order change", identity_ok ? "PASS" : "FAIL");
     ok = ok && identity_ok;
+
+    // A monitor added while only a higher config index is still bound must
+    // take the lowest missing index (config 0), not next.size() (which would
+    // collide with the surviving config 1).
+    mapper.Update(
+        {{static_cast<MonitorId>(0x200ULL), "DISPLAYB"},
+         {static_cast<MonitorId>(0x400ULL), "DISPLAYC"}},
+        bound, missing, 2);
+    const bool lowest_index_ok =
+        bound.size() == 2 &&
+        std::count_if(bound.begin(), bound.end(),
+                      [](const MonitorTopologyMapper::BoundMonitor& monitor) {
+                          return monitor.config_index == 1;
+                      }) == 1 &&
+        std::count_if(bound.begin(), bound.end(),
+                      [](const MonitorTopologyMapper::BoundMonitor& monitor) {
+                          return monitor.config_index == 0;
+                      }) == 1 &&
+        bound[1].device == "DISPLAYC" && missing.empty();
+    Field("new monitor takes lowest missing config index",
+          lowest_index_ok ? "PASS" : "FAIL");
+    ok = ok && lowest_index_ok;
 
     Field("result", ok ? "PASS" : "FAIL");
     Print("RESULT={}\n", ok ? "PASS" : "FAIL");

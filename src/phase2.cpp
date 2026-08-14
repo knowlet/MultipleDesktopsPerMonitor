@@ -637,6 +637,29 @@ struct ApplicationViewCollectionBinding {
     bool access_denied_seen = false;
 };
 
+// Every Shell object the production host holds, as one bundle so a
+// Shell/Explorer restart can atomically invalidate and reacquire the whole
+// runtime instead of replacing a few pointers while lambdas keep stale COM
+// objects and method entries captured.
+struct ShellRuntimeBundle {
+    Com<IServiceProvider> sp;
+    ManagerInternal manager;
+    ApplicationViewCollectionBinding views;
+    const MethodEntry* get_view = nullptr;
+    const MethodEntry* can_move = nullptr;
+    Com<IVirtualDesktopManager> documented;
+    DesktopSnapshot carrier;
+    DesktopSnapshot parking;
+
+    bool valid() const noexcept {
+        return sp && manager.obj && manager.layout != nullptr &&
+               views.object && views.layout != nullptr &&
+               get_view != nullptr && can_move != nullptr && documented &&
+               carrier.object && carrier.id_ok && parking.object &&
+               parking.id_ok;
+    }
+};
+
 ApplicationViewCollectionBinding AcquireApplicationViewCollection(IServiceProvider* sp) {
     ApplicationViewCollectionBinding out;
     if (sp == nullptr) {
@@ -8127,81 +8150,158 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     WorkspaceJournal journal(journal_path);
     Field("journal", journal_path.string());
 
-    Com<IServiceProvider> sp;
-    const HRESULT shell_hr = GetImmersiveShell(sp);
-    if (FAILED(shell_hr) || !sp) {
-        Field("result", shell_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
-                                                   : "ERROR");
-        Field("reason", std::format("ImmersiveShell unavailable ({})",
-                                    HrToString(shell_hr)));
-        release_mutex();
-        return shell_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
-    }
-    ManagerInternal manager = AcquireManagerInternal(sp.Get());
-    if (!manager.obj || manager.layout == nullptr) {
-        Field("result", manager.access_denied_seen ? "ENVIRONMENT-BLOCKED"
-                                                   : "ERROR");
-        Field("reason", "usable IVirtualDesktopManagerInternal unavailable");
-        release_mutex();
-        return manager.access_denied_seen ? kExitInconclusive : 1;
-    }
-    DesktopSnapshot carrier;
-    HRESULT current_hr = E_ABORT;
-    if (!ReadCurrentDesktop(manager, carrier, &current_hr)) {
-        Field("result", current_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
-                                                     : "ERROR");
-        Field("reason", "current Carrier unavailable");
-        release_mutex();
-        return current_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
-    }
-    std::vector<DesktopSnapshot> desktops;
-    HRESULT desktops_hr = E_ABORT;
-    if (!ReadDesktopList(manager, desktops, &desktops_hr)) {
-        Field("result", desktops_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
-                                                      : "ERROR");
-        Field("reason", "existing desktop enumeration failed");
-        release_mutex();
-        return desktops_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
-    }
-    DesktopSnapshot parking;
-    for (DesktopSnapshot& desktop : desktops) {
-        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
-            parking = std::move(desktop);
-            break;
+    HostResilienceState resilience;
+    bool degraded = false;
+    ShellRuntimeBundle runtime_state;
+    // Atomically reacquire every Shell object after a Shell/Explorer
+    // restart. The host model is built around the original Carrier/Parking
+    // identities, so a bundle that no longer names the same current desktop
+    // (or lost the original Parking desktop) is rejected and the host stays
+    // degraded until a restart can re-adopt the layout.
+    auto reacquire_shell = [&]() -> bool {
+        ++resilience.shell_reacquire_attempts;
+        ShellRuntimeBundle fresh;
+        const HRESULT shell_hr = GetImmersiveShell(fresh.sp);
+        if (FAILED(shell_hr) || !fresh.sp) return false;
+        fresh.manager = AcquireManagerInternal(fresh.sp.Get());
+        if (!fresh.manager.obj || fresh.manager.layout == nullptr) {
+            return false;
         }
-    }
-    if (!parking.id_ok || !parking.object) {
-        Field("result", "ENVIRONMENT-BLOCKED");
-        Field("reason", "no existing inactive Parking desktop");
-        release_mutex();
-        return kExitInconclusive;
-    }
-    ApplicationViewCollectionBinding views =
-        AcquireApplicationViewCollection(sp.Get());
-    const MethodEntry* get_view =
-        views.layout == nullptr ? nullptr
-                                : FindMethod(*views.layout, "GetViewForHwnd");
-    const MethodEntry* can_move =
-        FindMethod(*manager.layout, "CanViewMoveDesktops");
-    if (!views.object || get_view == nullptr || can_move == nullptr) {
-        Field("result", views.access_denied_seen ? "ENVIRONMENT-BLOCKED"
-                                                 : "ERROR");
-        Field("reason", "application-view capability APIs unavailable");
-        release_mutex();
-        return views.access_denied_seen ? kExitInconclusive : 1;
-    }
-    Com<IVirtualDesktopManager> documented_manager;
-    const HRESULT documented_hr = ::CoCreateInstance(
-        CLSID_VirtualDesktopManager, nullptr,
-        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
-        IID_IVirtualDesktopManager, documented_manager.PutVoid());
-    if (FAILED(documented_hr) || !documented_manager) {
-        Field("result", documented_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
-                                                        : "ERROR");
-        Field("reason", std::format("IVirtualDesktopManager unavailable ({})",
-                                    HrToString(documented_hr)));
-        release_mutex();
-        return documented_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        HRESULT current_hr = E_ABORT;
+        if (!ReadCurrentDesktop(fresh.manager, fresh.carrier, &current_hr)) {
+            return false;
+        }
+        std::vector<DesktopSnapshot> desktops;
+        HRESULT desktops_hr = E_ABORT;
+        if (!ReadDesktopList(fresh.manager, desktops, &desktops_hr)) {
+            return false;
+        }
+        for (DesktopSnapshot& desktop : desktops) {
+            if (desktop.id_ok &&
+                !::IsEqualGUID(desktop.id, fresh.carrier.id)) {
+                fresh.parking = std::move(desktop);
+                break;
+            }
+        }
+        if (!fresh.parking.id_ok || !fresh.parking.object) return false;
+        fresh.views = AcquireApplicationViewCollection(fresh.sp.Get());
+        fresh.get_view =
+            fresh.views.layout == nullptr
+                ? nullptr
+                : FindMethod(*fresh.views.layout, "GetViewForHwnd");
+        fresh.can_move =
+            fresh.manager.layout == nullptr
+                ? nullptr
+                : FindMethod(*fresh.manager.layout, "CanViewMoveDesktops");
+        if (!fresh.views.object || fresh.get_view == nullptr ||
+            fresh.can_move == nullptr) {
+            return false;
+        }
+        const HRESULT documented_hr = ::CoCreateInstance(
+            CLSID_VirtualDesktopManager, nullptr,
+            CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+            IID_IVirtualDesktopManager, fresh.documented.PutVoid());
+        if (FAILED(documented_hr) || !fresh.documented) return false;
+        if (!runtime_state.carrier.id_ok ||
+            !::IsEqualGUID(fresh.carrier.id, runtime_state.carrier.id) ||
+            !::IsEqualGUID(fresh.parking.id, runtime_state.parking.id)) {
+            // The desktop layout changed: adopting it would invalidate the
+            // model's Carrier/Parking identities.
+            return false;
+        }
+        runtime_state = std::move(fresh);
+        return true;
+    };
+    {
+        const HRESULT shell_hr = GetImmersiveShell(runtime_state.sp);
+        if (FAILED(shell_hr) || !runtime_state.sp) {
+            Field("result", shell_hr == E_ACCESSDENIED
+                              ? "ENVIRONMENT-BLOCKED" : "ERROR");
+            Field("reason", std::format("ImmersiveShell unavailable ({})",
+                                        HrToString(shell_hr)));
+            release_mutex();
+            return shell_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        }
+        runtime_state.manager =
+            AcquireManagerInternal(runtime_state.sp.Get());
+        if (!runtime_state.manager.obj ||
+            runtime_state.manager.layout == nullptr) {
+            Field("result",
+                  runtime_state.manager.access_denied_seen
+                      ? "ENVIRONMENT-BLOCKED" : "ERROR");
+            Field("reason",
+                  "usable IVirtualDesktopManagerInternal unavailable");
+            release_mutex();
+            return runtime_state.manager.access_denied_seen
+                       ? kExitInconclusive : 1;
+        }
+        HRESULT current_hr = E_ABORT;
+        if (!ReadCurrentDesktop(runtime_state.manager,
+                                runtime_state.carrier, &current_hr)) {
+            Field("result", current_hr == E_ACCESSDENIED
+                              ? "ENVIRONMENT-BLOCKED" : "ERROR");
+            Field("reason", "current Carrier unavailable");
+            release_mutex();
+            return current_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        }
+        std::vector<DesktopSnapshot> desktops;
+        HRESULT desktops_hr = E_ABORT;
+        if (!ReadDesktopList(runtime_state.manager, desktops,
+                             &desktops_hr)) {
+            Field("result", desktops_hr == E_ACCESSDENIED
+                              ? "ENVIRONMENT-BLOCKED" : "ERROR");
+            Field("reason", "existing desktop enumeration failed");
+            release_mutex();
+            return desktops_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        }
+        for (DesktopSnapshot& desktop : desktops) {
+            if (desktop.id_ok &&
+                !::IsEqualGUID(desktop.id, runtime_state.carrier.id)) {
+                runtime_state.parking = std::move(desktop);
+                break;
+            }
+        }
+        if (!runtime_state.parking.id_ok ||
+            !runtime_state.parking.object) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "no existing inactive Parking desktop");
+            release_mutex();
+            return kExitInconclusive;
+        }
+        runtime_state.views =
+            AcquireApplicationViewCollection(runtime_state.sp.Get());
+        runtime_state.get_view =
+            runtime_state.views.layout == nullptr
+                ? nullptr
+                : FindMethod(*runtime_state.views.layout, "GetViewForHwnd");
+        runtime_state.can_move = FindMethod(
+            *runtime_state.manager.layout, "CanViewMoveDesktops");
+        if (!runtime_state.views.object || runtime_state.get_view == nullptr ||
+            runtime_state.can_move == nullptr) {
+            Field("result",
+                  runtime_state.views.access_denied_seen
+                      ? "ENVIRONMENT-BLOCKED" : "ERROR");
+            Field("reason",
+                  "application-view capability APIs unavailable");
+            release_mutex();
+            return runtime_state.views.access_denied_seen
+                       ? kExitInconclusive : 1;
+        }
+        const HRESULT documented_hr = ::CoCreateInstance(
+            CLSID_VirtualDesktopManager, nullptr,
+            CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+            IID_IVirtualDesktopManager,
+            runtime_state.documented.PutVoid());
+        if (FAILED(documented_hr) || !runtime_state.documented) {
+            Field("result",
+                  documented_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                  : "ERROR");
+            Field("reason",
+                  std::format("IVirtualDesktopManager unavailable ({})",
+                              HrToString(documented_hr)));
+            release_mutex();
+            return documented_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        }
     }
 
     auto acquire_view = [&](HWND hwnd, RawObject& out,
@@ -8209,8 +8309,9 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         PumpStaMessages();
         Gate last_gate = Gate::Ok;
         HRESULT last_hr = InvokeSlot(
-            views.object.Get(), *views.layout, *get_view, last_gate, false,
-            hwnd, out.PutVoid());
+            runtime_state.views.object.Get(),
+            *runtime_state.views.layout, *runtime_state.get_view, last_gate,
+            false, hwnd, out.PutVoid());
         if (last_gate == Gate::Ok && SUCCEEDED(last_hr) && out) return true;
         if (error != nullptr) {
             *error = std::format("GetViewForHwnd 0x{:X} failed: gate={} hr={}",
@@ -8222,8 +8323,10 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     auto view_can_move = [&](IUnknown* view, std::string* error = nullptr) {
         Gate gate = Gate::Ok;
         BOOL value = FALSE;
-        const HRESULT hr = InvokeSlot(manager.obj.Get(), *manager.layout,
-                                      *can_move, gate, false, view, &value);
+        const HRESULT hr = InvokeSlot(
+            runtime_state.manager.obj.Get(),
+            *runtime_state.manager.layout, *runtime_state.can_move, gate,
+            false, view, &value);
         if (gate == Gate::Ok && SUCCEEDED(hr) && value != FALSE) return true;
         if (error != nullptr) {
             *error = std::format("CanViewMoveDesktops failed: gate={} hr={}",
@@ -8239,14 +8342,16 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             return NativeDesktopRole::Unknown;
         }
         WindowDesktopState state;
-        if (!ReadWindowDesktopState(documented_manager.Get(),
+        if (!ReadWindowDesktopState(runtime_state.documented.Get(),
                                     record.identity.hwnd, state)) {
             return NativeDesktopRole::Unknown;
         }
-        if (::IsEqualGUID(state.desktop, carrier.id) && state.on_current) {
+        if (::IsEqualGUID(state.desktop, runtime_state.carrier.id) &&
+            state.on_current) {
             return NativeDesktopRole::Carrier;
         }
-        if (::IsEqualGUID(state.desktop, parking.id) && !state.on_current) {
+        if (::IsEqualGUID(state.desktop, runtime_state.parking.id) &&
+            !state.on_current) {
             return NativeDesktopRole::Parking;
         }
         return NativeDesktopRole::Unknown;
@@ -8265,23 +8370,29 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             return false;
         }
         IUnknown* target_object =
-            target == NativeDesktopRole::Carrier ? carrier.object.Get()
-            : target == NativeDesktopRole::Parking ? parking.object.Get()
-                                                    : nullptr;
+            target == NativeDesktopRole::Carrier
+                ? runtime_state.carrier.object.Get()
+            : target == NativeDesktopRole::Parking
+                ? runtime_state.parking.object.Get()
+                : nullptr;
         const GUID* target_id =
-            target == NativeDesktopRole::Carrier ? &carrier.id
-            : target == NativeDesktopRole::Parking ? &parking.id : nullptr;
+            target == NativeDesktopRole::Carrier
+                ? &runtime_state.carrier.id
+            : target == NativeDesktopRole::Parking
+                ? &runtime_state.parking.id
+                : nullptr;
         if (target_object == nullptr || target_id == nullptr) return false;
         Gate gate = Gate::Ok;
         HRESULT hr = E_ABORT;
         return MoveViewToDesktopAndWait(
-            manager, view.Get(), target_object, record.identity.hwnd,
-            documented_manager.Get(), *target_id, carrier.id, confirm_mutate,
-            gate, hr);
+            runtime_state.manager, view.Get(), target_object,
+            record.identity.hwnd, runtime_state.documented.Get(), *target_id,
+            runtime_state.carrier.id, confirm_mutate, gate, hr);
     };
 
     std::string error;
-    WorkspaceEngine engine(carrier.id, parking.id);
+    WorkspaceEngine engine(runtime_state.carrier.id,
+                           runtime_state.parking.id);
     for (const ManagerRuntimeTopology::MonitorBinding& binding :
          topology.monitors) {
         if (!engine.AddMonitor(binding.real_monitor, binding.active,
@@ -8321,8 +8432,9 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             Gate gate = Gate::Ok;
             BOOL value = FALSE;
             const HRESULT hr = InvokeSlot(
-                manager.obj.Get(), *manager.layout, *can_move, gate, false,
-                view.Get(), &value);
+                runtime_state.manager.obj.Get(),
+                *runtime_state.manager.layout, *runtime_state.can_move, gate,
+                false, view.Get(), &value);
             if (hr == E_ACCESSDENIED) capability_access_denied = true;
             if (gate != Gate::Ok || FAILED(hr)) {
                 capabilities.can_move_desktops = false;
@@ -8332,8 +8444,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             return true;
         };
     Win32WindowDiscoveryOptions options;
-    options.carrier = carrier.id;
-    options.parking = parking.id;
+    options.carrier = runtime_state.carrier.id;
+    options.parking = runtime_state.parking.id;
     options.augment_capabilities = augment_capabilities;
     HRESULT backend_hr = S_OK;
     auto backend = CreateSystemWindowDiscoveryBackend(
@@ -8481,8 +8593,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             }
         }
         Win32WindowDiscoveryOptions recovered_options;
-        recovered_options.carrier = carrier.id;
-        recovered_options.parking = parking.id;
+        recovered_options.carrier = runtime_state.carrier.id;
+        recovered_options.parking = runtime_state.parking.id;
         recovered_options.augment_capabilities = augment_capabilities;
         HRESULT recovered_backend_hr = S_OK;
         auto recovered_backend = CreateSystemWindowDiscoveryBackend(
@@ -8538,7 +8650,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         return runtime;
     };
     WorkspaceStartup startup(engine, coordinator, source,
-                            discover_raw_snapshot, carrier.id, parking.id,
+                            discover_raw_snapshot, runtime_state.carrier.id,
+                            runtime_state.parking.id,
                             journal_path, make_recovery_runtime, 3);
     const WorkspaceStartupResult startup_result = startup.RecoverAtStartup();
     if (!startup_result.ready()) {
@@ -8579,9 +8692,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     MonitorTopologyMapper topology_mapper;
     std::vector<MonitorTopologyMapper::BoundMonitor> bound_monitors;
     std::vector<std::size_t> missing_monitors;
-    HostResilienceState resilience;
     resilience.monitor_present.assign(topology.monitors.size(), true);
-    bool degraded = false;
     auto refresh_topology = [&]() {
         const std::vector<MonitorRec> current = EnumerateMonitors();
         std::vector<std::pair<MonitorId, std::string>> real;
@@ -8599,6 +8710,19 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         }
         resilience.monitor_present = std::move(present);
         degraded = degraded || !missing_monitors.empty();
+        // The engine and assignment registry are keyed by the MonitorId
+        // captured at startup; a monitor whose real handle changed cannot
+        // be rebound at runtime, so the host degrades until a restart.
+        for (const auto& entry : bound_monitors) {
+            if (entry.config_index >= topology.monitors.size()) continue;
+            if (topology.monitors[entry.config_index].real_monitor !=
+                entry.real_monitor) {
+                Print("monitor {} changed identity; runtime rebind requires "
+                      "a restart\n",
+                      entry.config_index);
+                degraded = true;
+            }
+        }
     };
     {
         const std::vector<MonitorRec> current = EnumerateMonitors();
@@ -8618,8 +8742,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     HWND hotkey_window = nullptr;
     auto native_invariant_ok = [&]() {
         GUID current{};
-        return ReadCurrentDesktopId(manager, current) &&
-               ::IsEqualGUID(current, carrier.id);
+        return ReadCurrentDesktopId(runtime_state.manager, current) &&
+               ::IsEqualGUID(current, runtime_state.carrier.id);
     };
     auto refresh_focus_snapshots = [&]() {
         for (const ManagerRuntimeTopology::MonitorBinding& binding :
@@ -8783,8 +8907,10 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     };
     main_context.reconcile_handler = [&]() {
         ++reconcile_count;
-        if (!native_invariant_ok()) {
+        if (!native_invariant_ok() || !runtime_state.valid()) {
             degraded = true;
+            if (!reacquire_shell()) return;
+            degraded = false;
             return;
         }
         const CoordinatorResult result =
@@ -8909,9 +9035,19 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
     main_context.resume_handler = [&]() {
         ++resilience.resume_events_handled;
         refresh_topology();
-        if (!native_invariant_ok()) {
-            degraded = true;
-            ++resilience.shell_reacquire_attempts;
+        if (!native_invariant_ok() || !runtime_state.valid()) {
+            if (reacquire_shell()) {
+                degraded = false;
+                const CoordinatorResult result =
+                    active_coordinator->ReconcileDiscovery();
+                if (!result.succeeded() && !result.error.empty()) {
+                    Print("post-reacquire reconcile error: {}\n",
+                          result.error);
+                    degraded = true;
+                }
+            } else {
+                Print("shell reacquire failed; host stays degraded\n");
+            }
         }
     };
 

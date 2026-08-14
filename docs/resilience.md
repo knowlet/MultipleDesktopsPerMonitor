@@ -15,6 +15,13 @@ reassign workspaces to the wrong physical monitor.
   records the host as degraded instead of silently losing ownership.
 - A monitor that returns is re-bound by device identity; its workspaces
   recover automatically.
+- A new monitor takes the lowest missing config index, so a binding set
+  where only a higher index survived a suspend never collides with the
+  newcomer.
+- If a surviving monitor's real handle differs from the handle the engine
+  was configured with, the host degrades until a restart: the engine and
+  assignment registry are keyed by the startup MonitorId and cannot be
+  rebound at runtime.
 
 The host handles `WM_DISPLAYCHANGE` by re-enumerating and re-running the
 mapper.
@@ -36,6 +43,18 @@ periodic reconcile timer) and never keeps invoking stale interface pointers.
 Full Explorer-restart convergence is exercised through the same
 re-acquire path.
 
+Re-acquisition rebuilds the whole `ShellRuntimeBundle` atomically:
+`IServiceProvider`, `IVirtualDesktopManagerInternal` plus its layout and
+`CanViewMoveDesktops` entry, `IApplicationViewCollection` plus
+`GetViewForHwnd`, the documented `IVirtualDesktopManager`, and both
+Carrier/Parking desktop objects. Every mutation lambda reads from the live
+bundle, so no stale COM object or method entry survives a swap. A
+re-acquired bundle is only adopted when it still names the same current
+Carrier desktop and the same Parking desktop; a changed desktop layout
+keeps the host degraded until a restart can re-adopt it. The degraded
+state gates `do_switch` and reconciliation, and the 3 s reconcile timer
+keeps retrying the bundle re-acquisition.
+
 ## Reconciliation after event loss
 
 Periodic authoritative reconciliation (3 s timer) plus the coordinator's
@@ -48,7 +67,8 @@ engine/lifecycle layers.
 
 `workspace-host-resilience-test` verifies deterministically: initial order
 binding, suspension when a monitor disappears, recovery when it returns, and
-device-identity preservation across enumeration order changes.
+device-identity preservation across enumeration order changes, and lowest
+missing-index assignment for a newly added monitor.
 
 `workspace-manager --run --self-resilience --seconds N` posts
 `WM_DISPLAYCHANGE` and a resume broadcast to the host's own message window
