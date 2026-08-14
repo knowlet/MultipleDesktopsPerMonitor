@@ -20,6 +20,7 @@
 #include "window_discovery.h"
 #include "workspace_assignment.h"
 #include "workspace_coordinator.h"
+#include "workspace_live_focus.h"
 #include "workspace_live_lifecycle.h"
 #include "workspace_readonly_host.h"
 #include "workspace_startup.h"
@@ -107,6 +108,10 @@ void Usage() {
         "                      assignment, lifecycle, journaled coordinator, and\n"
         "                      one monitor-local A1 -> A2 -> A1 round-trip;\n"
         "                      requires --confirm-mutate\n"
+        "  workspace-live-focus-test\n"
+        "                      deterministic injected per-workspace focus/Z-order\n"
+        "                      capture, switch, and identity-checked presentation\n"
+        "                      restore planning/execution; read-only\n"
         "  workspace-live-lifecycle-test\n"
         "                      deterministic read-only lifecycle and explicit\n"
         "                      in-memory assignment integration\n"
@@ -251,6 +256,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveManagerTest(confirm_mutate);
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
+    } else if (cmd == "workspace-live-focus-test") {
+        rc = vd::CmdWorkspaceLiveFocusTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
     } else if (cmd == "workspace-assignment-test") {
