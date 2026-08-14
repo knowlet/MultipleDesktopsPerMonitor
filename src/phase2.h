@@ -134,7 +134,8 @@ int CmdWorkspaceManager(bool confirm_mutate, const char* config_path = nullptr);
 // Long-running host mode: single-instance mutex, message loop with hotkeys,
 // tray menu, and periodic reconciliation. `seconds` > 0 bounds the run for
 // automated validation; 0 runs until WM_CLOSE / tray Exit / session end.
-int CmdWorkspaceManagerRun(const char* config_path, int seconds);
+int CmdWorkspaceManagerRun(const char* config_path, int seconds,
+                           bool self_resilience);
 
 // Requests a clean shutdown of a running workspace-manager instance.
 int CmdWorkspaceManagerStop();

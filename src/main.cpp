@@ -22,6 +22,7 @@
 #include "workspace_coordinator.h"
 #include "workspace_live_focus.h"
 #include "workspace_manager.h"
+#include "workspace_host_resilience.h"
 #include "workspace_live_lifecycle.h"
 #include "workspace_readonly_host.h"
 #include "workspace_startup.h"
@@ -120,6 +121,9 @@ void Usage() {
         "  workspace-manager-test\n"
         "                      deterministic config parsing, hotkey binding\n"
         "                      validation, and dispatch resolution; read-only\n"
+        "  workspace-host-resilience-test\n"
+        "                      deterministic monitor topology suspend/recover and\n"
+        "                      device-identity mapping; read-only\n"
         "  workspace-live-focus-test\n"
         "                      deterministic injected per-workspace focus/Z-order\n"
         "                      capture, switch, and identity-checked presentation\n"
@@ -161,6 +165,8 @@ void Usage() {
         "  --stop              'workspace-manager': request clean shutdown\n"
         "  --install-startup   'workspace-manager': add the HKCU Run entry\n"
         "  --remove-startup    'workspace-manager': remove the HKCU Run entry\n"
+        "  --self-resilience   'workspace-manager --run': post display/resume\n"
+        "                      events to the host window for live validation\n"
         "  --help, -h          this text\n"
         "\n"
         "This build never invokes a vtable slot that is not recorded with an agreed\n"
@@ -198,6 +204,7 @@ int main(int argc, char** argv) {
     bool stop_mode = false;
     bool install_startup = false;
     bool remove_startup = false;
+    bool self_resilience = false;
     std::string config_path;
     std::string browser;
     int seconds = 0;
@@ -223,6 +230,8 @@ int main(int argc, char** argv) {
             install_startup = true;
         } else if (a == "--remove-startup") {
             remove_startup = true;
+        } else if (a == "--self-resilience") {
+            self_resilience = true;
         } else if (a == "--seconds" && i + 1 < argc) {
             seconds = std::atoi(argv[++i]);
         } else if (a == "--help" || a == "-h" || a == "/?") {
@@ -297,7 +306,8 @@ int main(int argc, char** argv) {
                                                     : config_path.c_str());
         } else if (run_mode) {
             rc = vd::CmdWorkspaceManagerRun(
-                config_path.empty() ? nullptr : config_path.c_str(), seconds);
+                config_path.empty() ? nullptr : config_path.c_str(), seconds,
+                self_resilience);
         } else {
             rc = vd::CmdWorkspaceManager(confirm_mutate,
                                          config_path.empty()
@@ -306,6 +316,8 @@ int main(int argc, char** argv) {
         }
     } else if (cmd == "workspace-manager-test") {
         rc = vd::CmdWorkspaceManagerTest();
+    } else if (cmd == "workspace-host-resilience-test") {
+        rc = vd::CmdWorkspaceHostResilienceTest();
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-live-focus-test") {

@@ -21,6 +21,7 @@
 #include "window_discovery.h"
 #include "workspace_readonly_host.h"
 #include "workspace_manager.h"
+#include "workspace_host_resilience.h"
 
 namespace vd {
 namespace {
@@ -6766,6 +6767,8 @@ struct ManagerMainContext {
     std::function<bool(UINT modifiers, UINT vk)> hotkey_handler;
     std::function<void()> reconcile_handler;
     std::function<void(int command)> tray_command_handler;
+    std::function<void()> display_change_handler;
+    std::function<void()> resume_handler;
     bool exit_requested = false;
 };
 
@@ -6808,6 +6811,18 @@ LRESULT CALLBACK ManagerMainWindowProc(HWND hwnd, UINT message,
         }
         return 0;
     }
+    if (message == WM_DISPLAYCHANGE && context != nullptr) {
+        if (context->display_change_handler) {
+            context->display_change_handler();
+        }
+        return 0;
+    }
+    if (message == WM_POWERBROADCAST && context != nullptr) {
+        if (wparam == PBT_APMRESUMESUSPEND && context->resume_handler) {
+            context->resume_handler();
+        }
+        return TRUE;
+    }
     if (message == WM_QUERYENDSESSION) {
         if (context != nullptr) context->exit_requested = true;
         return TRUE;
@@ -6838,7 +6853,8 @@ bool EnsureManagerMainClass() {
 
 }  // namespace
 
-int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
+int CmdWorkspaceManagerRun(const char* config_path, int seconds,
+                           bool self_resilience) {
     Heading("workspace-manager --run");
     Field("scope", "long-running host: hotkeys, tray, periodic reconciliation");
     Field("managed scope", "probe-owned windows (live gate)");
@@ -7382,7 +7398,50 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
         std::size_t hotkey_dispatches = 0;
         std::size_t switches_committed = 0;
         HWND hotkey_window = nullptr;
+        MonitorTopologyMapper topology_mapper;
+        std::vector<MonitorTopologyMapper::BoundMonitor> bound_monitors;
+        std::vector<std::size_t> missing_monitors;
+        HostResilienceState resilience;
+        std::size_t host_expected_monitors = 0;
+        auto refresh_topology = [&]() {
+            const std::vector<MonitorRec> current = EnumerateMonitors();
+            std::vector<std::pair<MonitorId, std::string>> real;
+            for (const MonitorRec& monitor : current) {
+                real.push_back({reinterpret_cast<MonitorId>(monitor.handle),
+                                ToUtf8(monitor.device)});
+            }
+            topology_mapper.Update(real, bound_monitors, missing_monitors,
+                                   host_expected_monitors);
+            const std::size_t presence_size =
+                bound_monitors.empty()
+                    ? 0
+                    : bound_monitors.back().config_index + 1;
+            std::vector<bool> present(presence_size, false);
+            for (const auto& entry : bound_monitors) {
+                if (entry.config_index < present.size()) {
+                    present[entry.config_index] = true;
+                }
+            }
+            resilience.monitor_present = std::move(present);
+            resilience.degraded =
+                resilience.degraded || !missing_monitors.empty();
+        };
+        {
+            const std::vector<MonitorRec> current = EnumerateMonitors();
+            for (std::size_t i = 0; i < current.size(); ++i) {
+                bound_monitors.push_back(
+                    {i, reinterpret_cast<MonitorId>(current[i].handle),
+                     ToUtf8(current[i].device)});
+            }
+            host_expected_monitors = bound_monitors.size();
+            resilience.monitor_present.assign(host_expected_monitors, true);
+        }
         auto do_switch = [&](WorkspaceId target) {
+            if (resilience.monitor_present.empty() ||
+                !resilience.monitor_present[0]) {
+                Field("switch skipped", "monitor A suspended");
+                return CoordinatorResult{};
+            }
             const CoordinatorResult result =
                 coordinator.Switch(monitor_a_id, target);
             if (result.succeeded() && result.transaction.committed) {
@@ -7439,6 +7498,35 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
                 ::PostMessageW(hotkey_window, WM_CLOSE, 0, 0);
             }
         };
+        main_context.display_change_handler = [&]() {
+            ++resilience.display_changes_handled;
+            refresh_topology();
+        };
+        main_context.resume_handler = [&]() {
+            ++resilience.resume_events_handled;
+            refresh_topology();
+            GUID current{};
+            if (!ReadCurrentDesktopId(manager, current)) {
+                resilience.shell_lost = true;
+                resilience.degraded = true;
+                ++resilience.shell_reacquire_attempts;
+                Com<IServiceProvider> fresh_sp;
+                if (SUCCEEDED(GetImmersiveShell(fresh_sp)) && fresh_sp) {
+                    ManagerInternal fresh_manager =
+                        AcquireManagerInternal(fresh_sp.Get());
+                    DesktopSnapshot fresh_carrier;
+                    HRESULT fresh_hr = E_ABORT;
+                    if (fresh_manager.obj && fresh_manager.layout &&
+                        ReadCurrentDesktop(fresh_manager, fresh_carrier,
+                                           &fresh_hr) &&
+                        ::IsEqualGUID(fresh_carrier.id, carrier.id)) {
+                        resilience.shell_lost = false;
+                        sp = std::move(fresh_sp);
+                        manager = std::move(fresh_manager);
+                    }
+                }
+            }
+        };
 
         if (!EnsureManagerMainClass()) {
             Field("result", "ERROR");
@@ -7487,6 +7575,13 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
         Field("run mode", seconds > 0
                               ? std::format("bounded {}s", seconds)
                               : "unbounded (stop via --stop or tray Exit)");
+        if (self_resilience) {
+            // Post the resilience events to our own window: identical message
+            // path to external display-change / resume delivery.
+            ::PostMessageW(hotkey_window, WM_DISPLAYCHANGE, 0, 0);
+            ::PostMessageW(hotkey_window, WM_POWERBROADCAST,
+                           static_cast<WPARAM>(PBT_APMRESUMESUSPEND), 0);
+        }
 
         MSG message{};
         bool loop_error = false;
@@ -7515,6 +7610,13 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
         Field("uptime reconciliations", std::format("{}", reconcile_count));
         Field("hotkey dispatches", std::format("{}", hotkey_dispatches));
         Field("switches committed", std::format("{}", switches_committed));
+        Field("display changes handled",
+              std::format("{}", resilience.display_changes_handled));
+        Field("resume events handled",
+              std::format("{}", resilience.resume_events_handled));
+        Field("shell reacquire attempts",
+              std::format("{}", resilience.shell_reacquire_attempts));
+        Field("host degraded", resilience.degraded ? "yes" : "no");
         std::string pending_error;
         const std::optional<SwitchPlan> pending =
             journal.ReadPending(&pending_error);
