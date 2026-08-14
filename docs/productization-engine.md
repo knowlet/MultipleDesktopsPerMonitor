@@ -301,6 +301,19 @@ probe-owned manager gate: the composed discovery, assignment, lifecycle,
 coordinator, and journal boundaries execute a complete monitor-local
 A1 -> A2 -> A1 round-trip on the live shell.
 
+`workspace-live-focus-test` is the deterministic focus/Z-order boundary. It
+composes injected discovery, assignment, and the engine, then derives each
+workspace's `last_foreground` and top-to-bottom Z-order from the complete
+snapshot presentation state. After an A1 -> A2 -> A1 switch, it verifies that
+`PreparePresentationRestore` emits placements first, then relative Z-order
+bottom-to-top, with the incoming workspace's foreground activation last, and
+that `ExecutePresentationRestore` applies those operations in that order with
+an identity check before every native call. Fail-closed cases are covered: an
+identity/capability mismatch stops before the failing operation, an altered
+plan is rejected before mutation, and an incomplete Z-order snapshot cannot
+produce a restore plan. Monitor B control windows never appear in the plan.
+The command performs no COM, native window, desktop, or foreground mutation.
+
 ## Deliberate next boundaries
 
 The controlled `logical-workspace-test` now provides live integration
