@@ -225,7 +225,10 @@ state, desktop role, presentation, and runtime capabilities, then classifies
 records as `Managed`, `Unsupported`, or `Ambiguous` without assigning logical
 workspaces or using executable names. Incomplete enumeration, duplicate
 identity, unstable observation, invalid desktop role, or backend exceptions
-fail closed and preserve the prior snapshot. `workspace-discovery-test`
+fail closed and preserve the prior snapshot; a per-window observation limit
+(a protected process that cannot be opened, or a HWND that vanishes mid-scan)
+is contained as an `Ambiguous` record instead of aborting the scan.
+`workspace-discovery-test`
 exercises the injected seam without COM or native mutation; the system backend
 is wired into `workspace-live-discovery-test` for a single bounded bootstrap
 snapshot, but is not yet wired into the long-running

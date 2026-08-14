@@ -203,8 +203,13 @@ previous result unchanged on observation failure or callback exception. It
 classifies only proven Carrier/Parking top-level records as `Managed`;
 unsupported capability or tool/owned windows are retained as `Unsupported`,
 while missing identity, monitor, desktop state, or a valid native role is
-`Ambiguous`. It deliberately does not assign logical workspaces, mutate native
-state, or branch on executable names. Run:
+`Ambiguous`. Per-window observation limits are contained: a protected process
+whose identity cannot be opened, or a HWND that vanishes mid-scan, is retained
+as an `Ambiguous` record and the complete scan continues. Only enumeration
+failure, duplicate HWNDs/identities, identity instability during an
+observation, and callback exceptions remain scan-fatal. The layer deliberately
+does not assign logical workspaces, mutate native state, or branch on
+executable names. Run:
 
 ```powershell
 .\build\vdprobe.exe workspace-discovery-test
