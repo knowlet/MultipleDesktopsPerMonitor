@@ -4524,7 +4524,7 @@ int CmdWorkspaceLiveReadOnlyHostTest() {
 
 // ------------------------------------------------ workspace-live-manager-test
 
-int CmdWorkspaceLiveManagerTest(bool confirm_mutate) {
+int CmdWorkspaceLiveManagerTest(bool confirm_mutate, int rounds) {
     Heading("workspace-live-manager-test");
     Field("scope", "three vdprobe-owned windows; A1 -> A2 -> A1");
     Field("discovery", "complete system EnumWindows + capability augmentation");
@@ -5037,7 +5037,7 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3);
+            observe_role, &journal, 3, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -5073,18 +5073,21 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate) {
         ok = reconciled.succeeded() && control_unchanged();
         CoordinatorResult forward;
         CoordinatorResult reverse;
-        if (ok) {
+        for (int round = 1; round <= rounds && ok; ++round) {
             forward = coordinator.Switch(monitor_a_id, kA2);
-            report_coordinator("A1 -> A2", forward);
+            report_coordinator(
+                std::format("A1 -> A2 (round {}/{})", round, rounds).c_str(),
+                forward);
             const bool forward_control_unchanged = control_unchanged();
             ok = forward.succeeded() && forward.transaction.committed &&
                  engine.Monitor(monitor_a_id)->active == kA2 &&
                  engine.Monitor(monitor_b_id)->active == kB1 &&
                  forward_control_unchanged;
-        }
-        if (ok) {
+            if (!ok) break;
             reverse = coordinator.Switch(monitor_a_id, kA1);
-            report_coordinator("A2 -> A1", reverse);
+            report_coordinator(
+                std::format("A2 -> A1 (round {}/{})", round, rounds).c_str(),
+                reverse);
             const bool reverse_control_unchanged = control_unchanged();
             ok = reverse.succeeded() && reverse.transaction.committed &&
                  engine.Monitor(monitor_a_id)->active == kA1 &&
@@ -5694,7 +5697,7 @@ int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3);
+            observe_role, &journal, 3, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -6615,7 +6618,7 @@ int CmdWorkspaceManager(bool confirm_mutate, const char* config_path) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3);
+            observe_role, &journal, 3, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -7406,7 +7409,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3);
+            observe_role, &journal, 3, 5);
 
         std::size_t hotkey_dispatches = 0;
         std::size_t switches_committed = 0;
@@ -7815,6 +7818,76 @@ int CmdWorkspaceManagerInstallStartup(bool remove,
     Field("startup entry", "installed (HKCU Run)");
     Field("command", ToUtf8(command));
     Field("result", "PASS");
+    return 0;
+}
+
+int CmdWorkspaceManagerDiagnostics(const char* config_path) {
+    Heading("workspace-manager diagnostics");
+    Print("version: vdprobe 0.1.0 (per-monitor workspace manager)\n");
+
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    const auto rtl_get_version = []() -> RtlGetVersionFn {
+        HMODULE module = ::GetModuleHandleW(L"ntdll.dll");
+        return module == nullptr
+                   ? nullptr
+                   : reinterpret_cast<RtlGetVersionFn>(
+                         ::GetProcAddress(module, "RtlGetVersion"));
+    }();
+    if (rtl_get_version != nullptr) {
+        OSVERSIONINFOW info{};
+        info.dwOSVersionInfoSize = sizeof(info);
+        if (rtl_get_version(&info) == 0) {
+            Print("windows build: {}.{}.{}\n", info.dwMajorVersion,
+                  info.dwMinorVersion, info.dwBuildNumber);
+        }
+    }
+
+    const std::vector<MonitorRec> monitors = EnumerateMonitors();
+    Print("monitors: {}\n", monitors.size());
+    for (const MonitorRec& monitor : monitors) {
+        Print("  {} work=({},{})-({},{})\n", ToUtf8(monitor.device),
+              monitor.work.left, monitor.work.top, monitor.work.right,
+              monitor.work.bottom);
+    }
+
+    if (config_path != nullptr && *config_path != '\0') {
+        WorkspaceManagerConfig config;
+        std::string error;
+        if (LoadManagerConfig(std::filesystem::path(config_path), config,
+                              &error)) {
+            Print("config: {} (monitors={}, hotkeys={}, migration={}, "
+                  "quarantine={}, log-level={})\n",
+                  config_path, config.monitors.size(), config.bindings.size(),
+                  config.migration_policy ==
+                          MonitorMigrationPolicy::ReassignToDestinationActive
+                      ? "reassign"
+                      : "fail-closed",
+                  config.quarantine_enabled ? "on" : "off",
+                  config.log_level == ManagerLogLevel::Debug
+                      ? "debug"
+                      : config.log_level == ManagerLogLevel::Info
+                            ? "info"
+                            : config.log_level == ManagerLogLevel::Warn
+                                  ? "warn"
+                                  : "error");
+        } else {
+            Print("config: {} (INVALID: {})\n", config_path, error);
+        }
+    } else {
+        Print("config: none (built-in defaults)\n");
+    }
+
+    const std::filesystem::path journal_path =
+        std::filesystem::temp_directory_path() /
+        "vdprobe-workspace-manager.journal";
+    WorkspaceJournal journal(journal_path);
+    std::string journal_error;
+    const std::optional<SwitchPlan> pending =
+        journal.ReadPending(&journal_error);
+    Print("journal: {} (pending={}, error={})\n", journal_path.string(),
+          pending ? "yes" : "no",
+          journal_error.empty() ? "none" : journal_error);
+    Field("result", "OK");
     return 0;
 }
 
@@ -8351,7 +8424,7 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             WorkspaceJournal journal(journal_path);
             WorkspaceCoordinator coordinator(
                 engine, lifecycle, lifecycle_source, discover_owned_windows,
-                move_to_role, observe_role, &journal, 3);
+                move_to_role, observe_role, &journal, 3, 5);
 
             auto switch_logical = [&](WorkspaceId outgoing,
                                        WorkspaceId incoming) -> bool {

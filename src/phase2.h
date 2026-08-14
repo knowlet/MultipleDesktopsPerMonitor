@@ -116,7 +116,7 @@ int CmdWorkspaceLiveReadOnlyHostTest();
 // Discovery is system-backed but capability promotion is restricted to the
 // exact probe HWND generations. It never calls SwitchDesktop or creates or
 // removes a native desktop.
-int CmdWorkspaceLiveManagerTest(bool confirm_mutate);
+int CmdWorkspaceLiveManagerTest(bool confirm_mutate, int rounds = 1);
 
 // Confirmation-gated live focus restore milestone. Spawns four vdprobe-owned
 // windows (A1 top/bottom, A2, B1), switches monitor A A1 -> A2 -> A1 through
@@ -147,6 +147,10 @@ int CmdWorkspaceManagerReload();
 // `workspace-manager --run` at sign-in.
 int CmdWorkspaceManagerInstallStartup(bool remove,
                                       const char* config_path = nullptr);
+
+// Standalone diagnostics bundle: version, Windows build, monitor topology,
+// config status, and journal status.
+int CmdWorkspaceManagerDiagnostics(const char* config_path = nullptr);
 
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
