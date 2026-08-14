@@ -331,6 +331,23 @@ best-effort failures. Monitor B and the session-global Carrier stay unchanged,
 the stable journal has no pending transaction, and all probe windows are
 restored and closed before cleanup. The live run reports `RESULT=PASS`.
 
+`workspace-manager-test` and `workspace-manager --confirm-mutate` form the
+minimal hotkey/UI boundary. The deterministic test parses the line-based
+manager config (`hotkey <mods>+<key> <monitor> <workspace>`, `journal`,
+`tray`), rejects duplicate hotkeys, unknown modifiers/keys, zero
+monitor/workspace values, and unknown directives, and resolves WM_HOTKEY
+modifier/key pairs to monitor/workspace targets. The live self-test registers
+real `RegisterHotKey` bindings (Ctrl+Alt+F9 -> monitor A workspace A2,
+Ctrl+Alt+F10 -> monitor A workspace A1) on a message-only window, adds a tray
+icon with `Shell_NotifyIcon`, and posts WM_HOTKEY messages that the window
+procedure resolves through the same binding table and hands to
+`WorkspaceCoordinator::Switch`; both probe-owned switches commit, Monitor B
+and the session-global Carrier stay unchanged, and hotkeys, tray icon,
+lifecycle source, and journal are all cleaned up. The live run reports
+`RESULT=PASS`. This is a bounded self-test, not yet a long-running user
+manager: production assignment policy, config-file discovery, focus policy,
+and process hosting remain separate work.
+
 ## Deliberate next boundaries
 
 The controlled `logical-workspace-test` now provides live integration
