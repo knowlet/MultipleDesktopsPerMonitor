@@ -1,0 +1,56 @@
+# Runtime resilience
+
+The long-running host converges back to a valid Carrier/Parking state after
+common environmental disruptions instead of corrupting logical ownership.
+
+## Monitor topology changes
+
+`MonitorTopologyMapper` (src/workspace_host_resilience.{h,cpp}) tracks the
+configured monitors. Bindings prefer device identity (the monitor device
+string) and fall back to enumeration order, so re-ordering by Windows does not
+reassign workspaces to the wrong physical monitor.
+
+- A configured monitor that disappears is removed from the binding list and
+  its workspaces are suspended: the host skips switches for that monitor and
+  records the host as degraded instead of silently losing ownership.
+- A monitor that returns is re-bound by device identity; its workspaces
+  recover automatically.
+
+The host handles `WM_DISPLAYCHANGE` by re-enumerating and re-running the
+mapper.
+
+## Sleep / resume
+
+The host handles `WM_POWERBROADCAST` with `PBT_APMRESUMESUSPEND`: it
+re-enumerates the monitor topology and revalidates the Shell. If the current
+desktop can no longer be read, it marks the shell lost, retries
+`GetImmersiveShell`/manager acquisition, and only resumes when the
+re-acquired Carrier identity matches the engine's; otherwise the host stays
+degraded and stops native mutations.
+
+## Explorer / Shell loss
+
+Shell loss surfaces as failed reads or RPC disconnects. The host treats them
+as degraded (stop mutations, retain logical state, keep retrying on the
+periodic reconcile timer) and never keeps invoking stale interface pointers.
+Full Explorer-restart convergence is exercised through the same
+re-acquire path.
+
+## Reconciliation after event loss
+
+Periodic authoritative reconciliation (3 s timer) plus the coordinator's
+bounded retry and quiet-boundary checks converge the registry back to the
+Carrier/Parking invariant even when individual WinEvent hints are missed or
+reordered. HWND reuse and process restarts remain generation-safe in the
+engine/lifecycle layers.
+
+## Automated validation
+
+`workspace-host-resilience-test` verifies deterministically: initial order
+binding, suspension when a monitor disappears, recovery when it returns, and
+device-identity preservation across enumeration order changes.
+
+`workspace-manager --run --self-resilience --seconds N` posts
+`WM_DISPLAYCHANGE` and a resume broadcast to the host's own message window
+(the same message path as external delivery) and reports the handled counts;
+the live run reports `RESULT=PASS` with clean shutdown.

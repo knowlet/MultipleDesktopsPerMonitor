@@ -219,7 +219,9 @@ assignment policy, log level, journal, tray) is documented in
 [docs/configuration.md](docs/configuration.md). The long-running host
 (single instance, HKCU Run startup, tray/hotkey loop, periodic
 reconciliation, graceful shutdown) is documented in
-[docs/host.md](docs/host.md). Run
+[docs/host.md](docs/host.md). Monitor topology suspend/recover, sleep/resume,
+and Shell-loss resilience are documented in
+[docs/resilience.md](docs/resilience.md). Run
 `workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
