@@ -21,6 +21,7 @@
 #include "workspace_assignment.h"
 #include "workspace_coordinator.h"
 #include "workspace_live_focus.h"
+#include "workspace_manager.h"
 #include "workspace_live_lifecycle.h"
 #include "workspace_readonly_host.h"
 #include "workspace_startup.h"
@@ -112,6 +113,13 @@ void Usage() {
         "                      live identity-checked placement/Z-order restore of\n"
         "                      probe-owned windows across an A1 -> A2 -> A1 switch;\n"
         "                      requires --confirm-mutate\n"
+        "  workspace-manager\n"
+        "                      minimal manager self-test: real hotkeys and tray\n"
+        "                      icon drive one probe-owned A1 -> A2 -> A1 switch;\n"
+        "                      requires --confirm-mutate\n"
+        "  workspace-manager-test\n"
+        "                      deterministic config parsing, hotkey binding\n"
+        "                      validation, and dispatch resolution; read-only\n"
         "  workspace-live-focus-test\n"
         "                      deterministic injected per-workspace focus/Z-order\n"
         "                      capture, switch, and identity-checked presentation\n"
@@ -260,6 +268,10 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveManagerTest(confirm_mutate);
     } else if (cmd == "workspace-live-focus-restore-test") {
         rc = vd::CmdWorkspaceLiveFocusRestoreTest(confirm_mutate);
+    } else if (cmd == "workspace-manager") {
+        rc = vd::CmdWorkspaceManager(confirm_mutate);
+    } else if (cmd == "workspace-manager-test") {
+        rc = vd::CmdWorkspaceManagerTest();
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-live-focus-test") {

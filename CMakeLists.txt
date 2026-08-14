@@ -34,6 +34,7 @@ add_executable(vdprobe
         src/workspace_readonly_host.cpp
         src/workspace_live_lifecycle.cpp
         src/workspace_live_focus.cpp
+        src/workspace_manager.cpp
         src/notifysink.cpp
 )
 
