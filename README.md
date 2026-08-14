@@ -73,6 +73,7 @@ Gated feasibility tests:
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 | `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |
 | `vdprobe workspace-readonly-host-test` | productization composition boundary: deterministic, non-mutating injected discovery, assignment, owner-thread lifecycle, coordinator, and startup wiring; no real HWND, COM, move, observe, or recovery callback is used |
+| `vdprobe workspace-live-manager-test --confirm-mutate` | bounded mutable integration: creates exactly three vdprobe-owned windows, uses system discovery plus capability checks, and runs one monitor-local A1 -> A2 -> A1 round-trip; no user HWNDs or native desktop lifecycle are touched |
 
 `--all` makes `windows` include invisible and untitled HWNDs. Add `--help` for
 the full usage text.
@@ -301,6 +302,30 @@ production message loop. It also does not choose a system capability provider,
 production monitor/workspace IDs, journal location, focus/Z-order policy,
 hotkeys, or UI. It is not a long-running product manager and does not
 establish live-shell compatibility evidence.
+
+`workspace-live-manager-test --confirm-mutate` is the first bounded mutable
+composition of the live boundaries. It creates exactly three disposable
+vdprobe-owned top-level windows (A1, A2, and B1), promotes only those exact
+HWND/PID/process-generation identities to `Managed`, and performs one
+monitor-local A1 -> A2 -> A1 round-trip through
+`WorkspaceAssignmentAdapter`, `WindowLifecycleAdapter`,
+`WinEventLifecycleSource`, `WorkspaceCoordinator`, and `WorkspaceJournal`.
+Every move revalidates the HWND generation, monitor, `GetViewForHwnd`, and
+`CanViewMoveDesktops`; Monitor B and the session-global Carrier are checked
+after each switch. The command never calls `SwitchDesktop`, creates/removes a
+native desktop, or promotes/mutates an existing user window. Probe windows
+are restored before lifecycle shutdown and journal cleanup; cleanup failures
+remain failures, and a pending or malformed stable journal is preserved.
+
+This is a bounded integration probe, not a long-running user-facing manager.
+It has no automatic application assignment, persistent workspace
+configuration, hotkeys, tray/UI, or production journal-path policy. If the
+host denies ImmersiveShell access, it reports
+`RESULT=ENVIRONMENT-BLOCKED`, `mutation_started=no`, and exit status `77`;
+that is an environment limitation and not live semantics evidence. The
+deterministic engine, discovery, assignment, coordinator, startup,
+read-only-host, and lifecycle suites remain the regression evidence for the
+non-live boundaries.
 
 On hosts where ImmersiveShell access is denied, either gated test prints
 `result = ENVIRONMENT-BLOCKED`, reports `mutation_started = no`, and exits with

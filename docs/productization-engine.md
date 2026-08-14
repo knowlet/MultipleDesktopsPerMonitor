@@ -248,6 +248,26 @@ cannot become quiet within the bound reports `RESULT=ENVIRONMENT-BLOCKED` and
 `mutation_started=no`; all other failures report `RESULT=ERROR` with the same
 non-mutation marker.
 
+`workspace-live-manager-test --confirm-mutate` is the first bounded mutable
+composition of these boundaries. It creates exactly three disposable
+vdprobe-owned top-level windows (A1, A2, and B1), promotes only their exact
+HWND/PID/process-generation identities to `Managed`, and performs one
+monitor-local A1 -> A2 -> A1 round-trip through the assignment, lifecycle,
+coordinator, and journal layers. Each native move revalidates the window
+generation, monitor, `GetViewForHwnd`, and `CanViewMoveDesktops`; Monitor B
+and the session-global Carrier are verified after each switch. The command
+never calls `SwitchDesktop`, creates/removes a native desktop, or promotes
+an existing user window. Probe windows are restored before lifecycle shutdown
+and journal cleanup, and pending or malformed stable journals are preserved.
+
+This is a bounded integration probe, not a long-running user-facing manager.
+It does not provide automatic application assignment, persistent workspace
+configuration, production journal-path selection, focus/Z-order policy,
+hotkeys, or UI. The command requires `--confirm-mutate`; without it, mutation
+is refused. If ImmersiveShell access is denied before probe creation, it emits
+`RESULT=ENVIRONMENT-BLOCKED`, `mutation_started=no`, and exit status `77`.
+That status is an environment limitation, not live semantics evidence.
+
 ## Deliberate next boundaries
 
 The controlled `logical-workspace-test` now provides live integration
