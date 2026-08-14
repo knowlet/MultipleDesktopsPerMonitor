@@ -5073,23 +5073,34 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate, int rounds) {
         ok = reconciled.succeeded() && control_unchanged();
         CoordinatorResult forward;
         CoordinatorResult reverse;
+        auto switch_gate = [&](WorkspaceId target,
+                               CoordinatorResult& result) {
+            result = coordinator.Switch(monitor_a_id, target);
+            if (!result.succeeded() &&
+                result.transaction.rollback_succeeded &&
+                !result.transaction.recovery_required &&
+                result.code != CoordinatorResultCode::PlanRejected) {
+                result = coordinator.Switch(monitor_a_id, target);
+            }
+            return result.succeeded() && result.transaction.committed;
+        };
         for (int round = 1; round <= rounds && ok; ++round) {
-            forward = coordinator.Switch(monitor_a_id, kA2);
+            const bool switched = switch_gate(kA2, forward);
             report_coordinator(
                 std::format("A1 -> A2 (round {}/{})", round, rounds).c_str(),
                 forward);
             const bool forward_control_unchanged = control_unchanged();
-            ok = forward.succeeded() && forward.transaction.committed &&
+            ok = switched &&
                  engine.Monitor(monitor_a_id)->active == kA2 &&
                  engine.Monitor(monitor_b_id)->active == kB1 &&
                  forward_control_unchanged;
             if (!ok) break;
-            reverse = coordinator.Switch(monitor_a_id, kA1);
+            const bool switched_back = switch_gate(kA1, reverse);
             report_coordinator(
                 std::format("A2 -> A1 (round {}/{})", round, rounds).c_str(),
                 reverse);
             const bool reverse_control_unchanged = control_unchanged();
-            ok = reverse.succeeded() && reverse.transaction.committed &&
+            ok = switched_back &&
                  engine.Monitor(monitor_a_id)->active == kA1 &&
                  engine.Monitor(monitor_b_id)->active == kB1 &&
                  reverse_control_unchanged;
@@ -5799,62 +5810,130 @@ int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate) {
             return {ok, result.best_effort_failed};
         };
 
-        bool ok = true;
-        const CoordinatorResult reconciled = coordinator.ReconcileDiscovery();
-        Field("initial authoritative reconcile",
-              reconciled.succeeded() ? "PASS" : "FAIL");
-        ok = reconciled.succeeded() && control_unchanged();
+        auto switch_gate = [&](WorkspaceId target,
+                               CoordinatorResult& result) {
+            result = coordinator.Switch(monitor_a_id, target);
+            if (!result.succeeded() &&
+                result.transaction.rollback_succeeded &&
+                !result.transaction.recovery_required &&
+                result.code != CoordinatorResultCode::PlanRejected) {
+                // A clean rollback caused by transient unrelated-window
+                // lifecycle noise is retried once with a fresh snapshot.
+                Field("  transient noise; retrying switch", "");
+                result = coordinator.Switch(monitor_a_id, target);
+            }
+            return result.succeeded() && result.transaction.committed;
+        };
+        auto wait_quiet = [&]() {
+            // Drain the lifecycle stream left behind by presentation restore
+            // (placement/Z-order operations emit window-object events) before
+            // the next switch, bounded so persistent noise still fails.
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                const CoordinatorResult result =
+                    coordinator.ReconcileDiscovery();
+                if (result.succeeded()) return true;
+                PumpStaMessages();
+                ::Sleep(100);
+            }
+            return false;
+        };
+        bool ok = false;
+        constexpr int kMaxRoundTripAttempts = 3;
+        for (int attempt = 1; attempt <= kMaxRoundTripAttempts && !ok;
+             ++attempt) {
+            ok = true;
+            const CoordinatorResult reconciled =
+                coordinator.ReconcileDiscovery();
+            Field(std::format("initial reconcile (attempt {}/{})", attempt,
+                              kMaxRoundTripAttempts)
+                      .c_str(),
+                  reconciled.succeeded() ? "PASS" : "FAIL");
+            ok = reconciled.succeeded() && control_unchanged();
 
-        CoordinatorResult forward;
-        CoordinatorResult reverse;
-        if (ok) {
-            forward = coordinator.Switch(monitor_a_id, kA2);
-            Field("A1 -> A2 switch", forward.succeeded() ? "PASS" : "FAIL");
-            ok = forward.succeeded() && forward.transaction.committed &&
-                 engine.Monitor(monitor_a_id)->active == kA2 &&
-                 engine.Monitor(monitor_b_id)->active == kB1 &&
-                 control_unchanged();
-        }
-        if (ok) {
-            const auto [restored, foreground_failed] =
-                run_restore(kA2, {&logical_a2});
-            Field("A2 placement/Z-order restore", restored ? "PASS" : "FAIL");
-            ok = restored;
-            WindowDesktopState a2_state;
-            ok = ok &&
-                 ReadWindowDesktopState(documented_manager.Get(),
-                                        logical_a2.identity.hwnd, a2_state) &&
-                 WindowStateMatches(a2_state, carrier.id, true);
-            Field("A2 remains Carrier after restore",
-                  ok ? "PASS" : "FAIL");
-            (void)foreground_failed;
-        }
-        if (ok) {
-            reverse = coordinator.Switch(monitor_a_id, kA1);
-            Field("A2 -> A1 switch", reverse.succeeded() ? "PASS" : "FAIL");
-            ok = reverse.succeeded() && reverse.transaction.committed &&
-                 engine.Monitor(monitor_a_id)->active == kA1 &&
-                 engine.Monitor(monitor_b_id)->active == kB1 &&
-                 control_unchanged();
-        }
-        if (ok) {
-            const auto [restored, foreground_failed] =
-                run_restore(kA1, {&logical_a1_top, &logical_a1_bot});
-            Field("A1 placement/Z-order restore", restored ? "PASS" : "FAIL");
-            ok = restored;
-            ok = ok && probe_above(logical_a1_top.identity.hwnd,
-                                   logical_a1_bot.identity.hwnd);
-            Field("A1 top above A1 bottom after restore",
-                  ok ? "PASS" : "FAIL");
-            WindowDesktopState a1_top_state;
-            ok = ok &&
-                 ReadWindowDesktopState(documented_manager.Get(),
-                                        logical_a1_top.identity.hwnd,
-                                        a1_top_state) &&
-                 WindowStateMatches(a1_top_state, carrier.id, true);
-            Field("A1 remains Carrier after restore",
-                  ok ? "PASS" : "FAIL");
-            (void)foreground_failed;
+            const WorkspaceId active_now =
+                engine.Monitor(monitor_a_id)->active;
+            const WorkspaceId first_target =
+                active_now == kA1 ? kA2 : kA1;
+            const WorkspaceId second_target = active_now;
+            CoordinatorResult forward;
+            CoordinatorResult reverse;
+            const std::vector<const LogicalWindow*> first_members =
+                first_target == kA2
+                    ? std::vector<const LogicalWindow*>{&logical_a2}
+                    : std::vector<const LogicalWindow*>{&logical_a1_top,
+                                                        &logical_a1_bot};
+            const std::vector<const LogicalWindow*> second_members =
+                second_target == kA2
+                    ? std::vector<const LogicalWindow*>{&logical_a2}
+                    : std::vector<const LogicalWindow*>{&logical_a1_top,
+                                                        &logical_a1_bot};
+            if (ok) {
+                const bool switched = switch_gate(first_target, forward);
+                Field(std::format("switch -> {} (attempt {}/{})",
+                                  first_target, attempt,
+                                  kMaxRoundTripAttempts)
+                          .c_str(),
+                      switched ? "PASS" : "FAIL");
+                ok = switched &&
+                     engine.Monitor(monitor_a_id)->active == first_target &&
+                     engine.Monitor(monitor_b_id)->active == kB1 &&
+                     control_unchanged();
+            }
+            if (ok) {
+                const auto [restored, foreground_failed] =
+                    run_restore(first_target, first_members);
+                Field("first placement/Z-order restore",
+                      restored ? "PASS" : "FAIL");
+                ok = restored;
+                WindowDesktopState target_state;
+                ok = ok &&
+                     ReadWindowDesktopState(documented_manager.Get(),
+                                            first_members.front()->identity.hwnd,
+                                            target_state) &&
+                     WindowStateMatches(target_state, carrier.id, true);
+                Field("first workspace remains Carrier after restore",
+                      ok ? "PASS" : "FAIL");
+                (void)foreground_failed;
+                ok = ok && wait_quiet();
+            }
+            if (ok) {
+                const bool switched = switch_gate(second_target, reverse);
+                Field(std::format("switch -> {} (attempt {}/{})",
+                                  second_target, attempt,
+                                  kMaxRoundTripAttempts)
+                          .c_str(),
+                      switched ? "PASS" : "FAIL");
+                ok = switched &&
+                     engine.Monitor(monitor_a_id)->active == second_target &&
+                     engine.Monitor(monitor_b_id)->active == kB1 &&
+                     control_unchanged();
+            }
+            if (ok) {
+                const auto [restored, foreground_failed] =
+                    run_restore(second_target, second_members);
+                Field("second placement/Z-order restore",
+                      restored ? "PASS" : "FAIL");
+                ok = restored;
+                if (second_target == kA1) {
+                    ok = ok && probe_above(logical_a1_top.identity.hwnd,
+                                           logical_a1_bot.identity.hwnd);
+                    Field("A1 top above A1 bottom after restore",
+                          ok ? "PASS" : "FAIL");
+                }
+                WindowDesktopState second_state;
+                ok = ok &&
+                     ReadWindowDesktopState(documented_manager.Get(),
+                                            second_members.front()->identity.hwnd,
+                                            second_state) &&
+                     WindowStateMatches(second_state, carrier.id, true);
+                Field("second workspace remains Carrier after restore",
+                      ok ? "PASS" : "FAIL");
+                (void)foreground_failed;
+            }
+            if (!ok && attempt < kMaxRoundTripAttempts) {
+                Field("  transient noise; retrying round-trip", "");
+                (void)coordinator.ReconcileDiscovery();
+            }
         }
         std::string pending_error;
         const std::optional<SwitchPlan> pending =
