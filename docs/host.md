@@ -1,8 +1,24 @@
 # Long-running host
 
-`workspace-manager --run` is the long-running per-user interactive host. It
-is not a Windows service: it operates on interactive-session windows and
-Shell COM objects and must run as the logged-in user.
+`workspace-manager --run --confirm-mutate` is the long-running per-user
+interactive production host. It is not a Windows service: it operates on
+interactive-session windows and Shell COM objects and must run as the logged-in
+user.
+
+The production host composes the real user-window runtime: complete
+`EnumWindows` discovery with per-window capability augmentation
+(`GetViewForHwnd`/`CanViewMoveDesktops`), the assignment policy, the window
+registry (engine), WinEvent lifecycle, the coordinator, Carrier/Parking
+mutation, and identity-checked placement/Z-order/foreground restore after each
+switch. It manages arbitrary manageable top-level windows - no probe windows
+are involved. The host is generic over the configured monitors: every
+configured monitor has its own workspaces, hotkeys route by
+`binding.monitor`, and the tray menu is built from the runtime topology.
+
+The bounded probe-owned validation harness is separate:
+`workspace-manager --run --probe-gate --confirm-mutate` exercises the same
+composition with three vdprobe-owned windows and is the deterministic live
+gate; it never touches user windows.
 
 ## Startup
 

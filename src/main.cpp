@@ -173,6 +173,8 @@ void Usage() {
         "  --remove-startup    'workspace-manager': remove the HKCU Run entry\n"
         "  --self-resilience   'workspace-manager --run': post display/resume\n"
         "                      events to the host window for live validation\n"
+        "  --probe-gate        'workspace-manager --run': bounded probe-owned\n"
+        "                      host gate (default is the production host)\n"
         "  --rounds N          'workspace-live-manager-test': switch round-trips\n"
         "                      (default 1; use >1 for live stress)\n"
         "  --version           print the manager version and exit\n"
@@ -217,6 +219,7 @@ int main(int argc, char** argv) {
     bool self_resilience = false;
     bool reload_mode = false;
     int rounds = 1;
+    bool probe_gate = false;
     bool version_mode = false;
     bool diagnostics_mode = false;
     std::string config_path;
@@ -251,6 +254,8 @@ int main(int argc, char** argv) {
         } else if (a == "--rounds" && i + 1 < argc) {
             rounds = std::atoi(argv[++i]);
             if (rounds < 1) rounds = 1;
+        } else if (a == "--probe-gate") {
+            probe_gate = true;
         } else if (a == "--version") {
             version_mode = true;
         } else if (a == "--diagnostics") {
@@ -340,7 +345,7 @@ int main(int argc, char** argv) {
         } else if (run_mode) {
             rc = vd::CmdWorkspaceManagerRun(
                 config_path.empty() ? nullptr : config_path.c_str(), seconds,
-                self_resilience);
+                self_resilience, confirm_mutate, probe_gate);
         } else {
             rc = vd::CmdWorkspaceManager(confirm_mutate,
                                          config_path.empty()

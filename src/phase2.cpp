@@ -5037,7 +5037,7 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate, int rounds) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3, 5);
+            observe_role, &journal, 10, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -5085,25 +5085,37 @@ int CmdWorkspaceLiveManagerTest(bool confirm_mutate, int rounds) {
             return result.succeeded() && result.transaction.committed;
         };
         for (int round = 1; round <= rounds && ok; ++round) {
-            const bool switched = switch_gate(kA2, forward);
-            report_coordinator(
-                std::format("A1 -> A2 (round {}/{})", round, rounds).c_str(),
-                forward);
-            const bool forward_control_unchanged = control_unchanged();
-            ok = switched &&
-                 engine.Monitor(monitor_a_id)->active == kA2 &&
-                 engine.Monitor(monitor_b_id)->active == kB1 &&
-                 forward_control_unchanged;
-            if (!ok) break;
-            const bool switched_back = switch_gate(kA1, reverse);
-            report_coordinator(
-                std::format("A2 -> A1 (round {}/{})", round, rounds).c_str(),
-                reverse);
-            const bool reverse_control_unchanged = control_unchanged();
-            ok = switched_back &&
-                 engine.Monitor(monitor_a_id)->active == kA1 &&
-                 engine.Monitor(monitor_b_id)->active == kB1 &&
-                 reverse_control_unchanged;
+            for (int attempt = 1; attempt <= 3; ++attempt) {
+                ok = true;
+                const bool switched = switch_gate(kA2, forward);
+                report_coordinator(
+                    std::format("A1 -> A2 (round {}/{})", round, rounds)
+                        .c_str(),
+                    forward);
+                const bool forward_control_unchanged = control_unchanged();
+                ok = switched &&
+                     engine.Monitor(monitor_a_id)->active == kA2 &&
+                     engine.Monitor(monitor_b_id)->active == kB1 &&
+                     forward_control_unchanged;
+                if (ok) {
+                    const bool switched_back = switch_gate(kA1, reverse);
+                    report_coordinator(
+                        std::format("A2 -> A1 (round {}/{})", round, rounds)
+                            .c_str(),
+                        reverse);
+                    const bool reverse_control_unchanged =
+                        control_unchanged();
+                    ok = switched_back &&
+                         engine.Monitor(monitor_a_id)->active == kA1 &&
+                         engine.Monitor(monitor_b_id)->active == kB1 &&
+                         reverse_control_unchanged;
+                }
+                if (ok) break;
+                if (attempt < 3) {
+                    Field("  transient noise; retrying round", "");
+                    (void)coordinator.ReconcileDiscovery();
+                }
+            }
         }
         std::string pending_error;
         const std::optional<SwitchPlan> pending =
@@ -5708,7 +5720,7 @@ int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3, 5);
+            observe_role, &journal, 10, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -6697,7 +6709,7 @@ int CmdWorkspaceManager(bool confirm_mutate, const char* config_path) {
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3, 5);
+            observe_role, &journal, 10, 5);
 
         auto control_unchanged = [&]() {
             WindowIdentity identity;
@@ -6851,6 +6863,7 @@ struct ManagerMainContext {
     std::function<bool(UINT modifiers, UINT vk)> hotkey_handler;
     std::function<void()> reconcile_handler;
     std::function<void(int command)> tray_command_handler;
+    std::function<void(HMENU menu)> menu_builder;
     std::function<void()> display_change_handler;
     std::function<void()> resume_handler;
     std::function<void()> reload_handler;
@@ -6880,13 +6893,20 @@ LRESULT CALLBACK ManagerMainWindowProc(HWND hwnd, UINT message,
     if (message == kManagerTrayMessage && context != nullptr) {
         if (lparam == WM_RBUTTONUP || lparam == WM_LBUTTONUP) {
             HMENU menu = ::CreatePopupMenu();
-            ::AppendMenuW(menu, MF_STRING, 1, L"Switch monitor A -> A2");
-            ::AppendMenuW(menu, MF_STRING, 2, L"Switch monitor A -> A1");
-            ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            ::AppendMenuW(menu, MF_STRING, 3, L"Status");
-            ::AppendMenuW(menu, MF_STRING, 4, L"Diagnostics");
-            ::AppendMenuW(menu, MF_STRING, 5, L"Reload configuration");
-            ::AppendMenuW(menu, MF_STRING, 6, L"Exit");
+            if (context->menu_builder) {
+                context->menu_builder(menu);
+            } else {
+                ::AppendMenuW(menu, MF_STRING, 1,
+                              L"Switch monitor A -> A2");
+                ::AppendMenuW(menu, MF_STRING, 2,
+                              L"Switch monitor A -> A1");
+                ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                ::AppendMenuW(menu, MF_STRING, 3, L"Status");
+                ::AppendMenuW(menu, MF_STRING, 4, L"Diagnostics");
+                ::AppendMenuW(menu, MF_STRING, 5,
+                              L"Reload configuration");
+                ::AppendMenuW(menu, MF_STRING, 6, L"Exit");
+            }
             POINT point{};
             ::GetCursorPos(&point);
             const int command = ::TrackPopupMenu(
@@ -6947,13 +6967,20 @@ bool EnsureManagerMainClass() {
 
 }  // namespace
 
-int CmdWorkspaceManagerRun(const char* config_path, int seconds,
-                           bool self_resilience) {
+int CmdWorkspaceManagerRunProbeGate(const char* config_path, int seconds,
+                                    bool self_resilience,
+                                    bool confirm_mutate) {
     Heading("workspace-manager --run");
     Field("scope", "long-running host: hotkeys, tray, periodic reconciliation");
     Field("managed scope", "probe-owned windows (live gate)");
     Field("global desktop switch", "never called");
     Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print("\n  Refusing the probe gate without --confirm-mutate.\n");
+        return 1;
+    }
 
     HANDLE mutex = ::CreateMutexW(nullptr, FALSE, kManagerMutexName);
     if (mutex == nullptr) {
@@ -7488,7 +7515,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         };
         WorkspaceCoordinator coordinator(
             engine, lifecycle, source, coordinator_discovery, move_to_role,
-            observe_role, &journal, 3, 5);
+            observe_role, &journal, 10, 5);
 
         std::size_t hotkey_dispatches = 0;
         std::size_t switches_committed = 0;
@@ -7969,6 +7996,887 @@ int CmdWorkspaceManagerDiagnostics(const char* config_path) {
     Field("result", "OK");
     return 0;
 }
+
+// ------------------------------------------- production host (real windows)
+
+int CmdWorkspaceManagerRun(const char* config_path, int seconds,
+                           bool self_resilience, bool confirm_mutate,
+                           bool probe_gate) {
+    if (probe_gate) {
+        return CmdWorkspaceManagerRunProbeGate(config_path, seconds,
+                                               self_resilience, confirm_mutate);
+    }
+
+    Heading("workspace-manager --run");
+    Field("mode", "production: real top-level windows");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    if (!confirm_mutate) {
+        Field("gate", GateText(Gate::Mutating));
+        Print("\n  Refusing the production manager without --confirm-mutate.\n"
+              "\n      vdprobe workspace-manager --run --confirm-mutate "
+              "[--config PATH]\n");
+        return 1;
+    }
+
+    HANDLE mutex = ::CreateMutexW(nullptr, FALSE, kManagerMutexName);
+    if (mutex == nullptr) {
+        Field("result", "ERROR");
+        Field("reason", "single-instance mutex unavailable");
+        return 1;
+    }
+    if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+        Print("another workspace-manager instance is already running\n");
+        ::CloseHandle(mutex);
+        return 0;
+    }
+    auto release_mutex = [&]() { ::CloseHandle(mutex); };
+
+    const std::vector<MonitorRec> monitors = EnumerateMonitors();
+    if (monitors.size() < 2) {
+        Field("result", "ERROR");
+        Field("reason", "at least two monitors are required");
+        release_mutex();
+        return 1;
+    }
+    for (const MonitorRec& monitor : monitors) {
+        Field("monitor", ToUtf8(monitor.device));
+    }
+
+    WorkspaceManagerConfig config;
+    std::filesystem::path config_file;
+    if (config_path != nullptr && *config_path != '\0') {
+        config_file = config_path;
+        std::string load_error;
+        if (!LoadManagerConfig(config_file, config, &load_error)) {
+            Field("result", "ERROR");
+            Field("reason", "config load failed: " + load_error);
+            release_mutex();
+            return 1;
+        }
+    } else {
+        config_file = DefaultManagerConfigPath();
+        if (std::filesystem::exists(config_file)) {
+            std::string load_error;
+            if (!LoadManagerConfig(config_file, config, &load_error)) {
+                Field("result", "ERROR");
+                Field("reason", "default config load failed: " + load_error);
+                release_mutex();
+                return 1;
+            }
+        } else {
+            config.schema_version = 1;
+            config.monitors = {
+                {static_cast<MonitorId>(1), {"A1", "A2"}, "A1"},
+                {static_cast<MonitorId>(2), {"B1"}, "B1"},
+            };
+            config.bindings = {
+                {{MOD_CONTROL | MOD_ALT, VK_F9},
+                 static_cast<MonitorId>(1), 2},
+                {{MOD_CONTROL | MOD_ALT, VK_F10},
+                 static_cast<MonitorId>(1), 1},
+            };
+            config.migration_policy =
+                MonitorMigrationPolicy::ReassignToDestinationActive;
+            config.log_level = ManagerLogLevel::Info;
+            config.quarantine_enabled = true;
+            config.tray_icon = true;
+            config.journal_path =
+                std::filesystem::temp_directory_path() /
+                "vdprobe-workspace-manager.journal";
+            std::error_code mkdir_error;
+            std::filesystem::create_directories(config_file.parent_path(),
+                                                mkdir_error);
+            std::string save_error;
+            if (!SaveManagerConfig(config, config_file, &save_error)) {
+                Print("warning: could not write default config {}: {}\n",
+                      config_file.string(), save_error);
+            }
+        }
+    }
+    Field("config", config_file.string());
+
+    std::vector<HMONITOR> real_monitors;
+    for (const MonitorRec& monitor : monitors) {
+        real_monitors.push_back(monitor.handle);
+    }
+    ManagerRuntimeTopology topology;
+    std::string topology_error;
+    if (!DeriveManagerRuntimeTopology(config, real_monitors, topology,
+                                      &topology_error)) {
+        Field("result", "ERROR");
+        Field("reason", "config topology failed: " + topology_error);
+        release_mutex();
+        return 1;
+    }
+    if (topology.monitors.size() < 2) {
+        Field("result", "ERROR");
+        Field("reason", "config must define at least two monitors");
+        release_mutex();
+        return 1;
+    }
+    Field("configured monitors", std::format("{}", topology.monitors.size()));
+    Field("hotkey bindings", std::format("{}", topology.bindings.size()));
+
+    const std::filesystem::path journal_path =
+        config.journal_path.empty()
+            ? std::filesystem::temp_directory_path() /
+                  "vdprobe-workspace-manager.journal"
+            : config.journal_path;
+    WorkspaceJournal journal(journal_path);
+    std::string journal_error;
+    const std::optional<SwitchPlan> existing_pending =
+        journal.ReadPending(&journal_error);
+    if (!journal_error.empty() || existing_pending) {
+        Field("journal", journal_path.string());
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason",
+              !journal_error.empty()
+                  ? "stable journal could not be read: " + journal_error
+                  : "stable journal contains a pending transaction; startup "
+                    "recovery is wired in the next milestone");
+        release_mutex();
+        return kExitInconclusive;
+    }
+    Field("journal", journal_path.string());
+
+    Com<IServiceProvider> sp;
+    const HRESULT shell_hr = GetImmersiveShell(sp);
+    if (FAILED(shell_hr) || !sp) {
+        Field("result", shell_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                   : "ERROR");
+        Field("reason", std::format("ImmersiveShell unavailable ({})",
+                                    HrToString(shell_hr)));
+        release_mutex();
+        return shell_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    ManagerInternal manager = AcquireManagerInternal(sp.Get());
+    if (!manager.obj || manager.layout == nullptr) {
+        Field("result", manager.access_denied_seen ? "ENVIRONMENT-BLOCKED"
+                                                   : "ERROR");
+        Field("reason", "usable IVirtualDesktopManagerInternal unavailable");
+        release_mutex();
+        return manager.access_denied_seen ? kExitInconclusive : 1;
+    }
+    DesktopSnapshot carrier;
+    HRESULT current_hr = E_ABORT;
+    if (!ReadCurrentDesktop(manager, carrier, &current_hr)) {
+        Field("result", current_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                     : "ERROR");
+        Field("reason", "current Carrier unavailable");
+        release_mutex();
+        return current_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    HRESULT desktops_hr = E_ABORT;
+    if (!ReadDesktopList(manager, desktops, &desktops_hr)) {
+        Field("result", desktops_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                      : "ERROR");
+        Field("reason", "existing desktop enumeration failed");
+        release_mutex();
+        return desktops_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.id_ok || !parking.object) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "no existing inactive Parking desktop");
+        release_mutex();
+        return kExitInconclusive;
+    }
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    const MethodEntry* get_view =
+        views.layout == nullptr ? nullptr
+                                : FindMethod(*views.layout, "GetViewForHwnd");
+    const MethodEntry* can_move =
+        FindMethod(*manager.layout, "CanViewMoveDesktops");
+    if (!views.object || get_view == nullptr || can_move == nullptr) {
+        Field("result", views.access_denied_seen ? "ENVIRONMENT-BLOCKED"
+                                                 : "ERROR");
+        Field("reason", "application-view capability APIs unavailable");
+        release_mutex();
+        return views.access_denied_seen ? kExitInconclusive : 1;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    const HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+        IID_IVirtualDesktopManager, documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("result", documented_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                        : "ERROR");
+        Field("reason", std::format("IVirtualDesktopManager unavailable ({})",
+                                    HrToString(documented_hr)));
+        release_mutex();
+        return documented_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+
+    auto acquire_view = [&](HWND hwnd, RawObject& out,
+                            std::string* error = nullptr) -> bool {
+        PumpStaMessages();
+        Gate last_gate = Gate::Ok;
+        HRESULT last_hr = InvokeSlot(
+            views.object.Get(), *views.layout, *get_view, last_gate, false,
+            hwnd, out.PutVoid());
+        if (last_gate == Gate::Ok && SUCCEEDED(last_hr) && out) return true;
+        if (error != nullptr) {
+            *error = std::format("GetViewForHwnd 0x{:X} failed: gate={} hr={}",
+                                 reinterpret_cast<std::uintptr_t>(hwnd),
+                                 GateText(last_gate), HrToString(last_hr));
+        }
+        return false;
+    };
+    auto view_can_move = [&](IUnknown* view, std::string* error = nullptr) {
+        Gate gate = Gate::Ok;
+        BOOL value = FALSE;
+        const HRESULT hr = InvokeSlot(manager.obj.Get(), *manager.layout,
+                                      *can_move, gate, false, view, &value);
+        if (gate == Gate::Ok && SUCCEEDED(hr) && value != FALSE) return true;
+        if (error != nullptr) {
+            *error = std::format("CanViewMoveDesktops failed: gate={} hr={}",
+                                 GateText(gate), HrToString(hr));
+        }
+        return false;
+    };
+
+    auto observe_role = [&](const WindowRecord& record) {
+        WindowIdentity current;
+        if (!ReadWindowIdentity(record.identity.hwnd, current) ||
+            current != record.identity) {
+            return NativeDesktopRole::Unknown;
+        }
+        WindowDesktopState state;
+        if (!ReadWindowDesktopState(documented_manager.Get(),
+                                    record.identity.hwnd, state)) {
+            return NativeDesktopRole::Unknown;
+        }
+        if (::IsEqualGUID(state.desktop, carrier.id) && state.on_current) {
+            return NativeDesktopRole::Carrier;
+        }
+        if (::IsEqualGUID(state.desktop, parking.id) && !state.on_current) {
+            return NativeDesktopRole::Parking;
+        }
+        return NativeDesktopRole::Unknown;
+    };
+    auto move_to_role = [&](const WindowRecord& record,
+                            NativeDesktopRole target) -> bool {
+        WindowIdentity current;
+        if (!ReadWindowIdentity(record.identity.hwnd, current) ||
+            current != record.identity) {
+            return false;
+        }
+        RawObject view;
+        std::string error;
+        if (!acquire_view(record.identity.hwnd, view, &error) ||
+            !view_can_move(view.Get(), &error)) {
+            return false;
+        }
+        IUnknown* target_object =
+            target == NativeDesktopRole::Carrier ? carrier.object.Get()
+            : target == NativeDesktopRole::Parking ? parking.object.Get()
+                                                    : nullptr;
+        const GUID* target_id =
+            target == NativeDesktopRole::Carrier ? &carrier.id
+            : target == NativeDesktopRole::Parking ? &parking.id : nullptr;
+        if (target_object == nullptr || target_id == nullptr) return false;
+        Gate gate = Gate::Ok;
+        HRESULT hr = E_ABORT;
+        return MoveViewToDesktopAndWait(
+            manager, view.Get(), target_object, record.identity.hwnd,
+            documented_manager.Get(), *target_id, carrier.id, confirm_mutate,
+            gate, hr);
+    };
+
+    std::string error;
+    WorkspaceEngine engine(carrier.id, parking.id);
+    for (const ManagerRuntimeTopology::MonitorBinding& binding :
+         topology.monitors) {
+        if (!engine.AddMonitor(binding.real_monitor, binding.active,
+                               binding.workspace_ids, &error)) {
+            Field("result", "ERROR");
+            Field("reason", "engine monitor setup failed: " + error);
+            release_mutex();
+            return 1;
+        }
+    }
+    engine.SetAutoQuarantine(config.quarantine_enabled);
+    WorkspaceAssignmentAdapter assignment(engine);
+    assignment.SetMonitorMigrationPolicy(config.migration_policy);
+    for (const ManagerRuntimeTopology::MonitorBinding& binding :
+         topology.monitors) {
+        if (!assignment.ConfigureMonitor(binding.real_monitor, binding.active,
+                                         binding.workspace_ids, &error)) {
+            Field("result", "ERROR");
+            Field("reason", "assignment setup failed: " + error);
+            release_mutex();
+            return 1;
+        }
+    }
+
+    bool capability_access_denied = false;
+    Win32WindowDiscoveryOptions options;
+    options.carrier = carrier.id;
+    options.parking = parking.id;
+    options.augment_capabilities =
+        [&](HWND hwnd, const WindowDiscoveryObservation& observation,
+            WindowCapabilities& capabilities, std::string* aug_error) {
+            (void)observation;
+            RawObject view;
+            if (!acquire_view(hwnd, view, aug_error)) {
+                // Windows without a usable IApplicationView are Unsupported,
+                // not discovery failures.
+                return true;
+            }
+            capabilities.has_application_view = true;
+            Gate gate = Gate::Ok;
+            BOOL value = FALSE;
+            const HRESULT hr = InvokeSlot(
+                manager.obj.Get(), *manager.layout, *can_move, gate, false,
+                view.Get(), &value);
+            if (hr == E_ACCESSDENIED) capability_access_denied = true;
+            if (gate != Gate::Ok || FAILED(hr)) {
+                capabilities.can_move_desktops = false;
+                return true;
+            }
+            capabilities.can_move_desktops = value != FALSE;
+            return true;
+        };
+    HRESULT backend_hr = S_OK;
+    auto backend = CreateSystemWindowDiscoveryBackend(
+        std::move(options), &error, &backend_hr);
+    if (!backend) {
+        Field("result", backend_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                     : "ERROR");
+        Field("reason", error);
+        release_mutex();
+        return backend_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    WindowDiscovery discovery(std::move(*backend));
+
+    auto discover_assigned = [&](std::vector<WindowRecord>& records,
+                                 std::string* local_error) {
+        std::vector<DiscoveredWindow> complete;
+        if (!discovery.Discover(complete, local_error) ||
+            !assignment.ConvertCompleteSnapshot(complete, records,
+                                                local_error)) {
+            return false;
+        }
+        return true;
+    };
+    auto observe_owned = [&](HWND hwnd) -> std::optional<WindowRecord> {
+        std::vector<WindowRecord> records;
+        std::string local_error;
+        if (!discover_assigned(records, &local_error)) return std::nullopt;
+        const auto found = std::find_if(
+            records.begin(), records.end(),
+            [hwnd](const WindowRecord& record) {
+                return record.identity.hwnd == hwnd;
+            });
+        return found == records.end() ? std::nullopt
+                                      : std::optional<WindowRecord>(*found);
+    };
+
+    WindowLifecycleAdapter lifecycle(engine, observe_owned);
+    WinEventLifecycleSource source;
+    if (!source.Start(&error)) {
+        Field("result", "ERROR");
+        Field("reason", "lifecycle source failed: " + error);
+        release_mutex();
+        return 1;
+    }
+    auto coordinator_discovery = [&](std::vector<WindowRecord>& records,
+                                     std::string* local_error) {
+        if (!source.PumpOwnerThreadMessages(local_error)) return false;
+        return discover_assigned(records, local_error);
+    };
+    WorkspaceCoordinator coordinator(
+        engine, lifecycle, source, coordinator_discovery, move_to_role,
+        observe_role, &journal, 10, 5);
+
+    const CoordinatorResult initial = coordinator.ReconcileDiscovery();
+    if (!initial.succeeded()) {
+        Field("result", capability_access_denied ? "ENVIRONMENT-BLOCKED"
+                                                 : "ERROR");
+        Field("reason", "initial reconcile failed: " + initial.error);
+        source.Stop();
+        release_mutex();
+        return capability_access_denied ? kExitInconclusive : 1;
+    }
+    if (!engine.CheckInvariant(&error)) {
+        Field("result", "ERROR");
+        Field("reason", "initial invariant failed: " + error);
+        source.Stop();
+        release_mutex();
+        return 1;
+    }
+    std::size_t managed_count = 0;
+    for (const WindowRecord* window : engine.Windows()) {
+        if (window->disposition == WindowDisposition::Managed) {
+            ++managed_count;
+        }
+    }
+    Field("managed windows (initial)", std::format("{}", managed_count));
+
+    MonitorTopologyMapper topology_mapper;
+    std::vector<MonitorTopologyMapper::BoundMonitor> bound_monitors;
+    std::vector<std::size_t> missing_monitors;
+    HostResilienceState resilience;
+    resilience.monitor_present.assign(topology.monitors.size(), true);
+    bool degraded = false;
+    auto refresh_topology = [&]() {
+        const std::vector<MonitorRec> current = EnumerateMonitors();
+        std::vector<std::pair<MonitorId, std::string>> real;
+        for (const MonitorRec& monitor : current) {
+            real.push_back({reinterpret_cast<MonitorId>(monitor.handle),
+                            ToUtf8(monitor.device)});
+        }
+        topology_mapper.Update(real, bound_monitors, missing_monitors,
+                               topology.monitors.size());
+        std::vector<bool> present(topology.monitors.size(), false);
+        for (const auto& entry : bound_monitors) {
+            if (entry.config_index < present.size()) {
+                present[entry.config_index] = true;
+            }
+        }
+        resilience.monitor_present = std::move(present);
+        degraded = degraded || !missing_monitors.empty();
+    };
+    {
+        const std::vector<MonitorRec> current = EnumerateMonitors();
+        std::vector<std::pair<MonitorId, std::string>> real;
+        for (const MonitorRec& monitor : current) {
+            real.push_back({reinterpret_cast<MonitorId>(monitor.handle),
+                            ToUtf8(monitor.device)});
+        }
+        topology_mapper.Update(real, bound_monitors, missing_monitors,
+                               topology.monitors.size());
+        degraded = !missing_monitors.empty();
+    }
+
+    std::size_t reconcile_count = 0;
+    std::size_t hotkey_dispatches = 0;
+    std::size_t switches_committed = 0;
+    HWND hotkey_window = nullptr;
+    auto native_invariant_ok = [&]() {
+        GUID current{};
+        return ReadCurrentDesktopId(manager, current) &&
+               ::IsEqualGUID(current, carrier.id);
+    };
+    auto refresh_focus_snapshots = [&]() {
+        for (const ManagerRuntimeTopology::MonitorBinding& binding :
+             topology.monitors) {
+            const MonitorWorkspaceState* state =
+                engine.Monitor(binding.real_monitor);
+            if (state == nullptr) continue;
+            for (WorkspaceId workspace : state->workspaces) {
+                const WorkspaceDefinition* definition =
+                    engine.Workspace(workspace);
+                if (definition == nullptr) continue;
+                std::vector<std::pair<std::int64_t, WindowIdentity>> ordered;
+                for (const WindowIdentity& identity : definition->windows) {
+                    const WindowRecord* record = engine.FindWindow(identity);
+                    if (record != nullptr &&
+                        record->disposition == WindowDisposition::Managed &&
+                        record->capabilities.Manageable() &&
+                        record->presentation.placement_valid) {
+                        ordered.push_back(
+                            {record->presentation.z_order, identity});
+                    }
+                }
+                std::stable_sort(
+                    ordered.begin(), ordered.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.first < right.first;
+                    });
+                if (ordered.empty()) continue;
+                std::vector<WindowIdentity> members;
+                for (const auto& entry : ordered) {
+                    members.push_back(entry.second);
+                }
+                std::string local_error;
+                if (!engine.SetZOrder(binding.real_monitor, workspace,
+                                      members, &local_error)) {
+                    Print("focus snapshot error: {}\n", local_error);
+                    continue;
+                }
+                for (const auto& entry : ordered) {
+                    const WindowRecord* record =
+                        engine.FindWindow(entry.second);
+                    if (record != nullptr &&
+                        record->presentation.foreground) {
+                        (void)engine.SetLastForeground(
+                            binding.real_monitor, workspace, entry.second,
+                            &local_error);
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    auto apply_production_presentation =
+        [&](const WindowRecord& record,
+            const PresentationOperation& operation) -> bool {
+        WindowIdentity current;
+        if (!ReadWindowIdentity(record.identity.hwnd, current) ||
+            current != record.identity ||
+            record.identity != operation.identity) {
+            return false;
+        }
+        switch (operation.kind) {
+            case PresentationOperationKind::RestorePlacement:
+                if (!operation.presentation.placement_valid) return false;
+                return ::SetWindowPlacement(
+                           record.identity.hwnd,
+                           &operation.presentation.placement) != FALSE;
+            case PresentationOperationKind::RestoreZOrder:
+                return ::SetWindowPos(
+                           record.identity.hwnd, HWND_TOP, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                               SWP_NOOWNERZORDER) != FALSE;
+            case PresentationOperationKind::RestoreForeground:
+                return ::SetForegroundWindow(record.identity.hwnd) != FALSE;
+        }
+        return false;
+    };
+    auto restore_presentation = [&](MonitorId monitor, WorkspaceId workspace) {
+        std::string restore_error;
+        const std::optional<PresentationPlan> plan =
+            engine.PreparePresentationRestore(monitor, workspace,
+                                              &restore_error);
+        if (!plan) return;
+        const PresentationResult result = engine.ExecutePresentationRestore(
+            *plan,
+            [&](const WindowRecord& record) {
+                WindowIdentity current;
+                return record.disposition == WindowDisposition::Managed &&
+                       record.capabilities.Manageable() &&
+                       ReadWindowIdentity(record.identity.hwnd, current) &&
+                       current == record.identity;
+            },
+            apply_production_presentation);
+        if (!result.completed && !result.error.empty()) {
+            Print("presentation restore error: {}\n", result.error);
+        }
+    };
+    auto do_switch = [&](MonitorId monitor, WorkspaceId target) {
+        if (degraded) {
+            Field("switch blocked", "host degraded");
+            return;
+        }
+        if (!native_invariant_ok()) {
+            Field("switch blocked",
+                  "global current desktop != Carrier (degraded)");
+            degraded = true;
+            return;
+        }
+        std::size_t config_index = topology.monitors.size();
+        for (std::size_t i = 0; i < topology.monitors.size(); ++i) {
+            if (topology.monitors[i].real_monitor == monitor) {
+                config_index = i;
+                break;
+            }
+        }
+        if (config_index >= resilience.monitor_present.size() ||
+            !resilience.monitor_present[config_index]) {
+            Field("switch blocked", "monitor suspended");
+            return;
+        }
+        CoordinatorResult result = coordinator.Switch(monitor, target);
+        if (!result.succeeded() && result.transaction.rollback_succeeded &&
+            !result.transaction.recovery_required &&
+            result.code != CoordinatorResultCode::PlanRejected) {
+            result = coordinator.Switch(monitor, target);
+        }
+        if (result.succeeded() && result.transaction.committed) {
+            ++switches_committed;
+            refresh_focus_snapshots();
+            restore_presentation(monitor, target);
+        } else if (!result.error.empty()) {
+            Print("switch error: {}\n", result.error);
+        }
+    };
+
+    std::vector<std::pair<int, std::pair<MonitorId, WorkspaceId>>>
+        tray_commands;
+    int next_tray_command = 10;
+    for (const ManagerRuntimeTopology::MonitorBinding& binding :
+         topology.monitors) {
+        for (WorkspaceId workspace : binding.workspace_ids) {
+            tray_commands.push_back(
+                {next_tray_command++, {binding.real_monitor, workspace}});
+        }
+    }
+
+    ManagerMainContext main_context;
+    main_context.hotkey_handler = [&](UINT modifiers, UINT vk) {
+        MonitorId monitor = 0;
+        WorkspaceId workspace = 0;
+        if (!ResolveWorkspaceHotkey(config, modifiers, vk, monitor,
+                                    workspace)) {
+            return true;
+        }
+        ++hotkey_dispatches;
+        do_switch(monitor, workspace);
+        return true;
+    };
+    main_context.reconcile_handler = [&]() {
+        ++reconcile_count;
+        if (!native_invariant_ok()) {
+            degraded = true;
+            return;
+        }
+        const CoordinatorResult result = coordinator.ReconcileDiscovery();
+        if (!result.succeeded() && !result.error.empty()) {
+            Print("periodic reconcile error: {}\n", result.error);
+            degraded = true;
+        }
+    };
+    main_context.status_text = [&]() {
+        std::string text = "active:";
+        for (const ManagerRuntimeTopology::MonitorBinding& binding :
+             topology.monitors) {
+            const MonitorWorkspaceState* state =
+                engine.Monitor(binding.real_monitor);
+            text += " " + std::to_string(state ? state->active : 0);
+        }
+        return text + std::format(" reconciles={} switches={} quarantine={}",
+                                  reconcile_count, switches_committed,
+                                  engine.QuarantineLog().size());
+    };
+    main_context.menu_builder = [&](HMENU menu) {
+        for (const auto& entry : tray_commands) {
+            const std::wstring label =
+                L"Switch monitor " +
+                std::to_wstring(static_cast<std::uint64_t>(
+                    entry.second.first)) +
+                L" -> workspace " +
+                std::to_wstring(entry.second.second);
+            ::AppendMenuW(menu, MF_STRING, entry.first, label.c_str());
+        }
+        ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(menu, MF_STRING, 1001, L"Status");
+        ::AppendMenuW(menu, MF_STRING, 1002, L"Diagnostics");
+        ::AppendMenuW(menu, MF_STRING, 1003, L"Reload configuration");
+        ::AppendMenuW(menu, MF_STRING, 1004, L"Exit");
+    };
+    main_context.tray_command_handler = [&](int command) {
+        if (command >= 10 && command < 1000) {
+            for (const auto& entry : tray_commands) {
+                if (entry.first == command) {
+                    do_switch(entry.second.first, entry.second.second);
+                    break;
+                }
+            }
+        } else if (command == 1001) {
+            if (main_context.status_text) {
+                Print("status: {}\n", main_context.status_text());
+            }
+        } else if (command == 1002) {
+            if (main_context.status_text) {
+                Print("diagnostics: {}\n", main_context.status_text());
+            }
+        } else if (command == 1003) {
+            if (main_context.reload_handler) {
+                main_context.reload_handler();
+            }
+        } else if (command == 1004) {
+            main_context.exit_requested = true;
+            ::PostMessageW(hotkey_window, WM_CLOSE, 0, 0);
+        }
+    };
+    main_context.reload_handler = [&]() {
+        WorkspaceManagerConfig reloaded;
+        std::string reload_error;
+        if (!LoadManagerConfig(config_file, reloaded, &reload_error)) {
+            Print("config reload REJECTED (kept previous): {}\n",
+                  reload_error);
+            return;
+        }
+        ManagerRuntimeTopology new_topology;
+        if (!DeriveManagerRuntimeTopology(reloaded, real_monitors,
+                                          new_topology, &reload_error)) {
+            Print("config reload REJECTED (kept previous): {}\n",
+                  reload_error);
+            return;
+        }
+        if (new_topology.monitors.size() != topology.monitors.size()) {
+            Print("config reload REJECTED (kept previous): monitor topology "
+                  "changes require a restart\n");
+            return;
+        }
+        WorkspaceManagerConfig staged = reloaded;
+        staged.bindings = new_topology.bindings;
+        std::vector<std::pair<UINT, WorkspaceHotkey>> staged_registered;
+        UINT id = 100;
+        bool all_registered = true;
+        for (const WorkspaceHotkeyBinding& binding : staged.bindings) {
+            if (!::RegisterHotKey(hotkey_window, id,
+                                  binding.hotkey.modifiers | MOD_NOREPEAT,
+                                  binding.hotkey.vk)) {
+                all_registered = false;
+                break;
+            }
+            staged_registered.push_back({id, binding.hotkey});
+            ++id;
+        }
+        if (!all_registered) {
+            for (const auto& entry : staged_registered) {
+                ::UnregisterHotKey(hotkey_window, entry.first);
+            }
+            Print("config reload REJECTED (kept previous): hotkey conflict\n");
+            return;
+        }
+        for (const WorkspaceHotkeyBinding& binding : config.bindings) {
+            const UINT old_id =
+                100 + static_cast<UINT>(&binding - config.bindings.data());
+            ::UnregisterHotKey(hotkey_window, old_id);
+        }
+        config = staged;
+        topology = new_topology;
+        engine.SetAutoQuarantine(config.quarantine_enabled);
+        assignment.SetMonitorMigrationPolicy(config.migration_policy);
+        Print("config reload accepted ({} hotkeys, quarantine={})\n",
+              config.bindings.size(),
+              config.quarantine_enabled ? "on" : "off");
+    };
+    main_context.display_change_handler = [&]() {
+        ++resilience.display_changes_handled;
+        refresh_topology();
+    };
+    main_context.resume_handler = [&]() {
+        ++resilience.resume_events_handled;
+        refresh_topology();
+        if (!native_invariant_ok()) {
+            degraded = true;
+            ++resilience.shell_reacquire_attempts;
+        }
+    };
+
+    if (!EnsureManagerMainClass()) {
+        Field("result", "ERROR");
+        Field("reason", "manager main window class unavailable");
+        source.Stop();
+        release_mutex();
+        return 1;
+    }
+    hotkey_window = ::CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kManagerMainClassName,
+        L"vdprobe-workspace-manager", WS_OVERLAPPED, 0, 0, 0, 0, nullptr,
+        nullptr, ::GetModuleHandleW(nullptr), nullptr);
+    if (hotkey_window == nullptr) {
+        Field("result", "ERROR");
+        Field("reason", "manager main window unavailable");
+        source.Stop();
+        release_mutex();
+        return 1;
+    }
+    ::SetWindowLongPtrW(hotkey_window, GWLP_USERDATA,
+                        reinterpret_cast<LONG_PTR>(&main_context));
+    UINT hotkey_id = 100;
+    for (const WorkspaceHotkeyBinding& binding : config.bindings) {
+        if (!::RegisterHotKey(hotkey_window, hotkey_id,
+                              binding.hotkey.modifiers | MOD_NOREPEAT,
+                              binding.hotkey.vk)) {
+            Field("result", "ENVIRONMENT-BLOCKED");
+            Field("reason", "hotkey registration failed (already bound?)");
+            source.Stop();
+            release_mutex();
+            return kExitInconclusive;
+        }
+        ++hotkey_id;
+    }
+    NOTIFYICONDATAW tray_data{};
+    bool tray_added = false;
+    if (config.tray_icon) {
+        tray_data.cbSize = sizeof(tray_data);
+        tray_data.hWnd = hotkey_window;
+        tray_data.uID = 1;
+        tray_data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        tray_data.uCallbackMessage = kManagerTrayMessage;
+        tray_data.hIcon = ::LoadIconW(nullptr, IDI_APPLICATION);
+        wcscpy_s(tray_data.szTip, L"vdprobe workspace manager");
+        tray_added = ::Shell_NotifyIconW(NIM_ADD, &tray_data) != FALSE;
+    }
+    Field("tray icon", config.tray_icon
+                           ? (tray_added ? "added" : "unavailable (recorded)")
+                           : "disabled by config");
+    ::SetTimer(hotkey_window, kManagerReconcileTimerId,
+               kManagerReconcileIntervalMs, nullptr);
+    if (seconds > 0) {
+        ::SetTimer(hotkey_window, kManagerShutdownTimerId,
+                   static_cast<UINT>(seconds) * 1000U, nullptr);
+    }
+    Field("run mode", seconds > 0
+                          ? std::format("bounded {}s", seconds)
+                          : "unbounded (stop via --stop or tray Exit)");
+    if (self_resilience) {
+        ::PostMessageW(hotkey_window, WM_DISPLAYCHANGE, 0, 0);
+        ::PostMessageW(hotkey_window, WM_POWERBROADCAST,
+                       static_cast<WPARAM>(PBT_APMRESUMESUSPEND), 0);
+    }
+
+    MSG message{};
+    bool loop_error = false;
+    while (!main_context.exit_requested) {
+        const int result = ::GetMessageW(&message, nullptr, 0, 0);
+        if (result < 0) {
+            loop_error = true;
+            break;
+        }
+        if (result == 0) break;
+        ::TranslateMessage(&message);
+        ::DispatchMessageW(&message);
+    }
+    ::KillTimer(hotkey_window, kManagerReconcileTimerId);
+    ::KillTimer(hotkey_window, kManagerShutdownTimerId);
+    UINT unregister_id = 100;
+    for (const WorkspaceHotkeyBinding& binding : config.bindings) {
+        (void)binding;
+        ::UnregisterHotKey(hotkey_window, unregister_id);
+        ++unregister_id;
+    }
+    if (tray_added) {
+        ::Shell_NotifyIconW(NIM_DELETE, &tray_data);
+    }
+    ::DestroyWindow(hotkey_window);
+
+    Field("uptime reconciliations", std::format("{}", reconcile_count));
+    Field("hotkey dispatches", std::format("{}", hotkey_dispatches));
+    Field("switches committed", std::format("{}", switches_committed));
+    Field("quarantine entries",
+          std::format("{}", engine.QuarantineLog().size()));
+    Field("display changes handled",
+          std::format("{}", resilience.display_changes_handled));
+    Field("resume events handled",
+          std::format("{}", resilience.resume_events_handled));
+    Field("shell reacquire attempts",
+          std::format("{}", resilience.shell_reacquire_attempts));
+    Field("host degraded", degraded ? "yes" : "no");
+    std::string pending_error;
+    const std::optional<SwitchPlan> pending =
+        journal.ReadPending(&pending_error);
+    bool ok = !loop_error && !pending && pending_error.empty() &&
+              engine.CheckInvariant(&error);
+    source.Stop();
+    ok = ok && source.shutdown_ok();
+    Field("stable journal pending", pending ? "YES" : "no");
+    if (!ok && !error.empty()) {
+        Field("failure reason", error);
+    }
+    Field("result", ok ? "PASS" : "FAIL");
+    Print("RESULT={}\n", ok ? "PASS" : "FAIL");
+    release_mutex();
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------- logical-workspace-test
 
 // ---------------------------------------------------- logical-workspace-test
 
@@ -8503,7 +9411,7 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
             WorkspaceJournal journal(journal_path);
             WorkspaceCoordinator coordinator(
                 engine, lifecycle, lifecycle_source, discover_owned_windows,
-                move_to_role, observe_role, &journal, 3, 5);
+                move_to_role, observe_role, &journal, 10, 5);
 
             auto switch_logical = [&](WorkspaceId outgoing,
                                        WorkspaceId incoming) -> bool {

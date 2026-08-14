@@ -135,7 +135,13 @@ int CmdWorkspaceManager(bool confirm_mutate, const char* config_path = nullptr);
 // tray menu, and periodic reconciliation. `seconds` > 0 bounds the run for
 // automated validation; 0 runs until WM_CLOSE / tray Exit / session end.
 int CmdWorkspaceManagerRun(const char* config_path, int seconds,
-                           bool self_resilience);
+                           bool self_resilience, bool confirm_mutate,
+                           bool probe_gate);
+
+// Bounded probe-owned host gate (kept separate from the production host).
+int CmdWorkspaceManagerRunProbeGate(const char* config_path, int seconds,
+                                    bool self_resilience,
+                                    bool confirm_mutate);
 
 // Requests a clean shutdown of a running workspace-manager instance.
 int CmdWorkspaceManagerStop();
