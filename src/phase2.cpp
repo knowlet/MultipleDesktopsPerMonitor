@@ -6751,6 +6751,869 @@ int CmdWorkspaceManager(bool confirm_mutate, const char* config_path) {
     return passed ? 0 : (blocked ? kExitInconclusive : 1);
 }
 
+// -------------------------------------------------- workspace-manager --run
+
+namespace {
+
+constexpr wchar_t kManagerMainClassName[] = L"vdprobe.WorkspaceManagerMain";
+constexpr wchar_t kManagerMutexName[] = L"Local\vdprobe-workspace-manager";
+constexpr UINT kManagerTrayMessage = WM_APP + 1;
+constexpr UINT_PTR kManagerReconcileTimerId = 1;
+constexpr UINT_PTR kManagerShutdownTimerId = 2;
+constexpr std::uint32_t kManagerReconcileIntervalMs = 3000;
+
+struct ManagerMainContext {
+    std::function<bool(UINT modifiers, UINT vk)> hotkey_handler;
+    std::function<void()> reconcile_handler;
+    std::function<void(int command)> tray_command_handler;
+    bool exit_requested = false;
+};
+
+LRESULT CALLBACK ManagerMainWindowProc(HWND hwnd, UINT message,
+                                       WPARAM wparam, LPARAM lparam) {
+    ManagerMainContext* context = reinterpret_cast<ManagerMainContext*>(
+        ::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_HOTKEY && context != nullptr &&
+        context->hotkey_handler) {
+        context->hotkey_handler(LOWORD(lparam), HIWORD(lparam));
+        return 0;
+    }
+    if (message == WM_TIMER && context != nullptr) {
+        if (wparam == kManagerReconcileTimerId &&
+            context->reconcile_handler) {
+            context->reconcile_handler();
+        } else if (wparam == kManagerShutdownTimerId) {
+            context->exit_requested = true;
+            ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    }
+    if (message == kManagerTrayMessage && context != nullptr) {
+        if (lparam == WM_RBUTTONUP || lparam == WM_LBUTTONUP) {
+            HMENU menu = ::CreatePopupMenu();
+            ::AppendMenuW(menu, MF_STRING, 1, L"Switch monitor A -> A2");
+            ::AppendMenuW(menu, MF_STRING, 2, L"Switch monitor A -> A1");
+            ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            ::AppendMenuW(menu, MF_STRING, 3, L"Diagnostics");
+            ::AppendMenuW(menu, MF_STRING, 4, L"Exit");
+            POINT point{};
+            ::GetCursorPos(&point);
+            const int command = ::TrackPopupMenu(
+                menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                point.x, point.y, 0, hwnd, nullptr);
+            ::DestroyMenu(menu);
+            if (command != 0 && context->tray_command_handler) {
+                context->tray_command_handler(command);
+            }
+        }
+        return 0;
+    }
+    if (message == WM_QUERYENDSESSION) {
+        if (context != nullptr) context->exit_requested = true;
+        return TRUE;
+    }
+    if (message == WM_CLOSE && context != nullptr) {
+        context->exit_requested = true;
+        ::DestroyWindow(hwnd);
+        return 0;
+    }
+    return ::DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool EnsureManagerMainClass() {
+    static bool registered = false;
+    if (registered) return true;
+    WNDCLASSEXW klass{};
+    klass.cbSize = sizeof(klass);
+    klass.hInstance = ::GetModuleHandleW(nullptr);
+    klass.lpfnWndProc = &ManagerMainWindowProc;
+    klass.lpszClassName = kManagerMainClassName;
+    if (::RegisterClassExW(&klass) == 0 &&
+        ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+    registered = true;
+    return true;
+}
+
+}  // namespace
+
+int CmdWorkspaceManagerRun(const char* config_path, int seconds) {
+    Heading("workspace-manager --run");
+    Field("scope", "long-running host: hotkeys, tray, periodic reconciliation");
+    Field("managed scope", "probe-owned windows (live gate)");
+    Field("global desktop switch", "never called");
+    Field("desktop lifecycle", "no create/remove");
+
+    HANDLE mutex = ::CreateMutexW(nullptr, FALSE, kManagerMutexName);
+    if (mutex == nullptr) {
+        Field("result", "ERROR");
+        Field("reason", "single-instance mutex unavailable");
+        return 1;
+    }
+    if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+        Print("another workspace-manager instance is already running\n");
+        ::CloseHandle(mutex);
+        return 0;
+    }
+    auto release_mutex = [&]() { ::CloseHandle(mutex); };
+
+    const std::vector<MonitorRec> monitors = EnumerateMonitors();
+    if (monitors.size() < 2) {
+        Field("result", "ERROR");
+        Field("reason", "at least two monitors are required");
+        release_mutex();
+        return 1;
+    }
+    const MonitorRec& monitor_a = monitors[0];
+    const MonitorRec& monitor_b = monitors[1];
+    const MonitorId monitor_a_id =
+        reinterpret_cast<MonitorId>(monitor_a.handle);
+    const MonitorId monitor_b_id =
+        reinterpret_cast<MonitorId>(monitor_b.handle);
+    WorkspaceId kA1 = 1;
+    WorkspaceId kA2 = 2;
+    WorkspaceId kB1 = 3;
+    std::vector<WorkspaceId> monitor_a_workspaces{kA1, kA2};
+    std::vector<WorkspaceId> monitor_b_workspaces{kB1};
+    Field("monitor A", ToUtf8(monitor_a.device));
+    Field("monitor B", ToUtf8(monitor_b.device));
+
+    const std::filesystem::path journal_path =
+        std::filesystem::temp_directory_path() /
+        "vdprobe-workspace-manager.journal";
+    WorkspaceJournal journal(journal_path);
+    std::string journal_error;
+    const std::optional<SwitchPlan> existing_pending =
+        journal.ReadPending(&journal_error);
+    if (!journal_error.empty() || existing_pending) {
+        Field("journal", journal_path.string());
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", !journal_error.empty()
+                            ? "stable journal could not be read: " +
+                                  journal_error
+                            : "stable journal contains a pending transaction");
+        Field("mutation_started", "no");
+        release_mutex();
+        return kExitInconclusive;
+    }
+    Field("journal", journal_path.string());
+
+    WorkspaceManagerConfig hotkey_config;
+    hotkey_config.journal_path = journal_path;
+    hotkey_config.tray_icon = true;
+    if (config_path != nullptr && *config_path != '\0') {
+        std::string config_error;
+        if (!LoadManagerConfig(std::filesystem::path(config_path),
+                               hotkey_config, &config_error)) {
+            Field("result", "ERROR");
+            Field("reason", "config load failed: " + config_error);
+            release_mutex();
+            return 1;
+        }
+        Field("config", config_path);
+        std::vector<HMONITOR> real_monitors;
+        for (const MonitorRec& monitor : monitors) {
+            real_monitors.push_back(monitor.handle);
+        }
+        ManagerRuntimeTopology topology;
+        if (!DeriveManagerRuntimeTopology(hotkey_config, real_monitors,
+                                          topology, &config_error)) {
+            Field("result", "ERROR");
+            Field("reason", "config topology failed: " + config_error);
+            release_mutex();
+            return 1;
+        }
+        if (topology.monitors.size() < 2) {
+            Field("result", "ERROR");
+            Field("reason", "config must define at least two monitors");
+            release_mutex();
+            return 1;
+        }
+        kA1 = topology.monitors[0].active;
+        kB1 = topology.monitors[1].active;
+        monitor_a_workspaces = topology.monitors[0].workspace_ids;
+        monitor_b_workspaces = topology.monitors[1].workspace_ids;
+        kA2 = monitor_a_workspaces.size() > 1 ? monitor_a_workspaces[1] : kA1;
+        hotkey_config.bindings = topology.bindings;
+        Field("config bindings",
+              std::format("{}", hotkey_config.bindings.size()));
+    } else {
+        hotkey_config.bindings = {
+            {{MOD_CONTROL | MOD_ALT, VK_F9}, monitor_a_id, kA2},
+            {{MOD_CONTROL | MOD_ALT, VK_F10}, monitor_a_id, kA1},
+        };
+    }
+
+    Com<IServiceProvider> sp;
+    const HRESULT shell_hr = GetImmersiveShell(sp);
+    if (FAILED(shell_hr) || !sp) {
+        const std::string reason = std::format("ImmersiveShell unavailable ({})",
+                                               HrToString(shell_hr));
+        Field("result", shell_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                   : "ERROR");
+        Field("reason", reason);
+        Field("mutation_started", "no");
+        release_mutex();
+        return shell_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    ManagerInternal manager = AcquireManagerInternal(sp.Get());
+    if (!manager.obj || manager.layout == nullptr) {
+        Field("result", manager.access_denied_seen ? "ENVIRONMENT-BLOCKED"
+                                                   : "ERROR");
+        Field("reason", "usable IVirtualDesktopManagerInternal unavailable");
+        Field("mutation_started", "no");
+        release_mutex();
+        return manager.access_denied_seen ? kExitInconclusive : 1;
+    }
+    DesktopSnapshot carrier;
+    HRESULT current_hr = E_ABORT;
+    if (!ReadCurrentDesktop(manager, carrier, &current_hr)) {
+        Field("result", current_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                     : "ERROR");
+        Field("reason", "current Carrier unavailable");
+        Field("mutation_started", "no");
+        release_mutex();
+        return current_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    std::vector<DesktopSnapshot> desktops;
+    HRESULT desktops_hr = E_ABORT;
+    if (!ReadDesktopList(manager, desktops, &desktops_hr)) {
+        Field("result", desktops_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                      : "ERROR");
+        Field("reason", "existing desktop enumeration failed");
+        Field("mutation_started", "no");
+        release_mutex();
+        return desktops_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+    DesktopSnapshot parking;
+    for (DesktopSnapshot& desktop : desktops) {
+        if (desktop.id_ok && !::IsEqualGUID(desktop.id, carrier.id)) {
+            parking = std::move(desktop);
+            break;
+        }
+    }
+    if (!parking.id_ok || !parking.object) {
+        Field("result", "ENVIRONMENT-BLOCKED");
+        Field("reason", "no existing inactive Parking desktop");
+        release_mutex();
+        return kExitInconclusive;
+    }
+    ApplicationViewCollectionBinding views =
+        AcquireApplicationViewCollection(sp.Get());
+    const MethodEntry* get_view =
+        views.layout == nullptr ? nullptr
+                                : FindMethod(*views.layout, "GetViewForHwnd");
+    const MethodEntry* can_move =
+        FindMethod(*manager.layout, "CanViewMoveDesktops");
+    if (!views.object || get_view == nullptr || can_move == nullptr) {
+        Field("result", views.access_denied_seen ? "ENVIRONMENT-BLOCKED"
+                                                 : "ERROR");
+        Field("reason", "application-view capability APIs unavailable");
+        release_mutex();
+        return views.access_denied_seen ? kExitInconclusive : 1;
+    }
+    Com<IVirtualDesktopManager> documented_manager;
+    const HRESULT documented_hr = ::CoCreateInstance(
+        CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+        IID_IVirtualDesktopManager, documented_manager.PutVoid());
+    if (FAILED(documented_hr) || !documented_manager) {
+        Field("result", documented_hr == E_ACCESSDENIED ? "ENVIRONMENT-BLOCKED"
+                                                        : "ERROR");
+        Field("reason", std::format("IVirtualDesktopManager unavailable ({})",
+                                    HrToString(documented_hr)));
+        release_mutex();
+        return documented_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+    }
+
+    auto acquire_view = [&](HWND hwnd, RawObject& out,
+                            std::string* error = nullptr) -> bool {
+        const ULONGLONG deadline = ::GetTickCount64() + 2000;
+        HRESULT last_hr = E_ABORT;
+        Gate last_gate = Gate::Ok;
+        do {
+            PumpStaMessages();
+            last_gate = Gate::Ok;
+            last_hr = InvokeSlot(views.object.Get(), *views.layout, *get_view,
+                                 last_gate, false, hwnd, out.PutVoid());
+            if (last_gate == Gate::Ok && SUCCEEDED(last_hr) && out) return true;
+            ::Sleep(25);
+        } while (::GetTickCount64() < deadline);
+        if (error != nullptr) {
+            *error = std::format("GetViewForHwnd 0x{:X} failed: gate={} hr={}",
+                                 reinterpret_cast<std::uintptr_t>(hwnd),
+                                 GateText(last_gate), HrToString(last_hr));
+        }
+        return false;
+    };
+    auto view_can_move = [&](IUnknown* view, std::string* error = nullptr) {
+        Gate gate = Gate::Ok;
+        BOOL value = FALSE;
+        const HRESULT hr = InvokeSlot(manager.obj.Get(), *manager.layout,
+                                      *can_move, gate, false, view, &value);
+        if (gate == Gate::Ok && SUCCEEDED(hr) && value != FALSE) return true;
+        if (error != nullptr) {
+            *error = std::format("CanViewMoveDesktops failed: gate={} hr={}",
+                                 GateText(gate), HrToString(hr));
+        }
+        return false;
+    };
+
+    SpawnedProbeWindow a1;
+    SpawnedProbeWindow a2;
+    SpawnedProbeWindow b1;
+    auto close_probes = [&]() {
+        const bool b1_closed = CloseThrowawayProbeWindow(b1);
+        const bool a2_closed = CloseThrowawayProbeWindow(a2);
+        const bool a1_closed = CloseThrowawayProbeWindow(a1);
+        const bool closed = b1_closed && a2_closed && a1_closed;
+        Field("probe window close", closed ? "PASS" : "FAIL");
+        return closed;
+    };
+    if (!SpawnThrowawayProbeWindow(a1) || !SpawnThrowawayProbeWindow(a2) ||
+        !SpawnThrowawayProbeWindow(b1) ||
+        !PlaceProbeWindowOnMonitor(a1.hwnd, monitor_a, 0) ||
+        !PlaceProbeWindowOnMonitor(a2.hwnd, monitor_a, 1) ||
+        !PlaceProbeWindowOnMonitor(b1.hwnd, monitor_b, 0)) {
+        const bool closed = close_probes();
+        Field("result", "ERROR");
+        Field("reason", "could not create and place three probe windows");
+        Field("probe cleanup", closed ? "PASS" : "FAIL");
+        release_mutex();
+        return 1;
+    }
+    LogicalWindow logical_a1;
+    LogicalWindow logical_a2;
+    LogicalWindow logical_b1;
+    if (!CaptureLogicalWindow(documented_manager.Get(), a1.hwnd,
+                              monitor_a.handle, kA1, logical_a1) ||
+        !CaptureLogicalWindow(documented_manager.Get(), a2.hwnd,
+                              monitor_a.handle, kA2, logical_a2) ||
+        !CaptureLogicalWindow(documented_manager.Get(), b1.hwnd,
+                              monitor_b.handle, kB1, logical_b1)) {
+        const bool closed = close_probes();
+        Field("result", "ERROR");
+        Field("reason", "could not capture exact probe identities");
+        Field("probe cleanup", closed ? "PASS" : "FAIL");
+        release_mutex();
+        return 1;
+    }
+    WindowDesktopState b1_baseline_state;
+    if (!ReadWindowDesktopState(documented_manager.Get(), b1.hwnd,
+                                b1_baseline_state) ||
+        !WindowStateMatches(b1_baseline_state, carrier.id, true)) {
+        const bool closed = close_probes();
+        Field("result", "ERROR");
+        Field("reason", "control probe baseline is not on Carrier");
+        Field("probe cleanup", closed ? "PASS" : "FAIL");
+        release_mutex();
+        return 1;
+    }
+    const LogicalWindow* all_windows[] = {&logical_a1, &logical_a2,
+                                          &logical_b1};
+    auto owned_logical = [&](const WindowIdentity& identity) {
+        for (const LogicalWindow* logical : all_windows) {
+            if (logical != nullptr && logical->identity == identity) {
+                return logical;
+            }
+        }
+        return static_cast<const LogicalWindow*>(nullptr);
+    };
+    auto observe_role = [&](const WindowRecord& record) {
+        const LogicalWindow* logical = owned_logical(record.identity);
+        WindowIdentity current;
+        if (logical == nullptr ||
+            !ReadWindowIdentity(record.identity.hwnd, current) ||
+            current != record.identity) {
+            return NativeDesktopRole::Unknown;
+        }
+        WindowDesktopState state;
+        if (!ReadWindowDesktopState(documented_manager.Get(),
+                                    record.identity.hwnd, state)) {
+            return NativeDesktopRole::Unknown;
+        }
+        if (::IsEqualGUID(state.desktop, carrier.id) && state.on_current) {
+            return NativeDesktopRole::Carrier;
+        }
+        if (::IsEqualGUID(state.desktop, parking.id) && !state.on_current) {
+            return NativeDesktopRole::Parking;
+        }
+        return NativeDesktopRole::Unknown;
+    };
+    auto move_to_role = [&](const WindowRecord& record,
+                            NativeDesktopRole target) -> bool {
+        const LogicalWindow* logical = owned_logical(record.identity);
+        WindowIdentity current;
+        if (logical == nullptr ||
+            !ReadWindowIdentity(record.identity.hwnd, current) ||
+            current != record.identity ||
+            ::MonitorFromWindow(record.identity.hwnd,
+                                MONITOR_DEFAULTTONULL) != logical->monitor) {
+            return false;
+        }
+        RawObject view;
+        std::string error;
+        if (!acquire_view(record.identity.hwnd, view, &error) ||
+            !view_can_move(view.Get(), &error)) {
+            if (!error.empty()) Field("native move error", error);
+            return false;
+        }
+        IUnknown* target_object =
+            target == NativeDesktopRole::Carrier ? carrier.object.Get()
+            : target == NativeDesktopRole::Parking ? parking.object.Get()
+                                                    : nullptr;
+        const GUID* target_id =
+            target == NativeDesktopRole::Carrier ? &carrier.id
+            : target == NativeDesktopRole::Parking ? &parking.id : nullptr;
+        if (target_object == nullptr || target_id == nullptr) return false;
+        Gate gate = Gate::Ok;
+        HRESULT hr = E_ABORT;
+        return MoveViewToDesktopAndWait(
+            manager, view.Get(), target_object, record.identity.hwnd,
+            documented_manager.Get(), *target_id, carrier.id, true, gate, hr);
+    };
+
+    bool mutation_started = false;
+    WindowRecord setup_a2{};
+    setup_a2.identity = logical_a2.identity;
+    setup_a2.monitor = monitor_a_id;
+    setup_a2.workspace = kA2;
+    setup_a2.native_role = NativeDesktopRole::Carrier;
+    setup_a2.capabilities = {true, true, true, true, true};
+    mutation_started = true;
+    if (!move_to_role(setup_a2, NativeDesktopRole::Parking)) {
+        const bool setup_restored =
+            observe_role(setup_a2) == NativeDesktopRole::Carrier ||
+            move_to_role(setup_a2, NativeDesktopRole::Carrier);
+        const bool closed = close_probes();
+        Field("result", "ERROR");
+        Field("reason", "could not establish A2 on Parking");
+        Field("setup restoration",
+              setup_restored ? "PASS" : "FAILED (probe destroyed)");
+        Field("probe cleanup", closed ? "PASS" : "FAIL");
+        Field("mutation_started", "yes");
+        release_mutex();
+        return 1;
+    }
+
+    auto restore_and_close = [&]() {
+        bool restored = true;
+        for (const LogicalWindow* logical : all_windows) {
+            if (logical == nullptr) continue;
+            WindowRecord record{};
+            record.identity = logical->identity;
+            record.monitor = reinterpret_cast<MonitorId>(logical->monitor);
+            record.workspace = logical->workspace;
+            record.capabilities = {true, true, true, true, true};
+            const NativeDesktopRole role = observe_role(record);
+            if (role != NativeDesktopRole::Carrier &&
+                !move_to_role(record, NativeDesktopRole::Carrier)) {
+                restored = false;
+            }
+        }
+        return restored && close_probes();
+    };
+
+    bool restoration_done = false;
+    bool restored_result = true;
+    int integration_rc = 1;
+    try {
+    integration_rc = [&]() -> int {
+        bool capability_access_denied = false;
+        Win32WindowDiscoveryOptions options;
+        options.carrier = carrier.id;
+        options.parking = parking.id;
+        options.augment_capabilities =
+            [&](HWND hwnd, const WindowDiscoveryObservation& observation,
+                WindowCapabilities& capabilities, std::string* error) {
+                const LogicalWindow* logical =
+                    owned_logical(observation.identity);
+                if (logical == nullptr) return true;
+                if (hwnd != logical->identity.hwnd ||
+                    ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) !=
+                        logical->monitor) {
+                    if (error != nullptr) {
+                        *error = "owned probe identity or monitor changed";
+                    }
+                    return false;
+                }
+                RawObject view;
+                if (!acquire_view(hwnd, view, error)) return false;
+                capabilities.has_application_view = true;
+                Gate gate = Gate::Ok;
+                BOOL value = FALSE;
+                const HRESULT hr = InvokeSlot(
+                    manager.obj.Get(), *manager.layout, *can_move, gate, false,
+                    view.Get(), &value);
+                if (hr == E_ACCESSDENIED) capability_access_denied = true;
+                if (gate != Gate::Ok || FAILED(hr)) {
+                    if (error != nullptr) {
+                        *error = std::format(
+                            "CanViewMoveDesktops failed: gate={} hr={}",
+                            GateText(gate), HrToString(hr));
+                    }
+                    return false;
+                }
+                capabilities.can_move_desktops = value != FALSE;
+                return true;
+            };
+
+        std::string error;
+        HRESULT backend_hr = S_OK;
+        auto backend = CreateSystemWindowDiscoveryBackend(
+            std::move(options), &error, &backend_hr);
+        if (!backend) {
+            Field("integration error", error);
+            return backend_hr == E_ACCESSDENIED ? kExitInconclusive : 1;
+        }
+        WindowDiscovery discovery(std::move(*backend));
+
+        WorkspaceEngine engine(carrier.id, parking.id);
+        if (!engine.AddMonitor(monitor_a_id, kA1, monitor_a_workspaces,
+                               &error) ||
+            !engine.AddMonitor(monitor_b_id, kB1, monitor_b_workspaces,
+                               &error)) {
+            Field("integration error", error);
+            return 1;
+        }
+        WorkspaceAssignmentAdapter assignment(engine);
+        if (!assignment.ConfigureMonitor(monitor_a_id, kA1,
+                                         monitor_a_workspaces, &error) ||
+            !assignment.ConfigureMonitor(monitor_b_id, kB1,
+                                         monitor_b_workspaces, &error)) {
+            Field("assignment error", error);
+            return 1;
+        }
+        std::vector<DiscoveredWindow> initial;
+        if (!discovery.Discover(initial, &error)) {
+            Field("discovery error", error);
+            return capability_access_denied ? kExitInconclusive : 1;
+        }
+        const struct {
+            const LogicalWindow* logical;
+            NativeDesktopRole expected;
+        } expectations[] = {
+            {&logical_a1, NativeDesktopRole::Carrier},
+            {&logical_a2, NativeDesktopRole::Parking},
+            {&logical_b1, NativeDesktopRole::Carrier},
+        };
+        for (const auto& expectation : expectations) {
+            const auto found = std::find_if(
+                initial.begin(), initial.end(),
+                [&](const DiscoveredWindow& item) {
+                    return item.identity == expectation.logical->identity;
+                });
+            if (found == initial.end() ||
+                found->disposition != WindowDisposition::Managed ||
+                found->native_role != expectation.expected ||
+                !found->capabilities.Manageable()) {
+                Field("integration error",
+                      "system discovery did not prove all owned probes");
+                return 1;
+            }
+            WindowRecord record{};
+            record.identity = found->identity;
+            record.monitor = reinterpret_cast<MonitorId>(found->monitor);
+            record.workspace = expectation.logical->workspace;
+            record.native_role = found->native_role;
+            record.capabilities = found->capabilities;
+            record.presentation = found->presentation;
+            record.disposition = WindowDisposition::Managed;
+            record.present = true;
+            if (engine.UpsertWindow(std::move(record), &error) !=
+                UpsertResult::Added) {
+                Field("assignment error", error);
+                return 1;
+            }
+        }
+        if (!engine.CheckInvariant(&error)) {
+            Field("integration error", error);
+            return 1;
+        }
+        auto discover_assigned = [&](std::vector<WindowRecord>& records,
+                                     std::string* local_error) {
+            std::vector<DiscoveredWindow> complete;
+            if (!discovery.Discover(complete, local_error) ||
+                !assignment.ConvertCompleteSnapshot(complete, records,
+                                                    local_error)) {
+                return false;
+            }
+            if (records.size() != std::size(all_windows) ||
+                std::any_of(records.begin(), records.end(),
+                            [&](const WindowRecord& record) {
+                                return owned_logical(record.identity) == nullptr;
+                            })) {
+                if (local_error != nullptr) {
+                    *local_error =
+                        "assigned snapshot escaped the probe ownership boundary";
+                }
+                return false;
+            }
+            return true;
+        };
+        auto observe_owned = [&](HWND hwnd) -> std::optional<WindowRecord> {
+            std::vector<WindowRecord> records;
+            std::string local_error;
+            if (!discover_assigned(records, &local_error)) return std::nullopt;
+            const auto found = std::find_if(
+                records.begin(), records.end(),
+                [hwnd](const WindowRecord& record) {
+                    return record.identity.hwnd == hwnd;
+                });
+            return found == records.end() ? std::nullopt
+                                          : std::optional<WindowRecord>(*found);
+        };
+        WindowLifecycleAdapter lifecycle(engine, observe_owned);
+        WinEventLifecycleSource source;
+        if (!source.Start(&error)) {
+            Field("lifecycle error", error);
+            return 1;
+        }
+        auto coordinator_discovery = [&](std::vector<WindowRecord>& records,
+                                         std::string* local_error) {
+            if (!source.PumpOwnerThreadMessages(local_error)) return false;
+            return discover_assigned(records, local_error);
+        };
+        WorkspaceCoordinator coordinator(
+            engine, lifecycle, source, coordinator_discovery, move_to_role,
+            observe_role, &journal, 3);
+
+        std::size_t hotkey_dispatches = 0;
+        std::size_t switches_committed = 0;
+        HWND hotkey_window = nullptr;
+        auto do_switch = [&](WorkspaceId target) {
+            const CoordinatorResult result =
+                coordinator.Switch(monitor_a_id, target);
+            if (result.succeeded() && result.transaction.committed) {
+                ++switches_committed;
+                Field("switch -> " + std::to_string(target), "PASS");
+            } else {
+                Field("switch -> " + std::to_string(target), "FAIL");
+                if (!result.error.empty()) {
+                    Field("  switch error", result.error);
+                }
+            }
+            return result;
+        };
+
+        ManagerMainContext main_context;
+        main_context.hotkey_handler = [&](UINT modifiers, UINT vk) {
+            MonitorId monitor = 0;
+            WorkspaceId workspace = 0;
+            if (!ResolveWorkspaceHotkey(hotkey_config, modifiers, vk, monitor,
+                                        workspace)) {
+                return true;
+            }
+            ++hotkey_dispatches;
+            if (monitor == monitor_a_id) {
+                do_switch(workspace);
+            }
+            return true;
+        };
+        std::size_t reconcile_count = 0;
+        main_context.reconcile_handler = [&]() {
+            ++reconcile_count;
+            const CoordinatorResult result = coordinator.ReconcileDiscovery();
+            if (!result.succeeded() && !result.error.empty()) {
+                Field("periodic reconcile error", result.error);
+            }
+        };
+        main_context.tray_command_handler = [&](int command) {
+            if (command == 1) {
+                do_switch(kA2);
+            } else if (command == 2) {
+                do_switch(kA1);
+            } else if (command == 3) {
+                const MonitorWorkspaceState* monitor_a_state =
+                    engine.Monitor(monitor_a_id);
+                const MonitorWorkspaceState* monitor_b_state =
+                    engine.Monitor(monitor_b_id);
+                Print("diagnostics: monitor A active={} monitor B active={} "
+                      "reconciles={} switches={} hotkeys={}\n",
+                      monitor_a_state ? monitor_a_state->active : 0,
+                      monitor_b_state ? monitor_b_state->active : 0,
+                      reconcile_count, switches_committed, hotkey_dispatches);
+            } else if (command == 4) {
+                main_context.exit_requested = true;
+                ::PostMessageW(hotkey_window, WM_CLOSE, 0, 0);
+            }
+        };
+
+        if (!EnsureManagerMainClass()) {
+            Field("result", "ERROR");
+            Field("reason", "manager main window class unavailable");
+            return 1;
+        }
+        hotkey_window = ::CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kManagerMainClassName,
+            L"vdprobe-workspace-manager", WS_OVERLAPPED, 0, 0, 0, 0, nullptr,
+            nullptr, ::GetModuleHandleW(nullptr), nullptr);
+        if (hotkey_window == nullptr) {
+            Field("result", "ERROR");
+            Field("reason", "manager main window unavailable");
+            return 1;
+        }
+        ::SetWindowLongPtrW(hotkey_window, GWLP_USERDATA,
+                            reinterpret_cast<LONG_PTR>(&main_context));
+        for (const WorkspaceHotkeyBinding& binding : hotkey_config.bindings) {
+            const UINT id = 100 + static_cast<UINT>(&binding -
+                                                    hotkey_config.bindings.data());
+            if (!::RegisterHotKey(hotkey_window, id,
+                                  binding.hotkey.modifiers | MOD_NOREPEAT,
+                                  binding.hotkey.vk)) {
+                Field("result", "ENVIRONMENT-BLOCKED");
+                Field("reason", "hotkey registration failed (already bound?)");
+                return kExitInconclusive;
+            }
+        }
+        NOTIFYICONDATAW tray_data{};
+        tray_data.cbSize = sizeof(tray_data);
+        tray_data.hWnd = hotkey_window;
+        tray_data.uID = 1;
+        tray_data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        tray_data.uCallbackMessage = kManagerTrayMessage;
+        tray_data.hIcon = ::LoadIconW(nullptr, IDI_APPLICATION);
+        wcscpy_s(tray_data.szTip, L"vdprobe workspace manager");
+        const bool tray_added =
+            ::Shell_NotifyIconW(NIM_ADD, &tray_data) != FALSE;
+        Field("tray icon", tray_added ? "added" : "unavailable (recorded)");
+        ::SetTimer(hotkey_window, kManagerReconcileTimerId,
+                   kManagerReconcileIntervalMs, nullptr);
+        if (seconds > 0) {
+            ::SetTimer(hotkey_window, kManagerShutdownTimerId,
+                       static_cast<UINT>(seconds) * 1000U, nullptr);
+        }
+        Field("run mode", seconds > 0
+                              ? std::format("bounded {}s", seconds)
+                              : "unbounded (stop via --stop or tray Exit)");
+
+        MSG message{};
+        bool loop_error = false;
+        while (!main_context.exit_requested) {
+            const int result = ::GetMessageW(&message, nullptr, 0, 0);
+            if (result < 0) {
+                loop_error = true;
+                break;
+            }
+            if (result == 0) break;
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+        }
+        ::KillTimer(hotkey_window, kManagerReconcileTimerId);
+        ::KillTimer(hotkey_window, kManagerShutdownTimerId);
+        for (const WorkspaceHotkeyBinding& binding : hotkey_config.bindings) {
+            const UINT id = 100 + static_cast<UINT>(&binding -
+                                                    hotkey_config.bindings.data());
+            ::UnregisterHotKey(hotkey_window, id);
+        }
+        if (tray_added) {
+            ::Shell_NotifyIconW(NIM_DELETE, &tray_data);
+        }
+        ::DestroyWindow(hotkey_window);
+
+        Field("uptime reconciliations", std::format("{}", reconcile_count));
+        Field("hotkey dispatches", std::format("{}", hotkey_dispatches));
+        Field("switches committed", std::format("{}", switches_committed));
+        std::string pending_error;
+        const std::optional<SwitchPlan> pending =
+            journal.ReadPending(&pending_error);
+        bool ok = !loop_error && !pending && pending_error.empty() &&
+                  engine.CheckInvariant(&error);
+        const bool restored_here = restore_and_close();
+        restoration_done = true;
+        restored_result = restored_here;
+        ok = ok && restored_here;
+        source.Stop();
+        ok = ok && source.shutdown_ok();
+        Field("probe cleanup/restoration", restored_here ? "PASS" : "FAIL");
+        Field("stable journal pending", pending ? "YES" : "no");
+        return ok ? 0 : 1;
+    }();
+    } catch (const std::exception& exception) {
+        Field("integration error", std::format("exception: {}", exception.what()));
+    } catch (...) {
+        Field("integration error", "unknown exception");
+    }
+
+    const bool restored =
+        restoration_done ? restored_result : restore_and_close();
+    const bool passed = integration_rc == 0 && restored;
+    Field("mutation_started", mutation_started ? "yes" : "no");
+    Field("result", passed ? "PASS" : "FAIL");
+    Print("mutation_started={}\n", mutation_started ? "yes" : "no");
+    Print("RESULT={}\n", passed ? "PASS" : "FAIL");
+    release_mutex();
+    return passed ? 0 : 1;
+}
+
+int CmdWorkspaceManagerStop() {
+    HWND hwnd = ::FindWindowW(kManagerMainClassName, nullptr);
+    if (hwnd == nullptr) {
+        Print("no workspace-manager window found\n");
+        return 1;
+    }
+    if (!::PostMessageW(hwnd, WM_CLOSE, 0, 0)) {
+        Print("failed to post shutdown to workspace-manager\n");
+        return 1;
+    }
+    Print("shutdown requested\n");
+    return 0;
+}
+
+int CmdWorkspaceManagerInstallStartup(bool remove,
+                                      const char* config_path) {
+    constexpr wchar_t kRunKey[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kValueName[] = L"VdprobeWorkspaceManager";
+    HKEY key = nullptr;
+    const LONG open_result = ::RegOpenKeyExW(
+        HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &key);
+    if (open_result != ERROR_SUCCESS) {
+        Field("result", "ERROR");
+        Field("reason", std::format("cannot open HKCU Run key (Win32 {})",
+                                    open_result));
+        return 1;
+    }
+    if (remove) {
+        const LONG delete_result = ::RegDeleteValueW(key, kValueName);
+        ::RegCloseKey(key);
+        const bool ok = delete_result == ERROR_SUCCESS ||
+                        delete_result == ERROR_FILE_NOT_FOUND;
+        Field("startup entry", ok ? "removed" : "REMOVE FAILED");
+        Field("result", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    wchar_t module[MAX_PATH] = {};
+    const DWORD module_size = ::GetModuleFileNameW(nullptr, module, MAX_PATH);
+    if (module_size == 0 || module_size >= MAX_PATH) {
+        ::RegCloseKey(key);
+        Field("result", "ERROR");
+        Field("reason", "cannot resolve executable path");
+        return 1;
+    }
+    std::wstring command = L"\"" + std::wstring(module) +
+                           L"\" workspace-manager --run";
+    if (config_path != nullptr && *config_path != '\0') {
+        command += L" --config \"" + ToWide(config_path) + L"\"";
+    }
+    const LONG set_result = ::RegSetValueExW(
+        key, kValueName, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()),
+        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    ::RegCloseKey(key);
+    if (set_result != ERROR_SUCCESS) {
+        Field("result", "ERROR");
+        Field("reason", std::format("cannot write HKCU Run value (Win32 {})",
+                                    set_result));
+        return 1;
+    }
+    Field("startup entry", "installed (HKCU Run)");
+    Field("command", ToUtf8(command));
+    Field("result", "PASS");
+    return 0;
+}
+
 // ---------------------------------------------------- logical-workspace-test
 
 int CmdLogicalWorkspaceTest(bool confirm_mutate) {

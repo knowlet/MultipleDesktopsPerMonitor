@@ -157,6 +157,10 @@ void Usage() {
         "  --confirm-mutate    unlock explicitly gated desktop/window mutations\n"
         "  --seconds N         'notify-watch': how long to watch (default 20)\n"
         "  --config PATH       'workspace-manager': load a schema-v1 config file\n"
+        "  --run               'workspace-manager': long-running host mode\n"
+        "  --stop              'workspace-manager': request clean shutdown\n"
+        "  --install-startup   'workspace-manager': add the HKCU Run entry\n"
+        "  --remove-startup    'workspace-manager': remove the HKCU Run entry\n"
         "  --help, -h          this text\n"
         "\n"
         "This build never invokes a vtable slot that is not recorded with an agreed\n"
@@ -190,9 +194,13 @@ int main(int argc, char** argv) {
     bool confirm_register = false;
     bool self_trigger = false;
     bool confirm_mutate = false;
+    bool run_mode = false;
+    bool stop_mode = false;
+    bool install_startup = false;
+    bool remove_startup = false;
     std::string config_path;
     std::string browser;
-    int seconds = 20;
+    int seconds = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--all") {
@@ -207,9 +215,16 @@ int main(int argc, char** argv) {
             browser = vd::ToLowerAscii(argv[++i]);
         } else if (a == "--config" && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (a == "--run") {
+            run_mode = true;
+        } else if (a == "--stop") {
+            stop_mode = true;
+        } else if (a == "--install-startup") {
+            install_startup = true;
+        } else if (a == "--remove-startup") {
+            remove_startup = true;
         } else if (a == "--seconds" && i + 1 < argc) {
             seconds = std::atoi(argv[++i]);
-            if (seconds <= 0) seconds = 20;
         } else if (a == "--help" || a == "-h" || a == "/?") {
             Usage();
             return 0;
@@ -245,7 +260,8 @@ int main(int argc, char** argv) {
     } else if (cmd == "per-monitor-status") {
         rc = vd::CmdPerMonitorStatus();
     } else if (cmd == "notify-watch") {
-        rc = vd::CmdNotifyWatch(confirm_register, self_trigger, confirm_mutate, seconds);
+        rc = vd::CmdNotifyWatch(confirm_register, self_trigger, confirm_mutate,
+                                seconds > 0 ? seconds : 20);
     } else if (cmd == "carrier-parking-test") {
         rc = vd::CmdCarrierParkingTest(confirm_mutate);
     } else if (cmd == "logical-workspace-test") {
@@ -273,9 +289,21 @@ int main(int argc, char** argv) {
     } else if (cmd == "workspace-live-focus-restore-test") {
         rc = vd::CmdWorkspaceLiveFocusRestoreTest(confirm_mutate);
     } else if (cmd == "workspace-manager") {
-        rc = vd::CmdWorkspaceManager(confirm_mutate,
-                                     config_path.empty() ? nullptr
-                                                         : config_path.c_str());
+        if (stop_mode) {
+            rc = vd::CmdWorkspaceManagerStop();
+        } else if (install_startup || remove_startup) {
+            rc = vd::CmdWorkspaceManagerInstallStartup(
+                remove_startup, config_path.empty() ? nullptr
+                                                    : config_path.c_str());
+        } else if (run_mode) {
+            rc = vd::CmdWorkspaceManagerRun(
+                config_path.empty() ? nullptr : config_path.c_str(), seconds);
+        } else {
+            rc = vd::CmdWorkspaceManager(confirm_mutate,
+                                         config_path.empty()
+                                             ? nullptr
+                                             : config_path.c_str());
+        }
     } else if (cmd == "workspace-manager-test") {
         rc = vd::CmdWorkspaceManagerTest();
     } else if (cmd == "workspace-live-lifecycle-test") {

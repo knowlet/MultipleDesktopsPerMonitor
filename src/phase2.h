@@ -131,6 +131,19 @@ int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate);
 // SwitchDesktop or creates/removes a native desktop.
 int CmdWorkspaceManager(bool confirm_mutate, const char* config_path = nullptr);
 
+// Long-running host mode: single-instance mutex, message loop with hotkeys,
+// tray menu, and periodic reconciliation. `seconds` > 0 bounds the run for
+// automated validation; 0 runs until WM_CLOSE / tray Exit / session end.
+int CmdWorkspaceManagerRun(const char* config_path, int seconds);
+
+// Requests a clean shutdown of a running workspace-manager instance.
+int CmdWorkspaceManagerStop();
+
+// Installs or removes the per-user HKCU Run startup entry that launches
+// `workspace-manager --run` at sign-in.
+int CmdWorkspaceManagerInstallStartup(bool remove,
+                                      const char* config_path = nullptr);
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();
