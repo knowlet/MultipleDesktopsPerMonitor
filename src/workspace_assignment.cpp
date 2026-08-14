@@ -102,16 +102,35 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
             SetError(error, "assignment snapshot contains a closed window");
             return false;
         }
-        if (window.disposition == WindowDisposition::Unsupported ||
-            window.disposition == WindowDisposition::Ambiguous) {
-            // Unobservable/unsupported windows (including protected processes
-            // whose identity cannot be read) stay outside managed scope; they
-            // are never assigned or moved.
-            continue;
-        }
-        if (window.disposition == WindowDisposition::Quarantined) {
-            // Quarantined windows stay outside managed scope until a user
-            // override; they are never re-assigned automatically.
+        const bool unsafe_observation =
+            window.disposition == WindowDisposition::Unsupported ||
+            window.disposition == WindowDisposition::Ambiguous ||
+            window.disposition == WindowDisposition::Quarantined;
+        const WindowRecord* tracked =
+            window.identity.IsValid()
+                ? engine_.FindWindow(window.identity)
+                : nullptr;
+        if (unsafe_observation) {
+            if (tracked == nullptr ||
+                tracked->disposition != WindowDisposition::Managed) {
+                // Unknown unsafe windows stay outside managed scope; windows
+                // already outside managed scope stay there.
+                continue;
+            }
+            // Observation capability dropped for a managed window (protected
+            // process, unreadable desktop, missing view): preserve its prior
+            // logical ownership and downgrade the record so the engine never
+            // treats the window as closed and never moves it while
+            // unobservable.
+            WindowRecord preserved;
+            preserved.identity = window.identity;
+            preserved.monitor = tracked->monitor;
+            preserved.workspace = tracked->workspace;
+            preserved.native_role = NativeDesktopRole::Unknown;
+            preserved.capabilities = window.capabilities;
+            preserved.disposition = window.disposition;
+            preserved.present = true;
+            candidate.push_back(std::move(preserved));
             continue;
         }
         if (!window.identity.IsValid() ||
@@ -138,9 +157,21 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
                      "configured assignment topology no longer matches the engine");
             return false;
         }
-        const WindowRecord* tracked = engine_.FindWindow(window.identity);
-        if (tracked != nullptr &&
-            tracked->disposition == WindowDisposition::Managed) {
+        if (tracked != nullptr) {
+            if (tracked->disposition == WindowDisposition::Quarantined) {
+                // Quarantine is sticky: a re-observed quarantined window stays
+                // outside managed scope and is never re-assigned.
+                WindowRecord sticky;
+                sticky.identity = window.identity;
+                sticky.monitor = tracked->monitor;
+                sticky.workspace = tracked->workspace;
+                sticky.native_role = NativeDesktopRole::Unknown;
+                sticky.capabilities = window.capabilities;
+                sticky.disposition = WindowDisposition::Quarantined;
+                sticky.present = true;
+                candidate.push_back(std::move(sticky));
+                continue;
+            }
             WorkspaceId assigned_workspace = tracked->workspace;
             if (tracked->monitor != observed_monitor) {
                 if (migration_policy_ == MonitorMigrationPolicy::FailClosed) {
@@ -378,6 +409,48 @@ int CmdWorkspaceAssignmentTest() {
     Field("quarantined window omitted",
           quarantined_omitted ? "PASS" : "FAIL");
     ok = ok && quarantined_omitted;
+
+    // Observation downgrade preserves ownership: a managed tracked window
+    // that becomes temporarily Ambiguous keeps its workspace and is not
+    // treated as closed.
+    const WindowIdentity downgraded_id = TestIdentity(16, 116, 1);
+    bool downgrade_ok =
+        engine.UpsertWindow(
+            {downgraded_id, 1, 11, NativeDesktopRole::Parking,
+             TestCapabilities()},
+            &error) == UpsertResult::Added;
+    DiscoveredWindow downgraded =
+        TestWindow(downgraded_id, 1, NativeDesktopRole::Parking);
+    downgraded.disposition = WindowDisposition::Ambiguous;
+    downgraded.native_role = NativeDesktopRole::Unknown;
+    std::vector<WindowRecord> downgrade_records;
+    downgrade_ok = downgrade_ok &&
+                   adapter.ConvertCompleteSnapshot({downgraded},
+                                                   downgrade_records,
+                                                   &error) &&
+                   downgrade_records.size() == 1 &&
+                   downgrade_records[0].identity == downgraded_id &&
+                   downgrade_records[0].workspace == 11 &&
+                   downgrade_records[0].disposition ==
+                       WindowDisposition::Ambiguous;
+    Field("observation downgrade preserves ownership",
+          downgrade_ok ? "PASS" : "FAIL");
+    ok = ok && downgrade_ok;
+
+    // Recovery: the same window observed Managed again returns to its prior
+    // workspace (11).
+    const bool recovery_ok =
+        adapter.ConvertCompleteSnapshot(
+            {TestWindow(downgraded_id, 1, NativeDesktopRole::Parking)},
+            downgrade_records, &error) &&
+        downgrade_records.size() == 1 &&
+        downgrade_records[0].workspace == 11 &&
+        downgrade_records[0].disposition == WindowDisposition::Managed;
+    Field("downgraded window recovers prior workspace",
+          recovery_ok ? "PASS" : "FAIL");
+    ok = ok && recovery_ok;
+    // The shared engine is used by later tests; remove the probe window.
+    engine.CloseWindow(downgraded_id, &error);
 
     const WindowIdentity new_generation = TestIdentity(6, 206, 2);
     const bool generation_not_inherited =
