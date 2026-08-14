@@ -7293,6 +7293,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             Field("integration error", error);
             return 1;
         }
+        engine.SetAutoQuarantine(hotkey_config.quarantine_enabled);
         WorkspaceAssignmentAdapter assignment(engine);
         if (!assignment.ConfigureMonitor(monitor_a_id, kA1,
                                          monitor_a_workspaces, &error) ||
@@ -7610,6 +7611,8 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         Field("uptime reconciliations", std::format("{}", reconcile_count));
         Field("hotkey dispatches", std::format("{}", hotkey_dispatches));
         Field("switches committed", std::format("{}", switches_committed));
+        Field("quarantine entries",
+              std::format("{}", engine.QuarantineLog().size()));
         Field("display changes handled",
               std::format("{}", resilience.display_changes_handled));
         Field("resume events handled",

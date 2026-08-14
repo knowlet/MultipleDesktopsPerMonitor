@@ -587,6 +587,13 @@ UpsertResult WorkspaceEngine::UpsertWindow(WindowRecord record,
         return UpsertResult::Added;
     }
 
+    // Quarantine is sticky: a re-observed window never silently returns to
+    // Managed scope.
+    if (existing->second.disposition == WindowDisposition::Quarantined &&
+        record.disposition == WindowDisposition::Managed) {
+        record.disposition = WindowDisposition::Quarantined;
+    }
+
     if (existing->second.monitor != record.monitor ||
         existing->second.workspace != record.workspace) {
         RemoveIdentityFromWorkspace(existing->second.identity,
@@ -611,6 +618,26 @@ bool WorkspaceEngine::CloseWindow(const WindowIdentity& identity,
     RemoveIdentityFromWorkspace(it->second.identity, it->second.workspace);
     hwnd_index_.erase(reinterpret_cast<std::uintptr_t>(identity.hwnd));
     windows_.erase(it);
+    return true;
+}
+
+bool WorkspaceEngine::QuarantineWindow(const WindowIdentity& identity,
+                                       const std::string& reason,
+                                       std::string* error) {
+    auto it = windows_.find(identity);
+    if (it == windows_.end()) {
+        if (error) *error = "window not tracked";
+        return false;
+    }
+    if (it->second.disposition == WindowDisposition::Managed) {
+        it->second.disposition = WindowDisposition::Quarantined;
+    }
+    if (std::none_of(quarantine_log_.begin(), quarantine_log_.end(),
+                     [&](const QuarantineEntry& entry) {
+                         return entry.identity == identity;
+                     })) {
+        quarantine_log_.push_back({identity, reason});
+    }
     return true;
 }
 
@@ -668,6 +695,11 @@ bool WorkspaceEngine::ReconcileDiscoverySnapshot(
         if (!identities.contains(window->identity) &&
             !hwnds.contains(reinterpret_cast<std::uintptr_t>(
                 window->identity.hwnd))) {
+            if (window->disposition == WindowDisposition::Quarantined) {
+                // Quarantined windows are outside managed scope and are not
+                // closed by authoritative snapshots; quarantine persists.
+                continue;
+            }
             const WindowIdentity identity = window->identity;
             if (!CloseWindow(identity, error)) return false;
             ++next_result.closed;
@@ -805,6 +837,10 @@ std::optional<SwitchPlan> WorkspaceEngine::PrepareSwitch(
         const bool affected = window->workspace == state->active ||
                               window->workspace == target_workspace;
         if (affected && window->disposition != WindowDisposition::Managed) {
+            if (window->disposition == WindowDisposition::Quarantined) {
+                // Quarantined windows stay outside mutation scope.
+                continue;
+            }
             if (error) *error = "affected workspace contains unsupported/ambiguous window";
             return std::nullopt;
         }
@@ -1149,6 +1185,12 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         }
         result.recovery_required =
             result.recovery_required || !result.rollback_succeeded;
+        if (auto_quarantine_) {
+            for (const SwitchOperation& operation : plan.operations) {
+                QuarantineWindow(operation.identity,
+                                 "switch rolled back: " + operation_error);
+            }
+        }
         result.error = error;
         return result;
     }
@@ -1198,6 +1240,12 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         }
     }
     if (!post_state_matches) {
+        if (auto_quarantine_) {
+            for (const SwitchOperation& operation : plan.operations) {
+                QuarantineWindow(operation.identity,
+                                 "switch invalidated before commit");
+            }
+        }
         result.rollback_attempted = !applied.empty();
         if (error.empty()) error = "switch state changed during execution";
         const std::string operation_error = error;
@@ -1453,6 +1501,8 @@ const char* WindowDispositionText(WindowDisposition disposition) noexcept {
             return "unsupported";
         case WindowDisposition::Ambiguous:
             return "ambiguous";
+        case WindowDisposition::Quarantined:
+            return "quarantined";
         case WindowDisposition::Closed:
             return "closed";
         default:
@@ -1486,6 +1536,10 @@ int CmdWorkspaceEngineTest() {
     GUID parking{0xaaaaaaaa, 0xbbbb, 0xcccc,
                  {0xdd, 0xee, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}};
     WorkspaceEngine engine(carrier, parking);
+    // The shared rollback/recovery engine keeps auto-quarantine disabled so
+    // its original rollback/journal semantics stay unchanged; quarantine is
+    // exercised by the dedicated engines below.
+    engine.SetAutoQuarantine(false);
     std::string error;
     bool ok = engine.AddMonitor(1, 1, {1, 2}, &error) &&
               engine.AddMonitor(2, 3, {3, 4}, &error);
@@ -2148,6 +2202,146 @@ int CmdWorkspaceEngineTest() {
     }
     ok = ok && unknown_role_ok;
     Field("unknown native role is unsupported", unknown_role_ok ? "PASS" : "FAIL");
+
+    // Compatibility quarantine: a quarantined window is excluded from switch
+    // plans, rollback/invalidation auto-quarantines, and quarantine is sticky
+    // across authoritative snapshots unless auto-quarantine is disabled.
+    WorkspaceEngine quarantine_engine(carrier, parking);
+    bool quarantine_ok =
+        quarantine_engine.AddMonitor(1, 10, {10, 11}, &error);
+    const WindowIdentity q1_id = identity(0x3001, 301, 3);
+    const WindowIdentity q2_id = identity(0x3002, 302, 3);
+    quarantine_ok = quarantine_ok &&
+                    quarantine_engine.UpsertWindow(
+                        {q1_id, 1, 10, NativeDesktopRole::Carrier, manageable,
+                         {}, {}, true},
+                        &error) == UpsertResult::Added &&
+                    quarantine_engine.UpsertWindow(
+                        {q2_id, 1, 10, NativeDesktopRole::Carrier, manageable,
+                         {}, {}, true},
+                        &error) == UpsertResult::Added &&
+                    quarantine_engine.QuarantineWindow(q1_id,
+                                                       "test anomaly",
+                                                       &error) &&
+                    quarantine_engine.FindWindow(q1_id)->disposition ==
+                        WindowDisposition::Quarantined &&
+                    quarantine_engine.QuarantineLog().size() == 1;
+    const std::optional<SwitchPlan> quarantine_plan =
+        quarantine_ok ? quarantine_engine.PrepareSwitch(1, 11, &error)
+                      : std::nullopt;
+    quarantine_ok = quarantine_ok && quarantine_plan.has_value() &&
+                    quarantine_plan->operations.size() == 1 &&
+                    quarantine_plan->operations[0].identity == q2_id;
+    ok = ok && quarantine_ok;
+    Field("quarantined window excluded from switch plan",
+          quarantine_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine rollback_quarantine_engine(carrier, parking);
+    bool rollback_quarantine_ok =
+        rollback_quarantine_engine.AddMonitor(1, 10, {10, 11}, &error);
+    const WindowIdentity rq1_id = identity(0x3003, 303, 3);
+    const WindowIdentity rq2_id = identity(0x3004, 304, 3);
+    rollback_quarantine_ok = rollback_quarantine_ok &&
+                             rollback_quarantine_engine.UpsertWindow(
+                                 {rq1_id, 1, 10, NativeDesktopRole::Carrier,
+                                  manageable, {}, {}, true},
+                                 &error) == UpsertResult::Added &&
+                             rollback_quarantine_engine.UpsertWindow(
+                                 {rq2_id, 1, 10, NativeDesktopRole::Carrier,
+                                  manageable, {}, {}, true},
+                                 &error) == UpsertResult::Added;
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        rq_roles{{rq1_id, NativeDesktopRole::Carrier},
+                 {rq2_id, NativeDesktopRole::Carrier}};
+    int rq_move_calls = 0;
+    const auto flaky_move = [&](const WindowRecord& window,
+                                NativeDesktopRole target) {
+        ++rq_move_calls;
+        if (target == NativeDesktopRole::Parking && rq_move_calls <= 1) {
+            return false;
+        }
+        rq_roles[window.identity] = target;
+        return true;
+    };
+    const auto rq_observe = [&](const WindowRecord& window) {
+        return rq_roles.at(window.identity);
+    };
+    std::optional<SwitchPlan> rq_plan = std::nullopt;
+    TransactionResult rq_result;
+    if (rollback_quarantine_ok) {
+        rq_plan = rollback_quarantine_engine.PrepareSwitch(1, 11, &error);
+        rq_result = rq_plan
+            ? rollback_quarantine_engine.ExecuteSwitch(*rq_plan, flaky_move,
+                                                       rq_observe)
+            : TransactionResult{};
+    }
+    rollback_quarantine_ok =
+        rollback_quarantine_ok && rq_plan.has_value() &&
+        !rq_result.committed && rq_result.rollback_succeeded &&
+        rollback_quarantine_engine.FindWindow(rq1_id)->disposition ==
+            WindowDisposition::Quarantined &&
+        rollback_quarantine_engine.FindWindow(rq2_id)->disposition ==
+            WindowDisposition::Quarantined &&
+        rollback_quarantine_engine.QuarantineLog().size() == 2;
+    ok = ok && rollback_quarantine_ok;
+    Field("rolled-back switch auto-quarantines windows",
+          rollback_quarantine_ok ? "PASS" : "FAIL");
+
+    WorkspaceEngine no_auto_quarantine(carrier, parking);
+    no_auto_quarantine.SetAutoQuarantine(false);
+    bool no_quarantine_ok =
+        no_auto_quarantine.AddMonitor(1, 10, {10, 11}, &error);
+    const WindowIdentity nq1_id = identity(0x3005, 305, 3);
+    no_quarantine_ok = no_quarantine_ok &&
+                       no_auto_quarantine.UpsertWindow(
+                           {nq1_id, 1, 10, NativeDesktopRole::Carrier,
+                            manageable, {}, {}, true},
+                           &error) == UpsertResult::Added;
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        nq_roles{{nq1_id, NativeDesktopRole::Carrier}};
+    int nq_move_calls = 0;
+    const auto nq_flaky_move = [&](const WindowRecord& window,
+                                   NativeDesktopRole target) {
+        ++nq_move_calls;
+        if (target == NativeDesktopRole::Parking && nq_move_calls <= 1) {
+            return false;
+        }
+        nq_roles[window.identity] = target;
+        return true;
+    };
+    const auto nq_observe = [&](const WindowRecord& window) {
+        return nq_roles.at(window.identity);
+    };
+    std::optional<SwitchPlan> nq_plan = std::nullopt;
+    if (no_quarantine_ok) {
+        nq_plan = no_auto_quarantine.PrepareSwitch(1, 11, &error);
+        (void)no_auto_quarantine.ExecuteSwitch(*nq_plan, nq_flaky_move,
+                                               nq_observe);
+    }
+    no_quarantine_ok =
+        no_quarantine_ok && nq_plan.has_value() &&
+        no_auto_quarantine.FindWindow(nq1_id)->disposition ==
+            WindowDisposition::Managed &&
+        no_auto_quarantine.QuarantineLog().empty();
+    ok = ok && no_quarantine_ok;
+    Field("auto-quarantine can be disabled", no_quarantine_ok ? "PASS" : "FAIL");
+
+    bool sticky_ok = quarantine_ok;
+    if (sticky_ok) {
+        sticky_ok = quarantine_engine.ReconcileDiscoverySnapshot(
+                        {WindowRecord{q1_id, 1, 10, NativeDesktopRole::Carrier,
+                                      manageable, {}, {}, true},
+                         WindowRecord{q2_id, 1, 10, NativeDesktopRole::Carrier,
+                                      manageable, {}, {}, true}},
+                        nullptr, &error) &&
+                    quarantine_engine.FindWindow(q1_id)->disposition ==
+                        WindowDisposition::Quarantined &&
+                    quarantine_engine.FindWindow(q2_id)->disposition ==
+                        WindowDisposition::Managed;
+    }
+    ok = ok && sticky_ok;
+    Field("quarantine persists across reconciliation",
+          sticky_ok ? "PASS" : "FAIL");
 
     WorkspaceEngine reconcile_engine(carrier, parking);
     bool bounded_rollback_ok =

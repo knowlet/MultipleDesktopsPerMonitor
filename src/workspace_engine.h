@@ -33,6 +33,10 @@ enum class WindowDisposition {
     Managed,
     Unsupported,
     Ambiguous,
+    // A window that violated expected Carrier/Parking semantics during a
+    // transaction. Quarantined windows are excluded from all future switch
+    // plans and are never promoted back to Managed automatically.
+    Quarantined,
     Closed,
 };
 
@@ -50,6 +54,11 @@ bool operator!=(const WindowIdentity& a, const WindowIdentity& b) noexcept;
 
 struct WindowIdentityHash {
     std::size_t operator()(const WindowIdentity& identity) const noexcept;
+};
+
+struct QuarantineEntry {
+    WindowIdentity identity;
+    std::string reason;
 };
 
 struct WindowCapabilities {
@@ -240,6 +249,20 @@ class WorkspaceEngine {
                               std::string* error = nullptr);
     bool CloseWindow(const WindowIdentity& identity,
                      std::string* error = nullptr);
+
+    // Marks a tracked Managed window as quarantined with a diagnostic reason.
+    // Quarantined windows are excluded from switch plans, presentation plans,
+    // and the invariant, and stay quarantined across reconciliations.
+    bool QuarantineWindow(const WindowIdentity& identity,
+                          const std::string& reason,
+                          std::string* error = nullptr);
+    void SetAutoQuarantine(bool enabled) noexcept {
+        auto_quarantine_ = enabled;
+    }
+    bool auto_quarantine() const noexcept { return auto_quarantine_; }
+    const std::vector<QuarantineEntry>& QuarantineLog() const noexcept {
+        return quarantine_log_;
+    }
     // Applies one complete, point-in-time discovery snapshot after validating
     // the full input and then using deterministic model updates. Callers must
     // not pass a filtered or partial enumeration: tracked windows omitted from
@@ -319,6 +342,8 @@ class WorkspaceEngine {
         windows_;
     std::unordered_map<std::uintptr_t, WindowIdentity> hwnd_index_;
     std::vector<WindowRecord> closed_windows_;
+    bool auto_quarantine_ = true;
+    std::vector<QuarantineEntry> quarantine_log_;
 };
 
 const char* NativeDesktopRoleText(NativeDesktopRole role) noexcept;

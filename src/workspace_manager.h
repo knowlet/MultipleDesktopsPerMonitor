@@ -51,6 +51,9 @@ struct WorkspaceManagerConfig {
     MonitorMigrationPolicy migration_policy =
         MonitorMigrationPolicy::ReassignToDestinationActive;
     ManagerLogLevel log_level = ManagerLogLevel::Info;
+    // When enabled, a rolled-back or invalidated switch automatically
+    // quarantines the affected windows (user override: `quarantine off`).
+    bool quarantine_enabled = true;
     std::filesystem::path journal_path;
     bool tray_icon = true;
 };

@@ -421,6 +421,14 @@ bool ParseWorkspaceManagerConfig(const std::string& text,
                              ": log-level must be debug, info, warn, or error");
                 return false;
             }
+        } else if (directive == "quarantine") {
+            if (tokens.size() != 2 ||
+                (tokens[1] != "on" && tokens[1] != "off")) {
+                SetError(error, "line " + std::to_string(line_number) +
+                                    ": quarantine requires 'on' or 'off'");
+                return false;
+            }
+            config.quarantine_enabled = tokens[1] == "on";
         } else if (directive == "journal") {
             if (tokens.size() != 2) {
                 SetError(error, "line " + std::to_string(line_number) +
@@ -508,6 +516,8 @@ bool SaveManagerConfig(const WorkspaceManagerConfig& config,
             stream << "log-level error\n";
             break;
     }
+    stream << "quarantine " << (config.quarantine_enabled ? "on" : "off")
+           << "\n";
     if (!config.journal_path.empty()) {
         stream << "journal " << config.journal_path.generic_string() << "\n";
     }
@@ -655,6 +665,7 @@ int CmdWorkspaceManagerTest() {
         "hotkey Ctrl+Alt+Shift+F9 2 B2\n"
         "assignment monitor-migration fail-closed\n"
         "log-level warn\n"
+        "quarantine off\n"
         "journal C:/tmp/vdprobe-manager.journal\n"
         "tray on\n";
     WorkspaceManagerConfig config;
@@ -678,6 +689,7 @@ int CmdWorkspaceManagerTest() {
          config.bindings[2].workspace == 2 &&
          config.migration_policy == MonitorMigrationPolicy::FailClosed &&
          config.log_level == ManagerLogLevel::Warn &&
+         !config.quarantine_enabled &&
          config.journal_path == L"C:/tmp/vdprobe-manager.journal" &&
          config.tray_icon;
     Field("valid v1 config parsed", ok ? "PASS" : "FAIL");
@@ -778,6 +790,16 @@ int CmdWorkspaceManagerTest() {
           bad_log_level_rejected ? "PASS" : "FAIL");
     ok = ok && bad_log_level_rejected;
 
+    const std::string bad_quarantine =
+        "version 1\nmonitor 1 workspaces A1 active A1\n"
+        "quarantine maybe\n";
+    const bool bad_quarantine_rejected =
+        !ParseWorkspaceManagerConfig(bad_quarantine, ignored, &error) &&
+        error.find("quarantine") != std::string::npos;
+    Field("invalid quarantine value rejected",
+          bad_quarantine_rejected ? "PASS" : "FAIL");
+    ok = ok && bad_quarantine_rejected;
+
     const std::string unknown_directive = "version 1\nfrobnicate 1\n";
     const bool unknown_directive_rejected =
         !ParseWorkspaceManagerConfig(unknown_directive, ignored, &error) &&
@@ -806,6 +828,7 @@ int CmdWorkspaceManagerTest() {
         loaded.bindings[0].workspace == config.bindings[0].workspace &&
         loaded.migration_policy == config.migration_policy &&
         loaded.log_level == config.log_level &&
+        loaded.quarantine_enabled == config.quarantine_enabled &&
         loaded.journal_path == config.journal_path &&
         loaded.tray_icon == config.tray_icon;
     std::filesystem::remove(roundtrip_path, remove_error);

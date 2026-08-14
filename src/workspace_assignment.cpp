@@ -109,6 +109,11 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
             // are never assigned or moved.
             continue;
         }
+        if (window.disposition == WindowDisposition::Quarantined) {
+            // Quarantined windows stay outside managed scope until a user
+            // override; they are never re-assigned automatically.
+            continue;
+        }
         if (!window.identity.IsValid() ||
             !identities.insert(window.identity).second ||
             !hwnds.insert(hwnd).second) {
@@ -362,6 +367,17 @@ int CmdWorkspaceAssignmentTest() {
         records.empty();
     Field("unobservable identity omitted", unreadable_omitted ? "PASS" : "FAIL");
     ok = ok && unreadable_omitted;
+
+    DiscoveredWindow quarantined_window =
+        TestWindow(TestIdentity(15, 115, 1), 1,
+                   NativeDesktopRole::Carrier);
+    quarantined_window.disposition = WindowDisposition::Quarantined;
+    const bool quarantined_omitted =
+        adapter.ConvertCompleteSnapshot({quarantined_window}, records, &error) &&
+        records.empty();
+    Field("quarantined window omitted",
+          quarantined_omitted ? "PASS" : "FAIL");
+    ok = ok && quarantined_omitted;
 
     const WindowIdentity new_generation = TestIdentity(6, 206, 2);
     const bool generation_not_inherited =

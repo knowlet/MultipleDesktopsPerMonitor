@@ -475,6 +475,7 @@ int CmdWorkspaceCoordinatorTest() {
     GUID exception_parking{};
     exception_parking.Data1 = 4;
     WorkspaceEngine exception_engine(exception_carrier, exception_parking);
+    exception_engine.SetAutoQuarantine(false);
     bool exception_tests_ok =
         exception_engine.AddMonitor(2, 20, {20, 21}, &error);
     WindowIdentity c{reinterpret_cast<HWND>(3), 102, {3, 3}, true};
@@ -571,6 +572,7 @@ int CmdWorkspaceCoordinatorTest() {
     // and must be tolerated: the plan is still valid and commits.
     {
         WorkspaceEngine tolerant_engine(epoch_carrier, epoch_parking);
+        tolerant_engine.SetAutoQuarantine(false);
         bool tolerant_ok =
             tolerant_engine.AddMonitor(3, 30, {30, 31}, &error);
         std::unordered_map<WindowIdentity, NativeDesktopRole,
@@ -623,6 +625,7 @@ int CmdWorkspaceCoordinatorTest() {
     // a fresh snapshot; only a persistent hint exhausts the bounded attempts.
     {
         WorkspaceEngine strict_engine(epoch_carrier, epoch_parking);
+        strict_engine.SetAutoQuarantine(false);
         bool strict_ok = strict_engine.AddMonitor(3, 30, {30, 31}, &error);
         const WindowIdentity z{reinterpret_cast<HWND>(9), 109, {9, 9}, true};
         std::unordered_map<WindowIdentity, NativeDesktopRole,
@@ -672,6 +675,7 @@ int CmdWorkspaceCoordinatorTest() {
 
     {
         WorkspaceEngine noisy_engine(epoch_carrier, epoch_parking);
+        noisy_engine.SetAutoQuarantine(false);
         bool noisy_ok = noisy_engine.AddMonitor(3, 30, {30, 31}, &error);
         const WindowIdentity z{reinterpret_cast<HWND>(9), 109, {9, 9}, true};
         std::unordered_map<WindowIdentity, NativeDesktopRole,
