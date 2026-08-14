@@ -51,6 +51,15 @@ struct LayoutTable {
     // Historical layouts are kept for comparison but are never invocable.
     bool applicable_to_current_family;
     std::span<const MethodEntry> methods;
+    // Runtime half of the mutation gate. The table above is compile-time;
+    // these are the build boundaries the layout was actually validated
+    // against. A mutating call is refused (UnsupportedBuild) when the live
+    // build falls outside [min, max] even if the shell still answers the
+    // recorded IID, so a future Windows build with a changed ABI can never
+    // be mutated before the layout is re-validated. 0 means unbounded on
+    // that side.
+    DWORD validated_build_min = 0;
+    DWORD validated_build_max = 0;
 };
 
 std::span<const LayoutTable> Layouts();
@@ -75,9 +84,14 @@ enum class Gate {
     NoObject,         // null interface pointer
     UnreadableVtable, // vtable pointer not readable
     NotCodePointer,   // slot does not hold a code pointer in a mapped image
+    UnsupportedBuild, // live Windows build outside the validated range
 };
 
 const char* GateText(Gate g);
+
+// Deterministic, non-mutating gate test.  No COM, HWND, or native desktop
+// state is touched; the fake object's vtable lives in this image.
+int CmdLayoutGateTest();
 
 // Validates everything that can be validated without transferring control.
 Gate CheckInvocable(IUnknown* obj, const LayoutTable& t, const MethodEntry& m,

@@ -4,6 +4,9 @@
 #include <iterator>
 #include <vector>
 
+#include "phase1.h"
+#include "util.h"
+
 namespace vd {
 namespace {
 
@@ -413,7 +416,7 @@ constexpr MethodEntry kPinnedApps_Methods[] = {
 constexpr LayoutTable kLayouts[] = {
     {"IVirtualDesktopManagerInternal", &IID_VDMI_53F5CA0B,
      "Win11 23H2 22631.3085+ / 24H2 26100 / 25H2 26200", MonitorAware::No, true,
-     kVDMI_53F5CA0B_Methods},
+     kVDMI_53F5CA0B_Methods, 22631, 26299},
     {"IVirtualDesktopManagerInternal", &IID_VDMI_A3175F2D,
      "Win11 22H2 22621.2215+ / 23H2 pre-3085", MonitorAware::No, false,
      kVDMI_A3175F2D_Methods},
@@ -434,7 +437,8 @@ constexpr LayoutTable kLayouts[] = {
     {"IApplicationView", &IID_IApplicationView, "Win10 1607 .. Win11 25H2",
      MonitorAware::Unknown, true, kAppView_Methods},
     {"IVirtualDesktopNotificationService", &IID_IVirtualDesktopNotificationService,
-     "Win10 1607 .. Win11 25H2", MonitorAware::Unknown, true, kNotifSvc_Methods},
+     "Win10 1607 .. Win11 25H2", MonitorAware::Unknown, true, kNotifSvc_Methods,
+     10240, 26299},
     // Documentation-only: the sink layout vdprobe's own COM object must match.
     // applicable_to_current_family=false because this row is never a target of
     // InvokeSlot(); CheckInvocable's NotApplicable branch guarantees that even a
@@ -468,6 +472,7 @@ const char* GateText(Gate g) {
         case Gate::NotApplicable:    return "REFUSED: layout is for a different build family";
         case Gate::Mutating:         return "REFUSED: method mutates shell state (read-only milestone)";
         case Gate::NoObject:         return "REFUSED: null interface pointer";
+        case Gate::UnsupportedBuild: return "REFUSED: live Windows build outside the validated range";
         case Gate::UnreadableVtable: return "REFUSED: vtable pointer not readable";
         case Gate::NotCodePointer:   return "REFUSED: slot does not hold image code pointer";
     }
@@ -507,6 +512,23 @@ const MethodEntry* FindMethod(const LayoutTable& t, const char* method) {
     return nullptr;
 }
 
+const BuildInfo& CurrentBuildInfo() {
+    static const BuildInfo info = GetBuildInfo();
+    return info;
+}
+
+bool MutationBuildAllowed(const LayoutTable& t) {
+    const DWORD build = CurrentBuildInfo().build;
+    if (build == 0) return false;
+    if (t.validated_build_min != 0 && build < t.validated_build_min) {
+        return false;
+    }
+    if (t.validated_build_max != 0 && build > t.validated_build_max) {
+        return false;
+    }
+    return true;
+}
+
 Gate CheckInvocable(IUnknown* obj, const LayoutTable& t, const MethodEntry& m,
                     bool allow_mutating) {
     if (obj == nullptr) return Gate::NoObject;
@@ -514,12 +536,92 @@ Gate CheckInvocable(IUnknown* obj, const LayoutTable& t, const MethodEntry& m,
     if (m.slot == kUnknownSlot) return Gate::SlotNotAgreed;
     if (m.confidence < Confidence::High) return Gate::LowConfidence;
     if (!m.read_only && !allow_mutating) return Gate::Mutating;
+    if (!m.read_only && allow_mutating && !MutationBuildAllowed(t)) {
+        // Runtime build gate: the layout table is compile-time, so even a
+        // shell that still answers the recorded IID must run a build the
+        // layout was actually validated against before any mutation.
+        return Gate::UnsupportedBuild;
+    }
 
     void** vt = VtableOf(obj);
     if (vt == nullptr) return Gate::UnreadableVtable;
     if (!IsReadablePointer(&vt[m.slot], sizeof(void*))) return Gate::UnreadableVtable;
     if (!IsImageCodePointer(vt[m.slot])) return Gate::NotCodePointer;
     return Gate::Ok;
+}
+
+namespace {
+
+HRESULT __stdcall FakeGateQueryInterface(void*, REFIID, void**) {
+    return E_NOINTERFACE;
+}
+ULONG __stdcall FakeGateAddRef(void*) { return 1; }
+ULONG __stdcall FakeGateRelease(void*) { return 1; }
+HRESULT __stdcall FakeGateMethod(void*) { return S_OK; }
+
+void* kFakeGateVtable[] = {
+    reinterpret_cast<void*>(&FakeGateQueryInterface),
+    reinterpret_cast<void*>(&FakeGateAddRef),
+    reinterpret_cast<void*>(&FakeGateRelease),
+    reinterpret_cast<void*>(&FakeGateMethod),
+};
+
+struct FakeGateObject {
+    void* const* vtable = kFakeGateVtable;
+};
+
+}  // namespace
+
+int CmdLayoutGateTest() {
+    Heading("layout-gate-test");
+    bool ok = true;
+    const GUID fake_iid = {0x11111111, 0x1111, 0x1111,
+                          {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+                           0x11}};
+    constexpr MethodEntry kGateMutating[] = {
+        {"FakeMutate", 3, "HRESULT FakeMutate()", Confidence::Verified,
+         "test fake", false, nullptr},
+    };
+    constexpr MethodEntry kGateReadOnly[] = {
+        {"FakeRead", 3, "HRESULT FakeRead()", Confidence::Verified,
+         "test fake", true, nullptr},
+    };
+    FakeGateObject fake;
+    IUnknown* fake_unknown = reinterpret_cast<IUnknown*>(&fake);
+    const LayoutTable in_range{
+        "FakeIface", &fake_iid, "test", MonitorAware::Unknown, true,
+        kGateMutating, 1, 999999};
+    const LayoutTable out_of_range{
+        "FakeIface", &fake_iid, "test", MonitorAware::Unknown, true,
+        kGateMutating, 1, 1};
+    const LayoutTable unbounded{
+        "FakeIface", &fake_iid, "test", MonitorAware::Unknown, true,
+        kGateMutating, 0, 0};
+    const LayoutTable read_only_table{
+        "FakeIface", &fake_iid, "test", MonitorAware::Unknown, true,
+        kGateReadOnly, 1, 1};
+
+    const Gate in_range_gate =
+        CheckInvocable(fake_unknown, in_range, kGateMutating[0], true);
+    const Gate out_range_gate =
+        CheckInvocable(fake_unknown, out_of_range, kGateMutating[0], true);
+    const Gate unbounded_gate =
+        CheckInvocable(fake_unknown, unbounded, kGateMutating[0], true);
+    const Gate read_only_gate =
+        CheckInvocable(fake_unknown, read_only_table, kGateReadOnly[0], true);
+    const Gate locked_gate =
+        CheckInvocable(fake_unknown, in_range, kGateMutating[0], false);
+
+    const bool gate_ok = in_range_gate == Gate::Ok &&
+                        out_range_gate == Gate::UnsupportedBuild &&
+                        unbounded_gate == Gate::Ok &&
+                        read_only_gate == Gate::Ok &&
+                        locked_gate == Gate::Mutating;
+    Field("mutating call inside validated build range",
+          gate_ok ? "PASS" : "FAIL");
+    ok = ok && gate_ok;
+    Field("result", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 }  // namespace vd

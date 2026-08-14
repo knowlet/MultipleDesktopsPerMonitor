@@ -153,6 +153,9 @@ void Usage() {
         "                      exercise the reusable non-mutating discovery,\n"
         "                      assignment, lifecycle, coordinator, and startup\n"
         "                      host boundary with injected platform seams\n"
+        "  layout-gate-test\n"
+        "                      deterministic private-COM mutation gate: build\n"
+        "                      range, read-only, and locked-method refusal\n"
         "\n"
         "documentation\n"
         "  matrix              emit the vtable layout registry as markdown\n"
@@ -358,6 +361,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceHostResilienceTest();
     } else if (cmd == "workspace-stress-test") {
         rc = vd::CmdWorkspaceStressTest();
+    } else if (cmd == "layout-gate-test") {
+        rc = vd::CmdLayoutGateTest();
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-live-focus-test") {
