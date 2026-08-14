@@ -169,7 +169,10 @@ that the product already tracks every desktop window. The controlled
 `logical-workspace-test` supplies a probe-owned native presentation adapter
 that revalidates HWND generation and capability immediately before applying
 placement, non-activating Z-order, and confirmation-gated foreground
-operations. `window_lifecycle.{h,cpp}` adds a bounded read-only
+operations; foreground activation is best-effort because the foreground lock
+can deny `SetForegroundWindow` even for an owned window, and the executor
+records such denials (`best_effort_failed`) instead of failing the restore,
+while placement and Z-order remain strict. `window_lifecycle.{h,cpp}` adds a bounded read-only
 `SetWinEventHook` source for window-object create/show/destroy hints and a separate
 model-neutral adapter. The hook callback queues window-object hints without
 doing COM or model mutation; capability/native-role resolution happens later
@@ -339,8 +342,15 @@ non-mutating `workspace-coordinator-test`. It owns an owner-thread operation
 boundary, drains lifecycle hints atomically with overflow state, retries
 complete discovery until the input is quiet, rejects late lifecycle changes
 before native mutation, and delegates stale-plan validation, rollback, and
-journal recovery to `WorkspaceEngine`. It is intentionally not yet a
-long-running manager: the caller still supplies complete discovery and native
+journal recovery to `WorkspaceEngine`. Pre-commit lifecycle validation
+tolerates window-object events for the windows the switch itself moves (the
+native moves can emit SHOW-style events for those same windows); a lifecycle
+event for any other window invalidates the attempt, which is rolled back
+without mutation and retried with a fresh authoritative snapshot (bounded,
+default three attempts); persistent noise exhausts the bound and fails
+closed, overflow always fails closed, and any rollback that cannot be
+verified stops immediately. It is intentionally not yet a long-running
+manager: the caller still supplies complete discovery and native
 move/observe callbacks, pumps the WinEvent owner thread, and chooses the
 production journal/bootstrap policy.
 

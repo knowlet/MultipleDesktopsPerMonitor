@@ -198,7 +198,10 @@ benchmarking, and any form of faked or emulated native desktop lifecycle until
 those milestones are explicitly implemented. The controlled
 `logical-workspace-test` now exercises identity-checked placement,
 non-activating Z-order, and confirmation-gated foreground restoration for its
-probe-owned windows; this is not yet a user-facing presentation manager.
+probe-owned windows; foreground activation is best-effort because the
+foreground lock can deny it even for an owned window (denials are recorded
+rather than aborting the restore), while placement and Z-order remain strict.
+This is not yet a user-facing presentation manager.
 
 The first productization core is in
 [`src/workspace_engine.{h,cpp}`](src/workspace_engine.h). It models
@@ -269,7 +272,10 @@ The serialized coordinator boundary is in
 [`src/workspace_coordinator.{h,cpp}`](src/workspace_coordinator.h). It keeps
 complete discovery snapshots and lifecycle hints on one owner thread, retries
 until the lifecycle input is quiet, rejects stale plans before native mutation,
-and blocks new operations while a journal transaction is pending. Run
+blocks new operations while a journal transaction is pending, tolerates
+self-inflicted window-object events for the windows a switch moves, and
+boundedly retries a clean rollback caused by transient unrelated-window noise
+before failing closed. Run
 `workspace-coordinator-test` for deterministic, non-mutating evidence. This is
 still a library boundary, not a long-running user-facing manager: production
 discovery policy, WinEvent message pumping, startup bootstrap, and
