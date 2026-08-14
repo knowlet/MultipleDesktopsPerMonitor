@@ -223,7 +223,9 @@ reconciliation, graceful shutdown) is documented in
 and Shell-loss resilience are documented in
 [docs/resilience.md](docs/resilience.md). Compatibility quarantine
 (auto-quarantine on rollback/anomaly, sticky exclusion, user override) is
-documented in [docs/quarantine.md](docs/quarantine.md). Run
+documented in [docs/quarantine.md](docs/quarantine.md). Install, configure,
+operate, recover, and uninstall guidance and supported Windows builds are
+documented in [docs/release.md](docs/release.md). Run
 `workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
