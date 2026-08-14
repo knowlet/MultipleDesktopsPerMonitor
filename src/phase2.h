@@ -140,6 +140,9 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
 // Requests a clean shutdown of a running workspace-manager instance.
 int CmdWorkspaceManagerStop();
 
+// Requests a transactional configuration reload of a running instance.
+int CmdWorkspaceManagerReload();
+
 // Installs or removes the per-user HKCU Run startup entry that launches
 // `workspace-manager --run` at sign-in.
 int CmdWorkspaceManagerInstallStartup(bool remove,

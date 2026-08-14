@@ -163,6 +163,8 @@ void Usage() {
         "  --config PATH       'workspace-manager': load a schema-v1 config file\n"
         "  --run               'workspace-manager': long-running host mode\n"
         "  --stop              'workspace-manager': request clean shutdown\n"
+        "  --reload            'workspace-manager': request transactional\n"
+        "                      configuration reload\n"
         "  --install-startup   'workspace-manager': add the HKCU Run entry\n"
         "  --remove-startup    'workspace-manager': remove the HKCU Run entry\n"
         "  --self-resilience   'workspace-manager --run': post display/resume\n"
@@ -205,6 +207,7 @@ int main(int argc, char** argv) {
     bool install_startup = false;
     bool remove_startup = false;
     bool self_resilience = false;
+    bool reload_mode = false;
     std::string config_path;
     std::string browser;
     int seconds = 0;
@@ -232,6 +235,8 @@ int main(int argc, char** argv) {
             remove_startup = true;
         } else if (a == "--self-resilience") {
             self_resilience = true;
+        } else if (a == "--reload") {
+            reload_mode = true;
         } else if (a == "--seconds" && i + 1 < argc) {
             seconds = std::atoi(argv[++i]);
         } else if (a == "--help" || a == "-h" || a == "/?") {
@@ -300,6 +305,8 @@ int main(int argc, char** argv) {
     } else if (cmd == "workspace-manager") {
         if (stop_mode) {
             rc = vd::CmdWorkspaceManagerStop();
+        } else if (reload_mode) {
+            rc = vd::CmdWorkspaceManagerReload();
         } else if (install_startup || remove_startup) {
             rc = vd::CmdWorkspaceManagerInstallStartup(
                 remove_startup, config_path.empty() ? nullptr

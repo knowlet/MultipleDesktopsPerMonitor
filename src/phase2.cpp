@@ -4236,6 +4236,7 @@ int CmdWorkspaceLiveDiscovery(bool bootstrap_engine,
             case WindowDisposition::Unsupported: ++unsupported; break;
             case WindowDisposition::Ambiguous: ++ambiguous; break;
             case WindowDisposition::Closed: ++ambiguous; break;
+            case WindowDisposition::Quarantined: ++unsupported; break;
         }
     }
     Field("total windows", std::format("{}", windows.size()));
@@ -4488,6 +4489,7 @@ int CmdWorkspaceLiveReadOnlyHostTest() {
             case WindowDisposition::Unsupported: ++unsupported; break;
             case WindowDisposition::Ambiguous: ++ambiguous; break;
             case WindowDisposition::Closed: ++ambiguous; break;
+            case WindowDisposition::Quarantined: ++unsupported; break;
         }
     }
     const ReadOnlyHostResult stopped = host.Stop();
@@ -6769,6 +6771,8 @@ struct ManagerMainContext {
     std::function<void(int command)> tray_command_handler;
     std::function<void()> display_change_handler;
     std::function<void()> resume_handler;
+    std::function<void()> reload_handler;
+    std::function<std::string()> status_text;
     bool exit_requested = false;
 };
 
@@ -6797,8 +6801,10 @@ LRESULT CALLBACK ManagerMainWindowProc(HWND hwnd, UINT message,
             ::AppendMenuW(menu, MF_STRING, 1, L"Switch monitor A -> A2");
             ::AppendMenuW(menu, MF_STRING, 2, L"Switch monitor A -> A1");
             ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            ::AppendMenuW(menu, MF_STRING, 3, L"Diagnostics");
-            ::AppendMenuW(menu, MF_STRING, 4, L"Exit");
+            ::AppendMenuW(menu, MF_STRING, 3, L"Status");
+            ::AppendMenuW(menu, MF_STRING, 4, L"Diagnostics");
+            ::AppendMenuW(menu, MF_STRING, 5, L"Reload configuration");
+            ::AppendMenuW(menu, MF_STRING, 6, L"Exit");
             POINT point{};
             ::GetCursorPos(&point);
             const int command = ::TrackPopupMenu(
@@ -6808,6 +6814,12 @@ LRESULT CALLBACK ManagerMainWindowProc(HWND hwnd, UINT message,
             if (command != 0 && context->tray_command_handler) {
                 context->tray_command_handler(command);
             }
+        }
+        return 0;
+    }
+    if (message == WM_APP + 2 && context != nullptr) {
+        if (context->reload_handler) {
+            context->reload_handler();
         }
         return 0;
     }
@@ -7485,19 +7497,89 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
             } else if (command == 2) {
                 do_switch(kA1);
             } else if (command == 3) {
+                if (main_context.status_text) {
+                    Print("status: {}\n", main_context.status_text());
+                }
+            } else if (command == 4) {
                 const MonitorWorkspaceState* monitor_a_state =
                     engine.Monitor(monitor_a_id);
                 const MonitorWorkspaceState* monitor_b_state =
                     engine.Monitor(monitor_b_id);
                 Print("diagnostics: monitor A active={} monitor B active={} "
-                      "reconciles={} switches={} hotkeys={}\n",
+                      "reconciles={} switches={} hotkeys={} quarantine={}\n",
                       monitor_a_state ? monitor_a_state->active : 0,
                       monitor_b_state ? monitor_b_state->active : 0,
-                      reconcile_count, switches_committed, hotkey_dispatches);
-            } else if (command == 4) {
+                      reconcile_count, switches_committed, hotkey_dispatches,
+                      engine.QuarantineLog().size());
+            } else if (command == 5) {
+                if (main_context.reload_handler) {
+                    main_context.reload_handler();
+                }
+            } else if (command == 6) {
                 main_context.exit_requested = true;
                 ::PostMessageW(hotkey_window, WM_CLOSE, 0, 0);
             }
+        };
+        main_context.status_text = [&]() {
+            const MonitorWorkspaceState* monitor_a_state =
+                engine.Monitor(monitor_a_id);
+            const MonitorWorkspaceState* monitor_b_state =
+                engine.Monitor(monitor_b_id);
+            return std::format(
+                "monitor A active={} monitor B active={} reconciles={} "
+                "switches={} quarantine={}",
+                monitor_a_state ? monitor_a_state->active : 0,
+                monitor_b_state ? monitor_b_state->active : 0,
+                reconcile_count, switches_committed,
+                engine.QuarantineLog().size());
+        };
+        main_context.reload_handler = [&]() {
+            if (config_path == nullptr || *config_path == '\0') {
+                Print("config reload: no config file; kept running\n");
+                return;
+            }
+            WorkspaceManagerConfig reloaded;
+            std::string reload_error;
+            if (!LoadManagerConfig(std::filesystem::path(config_path),
+                                   reloaded, &reload_error)) {
+                Print("config reload REJECTED (kept previous): {}\n",
+                      reload_error);
+                return;
+            }
+            std::vector<HMONITOR> real_monitors;
+            for (const MonitorRec& monitor : monitors) {
+                real_monitors.push_back(monitor.handle);
+            }
+            ManagerRuntimeTopology topology;
+            if (!DeriveManagerRuntimeTopology(reloaded, real_monitors,
+                                              topology, &reload_error)) {
+                Print("config reload REJECTED (kept previous): {}\n",
+                      reload_error);
+                return;
+            }
+            for (const WorkspaceHotkeyBinding& binding : hotkey_config.bindings) {
+                const UINT id =
+                    100 + static_cast<UINT>(&binding -
+                                            hotkey_config.bindings.data());
+                ::UnregisterHotKey(hotkey_window, id);
+            }
+            hotkey_config = reloaded;
+            hotkey_config.bindings = topology.bindings;
+            for (const WorkspaceHotkeyBinding& binding : hotkey_config.bindings) {
+                const UINT id =
+                    100 + static_cast<UINT>(&binding -
+                                            hotkey_config.bindings.data());
+                if (!::RegisterHotKey(hotkey_window, id,
+                                      binding.hotkey.modifiers | MOD_NOREPEAT,
+                                      binding.hotkey.vk)) {
+                    Print("config reload: hotkey registration failed for a "
+                          "binding (kept running)\n");
+                }
+            }
+            engine.SetAutoQuarantine(hotkey_config.quarantine_enabled);
+            Print("config reload accepted ({} hotkeys, quarantine={})\n",
+                  hotkey_config.bindings.size(),
+                  hotkey_config.quarantine_enabled ? "on" : "off");
         };
         main_context.display_change_handler = [&]() {
             ++resilience.display_changes_handled;
@@ -7633,6 +7715,9 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         ok = ok && source.shutdown_ok();
         Field("probe cleanup/restoration", restored_here ? "PASS" : "FAIL");
         Field("stable journal pending", pending ? "YES" : "no");
+        if (!ok && !error.empty()) {
+            Field("failure reason", error);
+        }
         return ok ? 0 : 1;
     }();
     } catch (const std::exception& exception) {
@@ -7663,6 +7748,20 @@ int CmdWorkspaceManagerStop() {
         return 1;
     }
     Print("shutdown requested\n");
+    return 0;
+}
+
+int CmdWorkspaceManagerReload() {
+    HWND hwnd = ::FindWindowW(kManagerMainClassName, nullptr);
+    if (hwnd == nullptr) {
+        Print("no workspace-manager window found\n");
+        return 1;
+    }
+    if (!::PostMessageW(hwnd, WM_APP + 2, 0, 0)) {
+        Print("failed to post reload to workspace-manager\n");
+        return 1;
+    }
+    Print("reload requested\n");
     return 0;
 }
 
