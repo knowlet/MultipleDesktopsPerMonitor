@@ -299,10 +299,40 @@ std::optional<WindowDiscoveryBackend> CreateWin32WindowDiscoveryBackend(
             WindowIdentity identity;
             Win32WindowObservation window;
             Win32DesktopObservation desktop;
-            if (!shared_api->read_identity(hwnd, identity, local_error) ||
-                !shared_api->read_window(hwnd, window, local_error) ||
-                !shared_api->read_desktop(hwnd, desktop, local_error)) {
-                return false;
+            const bool identity_ok =
+                shared_api->read_identity(hwnd, identity, local_error);
+            const bool window_ok =
+                shared_api->read_window(hwnd, window, local_error);
+            const bool desktop_ok =
+                shared_api->read_desktop(hwnd, desktop, local_error);
+            if (!identity_ok || !window_ok || !desktop_ok) {
+                if (identity.hwnd == nullptr) identity.hwnd = hwnd;
+                observation.identity = identity;
+                observation.monitor = window.monitor;
+                observation.owner = window.owner;
+                observation.child = window.child;
+                observation.visible = window.visible;
+                observation.cloaked = window.cloaked;
+                observation.cloaked_ok = window.cloaked_ok;
+                observation.tool_window = window.tool_window;
+                observation.desktop = desktop.desktop;
+                observation.desktop_ok = desktop.desktop_ok;
+                observation.on_current = desktop.on_current;
+                observation.on_current_ok = desktop.on_current_ok;
+                observation.presentation = window.presentation;
+                // Base capability derivation stays the same as the normal
+                // path so the missing identity classifies Ambiguous rather
+                // than being misreported as Unsupported.  Private
+                // IApplicationView augmentation is skipped for an
+                // unreadable window.
+                observation.capabilities.independent_top_level =
+                    !window.child && window.owner == nullptr &&
+                    !window.tool_window;
+                observation.capabilities.desktop_state_observable =
+                    desktop.desktop_ok && desktop.on_current_ok;
+                observation.capabilities.owner_state_observable =
+                    window.owner == nullptr;
+                return true;
             }
 
             observation.identity = identity;
@@ -456,13 +486,13 @@ bool WindowDiscovery::Discover(std::vector<DiscoveredWindow>& out,
             }
             return false;
         }
-        if (observation.identity.hwnd != hwnd ||
-            !observation.identity.IsValid()) {
+        if (observation.identity.hwnd != hwnd) {
             if (error != nullptr) *error = "window identity changed during scan";
             return false;
         }
         if (HasDuplicateHwnd(candidate, hwnd) ||
-            HasDuplicateIdentity(candidate, observation.identity)) {
+            (observation.identity.IsValid() &&
+             HasDuplicateIdentity(candidate, observation.identity))) {
             if (error != nullptr) *error = "duplicate HWND or window identity";
             return false;
         }
@@ -709,6 +739,70 @@ int CmdWorkspaceDiscoveryTest() {
     Field("Win32 backend seam/classification",
           win32_seam_ok ? "PASS" : "FAIL");
     ok = ok && win32_seam_ok;
+
+    std::size_t denied_identity_reads = 0;
+    Win32WindowDiscoveryApi denied_api;
+    denied_api.enumerate =
+        [managed_id, unsupported_id](std::vector<HWND>& out, std::string*) {
+            out = {managed_id.hwnd, unsupported_id.hwnd};
+            return true;
+        };
+    denied_api.read_identity =
+        [managed_id, unsupported_id, &denied_identity_reads](
+            HWND hwnd, WindowIdentity& out, std::string* local_error) {
+            if (hwnd == managed_id.hwnd) {
+                out = managed_id;
+                return true;
+            }
+            ++denied_identity_reads;
+            if (local_error != nullptr) {
+                *local_error = "OpenProcess failed (Win32 5)";
+            }
+            return false;
+        };
+    denied_api.read_window =
+        [](HWND, Win32WindowObservation& out, std::string*) {
+            out.monitor = reinterpret_cast<HMONITOR>(0x100);
+            return true;
+        };
+    denied_api.read_desktop =
+        [carrier](HWND, Win32DesktopObservation& out, std::string*) {
+            out.desktop = carrier;
+            out.desktop_ok = true;
+            out.on_current = true;
+            out.on_current_ok = true;
+            return true;
+        };
+    Win32WindowDiscoveryOptions denied_options;
+    denied_options.carrier = carrier;
+    denied_options.parking = parking;
+    std::size_t denied_augment_calls = 0;
+    denied_options.augment_capabilities =
+        [&denied_augment_calls](HWND, const WindowDiscoveryObservation&,
+                                WindowCapabilities& capabilities,
+                                std::string*) {
+            ++denied_augment_calls;
+            capabilities.has_application_view = true;
+            capabilities.can_move_desktops = true;
+            return true;
+        };
+    auto denied_backend = CreateWin32WindowDiscoveryBackend(
+        std::move(denied_options), std::move(denied_api), &error);
+    error.clear();
+    bool denied_contained = denied_backend.has_value();
+    if (denied_backend) {
+        WindowDiscovery denied_discovery(std::move(*denied_backend));
+        std::vector<DiscoveredWindow> denied_windows;
+        denied_contained =
+            denied_discovery.Discover(denied_windows, &error) &&
+            denied_windows.size() == 2 &&
+            denied_windows[0].disposition == WindowDisposition::Managed &&
+            denied_windows[1].disposition == WindowDisposition::Ambiguous &&
+            denied_identity_reads == 1 && denied_augment_calls == 1;
+    }
+    Field("unreadable identity contained as ambiguous",
+          denied_contained ? "PASS" : "FAIL");
+    ok = ok && denied_contained;
 
     WindowIdentity changed_id = managed_id;
     changed_id.process_creation_time.dwLowDateTime++;

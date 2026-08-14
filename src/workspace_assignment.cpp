@@ -98,20 +98,23 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
     for (const DiscoveredWindow& window : discovered) {
         const std::uintptr_t hwnd =
             reinterpret_cast<std::uintptr_t>(window.identity.hwnd);
-        if (!window.identity.IsValid() ||
-            !identities.insert(window.identity).second ||
-            !hwnds.insert(hwnd).second) {
-            SetError(error,
-                     "assignment snapshot contains an invalid or duplicate window");
-            return false;
-        }
         if (window.disposition == WindowDisposition::Closed) {
             SetError(error, "assignment snapshot contains a closed window");
             return false;
         }
         if (window.disposition == WindowDisposition::Unsupported ||
             window.disposition == WindowDisposition::Ambiguous) {
+            // Unobservable/unsupported windows (including protected processes
+            // whose identity cannot be read) stay outside managed scope; they
+            // are never assigned or moved.
             continue;
+        }
+        if (!window.identity.IsValid() ||
+            !identities.insert(window.identity).second ||
+            !hwnds.insert(hwnd).second) {
+            SetError(error,
+                     "assignment snapshot contains an invalid or duplicate window");
+            return false;
         }
         if (window.disposition != WindowDisposition::Managed ||
             !window.capabilities.Manageable()) {
@@ -278,6 +281,15 @@ int CmdWorkspaceAssignmentTest() {
         records.empty();
     Field("unsupported and ambiguous omitted", omitted ? "PASS" : "FAIL");
     ok = ok && omitted;
+
+    DiscoveredWindow unreadable;
+    unreadable.identity.hwnd = reinterpret_cast<HWND>(0x777);
+    unreadable.disposition = WindowDisposition::Ambiguous;
+    const bool unreadable_omitted =
+        adapter.ConvertCompleteSnapshot({unreadable}, records, &error) &&
+        records.empty();
+    Field("unobservable identity omitted", unreadable_omitted ? "PASS" : "FAIL");
+    ok = ok && unreadable_omitted;
 
     const WindowIdentity new_generation = TestIdentity(6, 206, 2);
     const bool generation_not_inherited =
