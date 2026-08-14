@@ -2060,6 +2060,51 @@ int CmdWorkspaceEngineTest() {
     Field("generation-safe lifecycle observation adapter",
           lifecycle_ok ? "PASS" : "FAIL");
 
+    // Same-process HWND reuse: a destroy hint followed by an authoritative
+    // snapshot in which the same HWND reappears with the exact same
+    // pid/process-creation tuple must start a fresh generation (the old
+    // record is dropped, so the upsert is Added) instead of being treated
+    // as an update that inherits Z-order/foreground membership.
+    WorkspaceEngine reuse_engine(carrier, parking);
+    bool reuse_ok = reuse_engine.AddMonitor(85, 86, {86, 87}, &error);
+    const WindowIdentity sr1_id = identity(0x9001, 1001, 10);
+    WindowLifecycleAdapter reuse_adapter(
+        reuse_engine, [&](HWND hwnd) -> std::optional<WindowRecord> {
+            if (hwnd != sr1_id.hwnd) return std::nullopt;
+            return WindowRecord{sr1_id, 85, 86, NativeDesktopRole::Carrier,
+                                manageable, {}, {}, true};
+        });
+    if (reuse_ok) {
+        reuse_ok =
+            reuse_engine.UpsertWindow(
+                {sr1_id, 85, 86, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added &&
+            reuse_engine.SetLastForeground(85, 86, sr1_id, &error) &&
+            reuse_engine.SetZOrder(85, 86, {sr1_id}, &error);
+    }
+    if (reuse_ok) {
+        reuse_ok = reuse_adapter.ReconcileCompleteSnapshot(
+                       {{WindowLifecycleEventKind::Closed, sr1_id.hwnd,
+                         std::nullopt}},
+                       {WindowRecord{sr1_id, 85, 86,
+                                     NativeDesktopRole::Carrier, manageable,
+                                     {}, {}, true}},
+                       nullptr, &error) &&
+                   reuse_engine.FindWindow(sr1_id) != nullptr &&
+                   reuse_engine.FindWindow(sr1_id)->disposition ==
+                       WindowDisposition::Managed &&
+                   !reuse_engine.FindWindow(sr1_id)
+                        ->presentation.foreground &&
+                   reuse_engine.FindWindow(sr1_id)->presentation.z_order == 0 &&
+                   reuse_engine.Workspace(86)->z_order.empty() &&
+                   !reuse_engine.Workspace(86)->last_foreground.has_value() &&
+                   reuse_engine.CheckInvariant(&error);
+    }
+    ok = ok && reuse_ok;
+    Field("same-process HWND reuse starts a fresh generation",
+          reuse_ok ? "PASS" : "FAIL");
+
     WorkspaceEngine lifecycle_batch_engine(carrier, parking);
     bool lifecycle_batch_ok =
         lifecycle_batch_engine.AddMonitor(80, 81, {81, 82}, &error);

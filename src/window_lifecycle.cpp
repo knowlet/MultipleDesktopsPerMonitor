@@ -164,6 +164,33 @@ bool WindowLifecycleAdapter::ReconcileCompleteSnapshot(
         }
     }
 
+    // Same-process HWND reuse: destroy hints carry no identity, so resolve
+    // them against the currently tracked record. If a later authoritative
+    // snapshot shows the same HWND with the same pid/process-creation
+    // tuple, the window was destroyed and recreated (Windows reused the
+    // HWND value). The old record is dropped first so the new observation
+    // starts a fresh generation (Added) instead of an update that would
+    // inherit the old workspace membership, Z-order, and foreground slot.
+    for (const EventKey& event : unique) {
+        if (event.kind != WindowLifecycleEventKind::Closed) continue;
+        const WindowRecord* tracked = engine_.FindWindowByHwnd(event.hwnd);
+        if (tracked != nullptr) destroyed_[event.hwnd] = tracked->identity;
+    }
+    for (const auto& [hwnd, identity] : destroyed_) {
+        const auto observed = std::find_if(
+            complete_observation.begin(), complete_observation.end(),
+            [hwnd](const WindowRecord& record) {
+                return record.identity.hwnd == hwnd;
+            });
+        if (observed != complete_observation.end() &&
+            observed->identity == identity) {
+            // CloseWindow reports failure only when the record is no
+            // longer tracked, which is exactly the harmless case here.
+            (void)engine_.CloseWindow(identity, nullptr);
+        }
+    }
+    destroyed_.clear();
+
     if (!engine_.ReconcileDiscoverySnapshot(std::move(complete_observation),
                                             &next.discovery, error)) {
         reconciliation_required_ = true;

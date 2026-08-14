@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "workspace_engine.h"
@@ -85,6 +86,10 @@ class WindowLifecycleAdapter {
     WorkspaceEngine& engine_;
     ObserveWindow observe_;
     bool reconciliation_required_ = false;
+    // HWNDs whose destroy was hinted but not yet authoritatively
+    // resolved. A reappearance of the same identity tuple is a
+    // same-process HWND reuse (a new generation), not an update.
+    std::unordered_map<HWND, WindowIdentity> destroyed_;
 };
 
 // Read-only source for window-object lifecycle hints. Start and Stop must be
