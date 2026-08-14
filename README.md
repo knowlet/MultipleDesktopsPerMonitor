@@ -211,7 +211,10 @@ The first productization core is in
 `MonitorId × WorkspaceId` independently from native desktop GUIDs, accepts
 runtime `WindowCapabilities`, rejects unsupported/ambiguous affected windows,
 and provides a callback-based switch transaction with rollback and optional
-journal recovery. Run `workspace-engine-test` for deterministic, non-mutating
+journal recovery. The production window assignment policy (new-window,
+owned-window inheritance, monitor migration, and recreated-window semantics)
+is documented in [docs/assignment-policy.md](docs/assignment-policy.md). Run
+`workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
 `GetViewForHwnd` resolution before each move, and verifies the callback-backed
