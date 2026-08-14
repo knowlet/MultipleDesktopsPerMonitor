@@ -1,0 +1,36 @@
+name: deterministic
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Msvc
+      - name: Run deterministic suites
+        shell: pwsh
+        run: |
+          $tests = @(
+            'workspace-engine-test',
+            'workspace-discovery-test',
+            'workspace-assignment-test',
+            'workspace-coordinator-test',
+            'workspace-startup-test',
+            'workspace-readonly-host-test',
+            'workspace-live-lifecycle-test',
+            'workspace-live-focus-test',
+            'workspace-manager-test',
+            'workspace-host-resilience-test',
+            'workspace-stress-test',
+            'layout-gate-test'
+          )
+          foreach ($t in $tests) {
+            .\build\vdprobe.exe $t
+            if ($LASTEXITCODE -ne 0) { throw "$t failed ($LASTEXITCODE)" }
+          }
+          Write-Output 'ALL DETERMINISTIC SUITES PASS'

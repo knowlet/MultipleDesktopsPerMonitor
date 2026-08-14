@@ -12,6 +12,13 @@ layouts in src/vdlayout.cpp. The interface layouts were verified on Windows
 or unsupported layout the manager reports the host capability state and
 refuses unsafe native mutation instead of making speculative vtable calls.
 
+Mutation is additionally gated at runtime: the live Windows build must fall
+inside the build range each layout was validated against (see
+`validated_build_min`/`validated_build_max` in src/vdlayout.cpp), even when
+the shell still answers the recorded IID. A future build therefore stays
+read-only until the layout is re-validated, and `layout-gate-test` covers
+the gate deterministically.
+
 ## Install
 
 The manager is a per-user interactive process and does not require
@@ -65,6 +72,14 @@ invariant after display changes, sleep/resume, and Shell loss (see
 docs/resilience.md). Anomalous windows are quarantined and excluded from
 further mutation (see docs/quarantine.md).
 
+The WAL distinguishes the two crash windows: a transaction without a
+terminal record is rolled back through a fresh bootstrapped engine, while a
+durable `COMMIT <monitor> <from> <to>` is replayed into the logical model
+(monitor active = to, ownership per operation) with no native moves. The
+recovery snapshot is assignment-neutral so Parking-side journal identities
+remain provable, and a live crash-after-COMMIT injection has been verified
+through the production host.
+
 ## Uninstall
 
 ```powershell
@@ -103,3 +118,34 @@ HWNDs are transient.
 Run the deterministic suites and the live gates listed in the README command
 table from a fresh build; the final tree keeps `develop` buildable and the
 working tree clean.
+
+## Release status
+
+The review fix list that blocked v0.1.0 has been implemented and pushed:
+
+- production host composed for real user windows (`--run` manages arbitrary
+  manageable top-level windows, generic N-monitor topology, hotkeys route
+  by binding, tray built from topology, config-authoritative runtime);
+- ownership preserved across observation downgrades;
+- startup recovery wired into the production host and the WAL commit
+  window closed;
+- presentation/focus restore wired into the real switch path;
+- whole-Shell bundle re-acquisition after Shell loss with degraded
+  mutation gating;
+- monitor topology lowest-index binding and stale-handle degradation;
+- quarantine narrowed to proven culprits and presentation membership
+  filtered;
+- same-process HWND reuse treated as a new generation;
+- runtime build gate for private-COM mutation.
+
+Remaining before the release gate is formally closed:
+
+- 1-24 h real window-churn soak (memory bounded, no ownership drift, no
+  pending journal at exit);
+- WIN32-subsystem tray host (currently a console executable);
+- `log-level` consumed by the production host;
+- config path quoting/escaping for paths with spaces;
+- WorkspaceId allocator or an explicit per-monitor limit.
+
+Deterministic suites run in CI (`.github/workflows/deterministic.yml`);
+live gates require an interactive session and stay manual.

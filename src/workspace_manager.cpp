@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cctype>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -239,6 +240,12 @@ bool ParseWorkspaceManagerConfig(const std::string& text,
                                     ": version requires one integer");
                 return false;
             }
+            if (version_value > std::numeric_limits<std::uint32_t>::max()) {
+                SetError(error,
+                         "line " + std::to_string(line_number) +
+                             ": version out of range");
+                return false;
+            }
             config.schema_version = static_cast<std::uint32_t>(version_value);
             if (version_seen) {
                 SetError(error, "line " + std::to_string(line_number) +
@@ -468,7 +475,13 @@ bool SaveManagerConfig(const WorkspaceManagerConfig& config,
                      " is not representable (expected 1)");
         return false;
     }
-    std::ofstream stream(path, std::ios::out | std::ios::trunc);
+    // Write to a same-directory temporary and atomically replace so a
+    // crash mid-save can never leave a truncated config behind.
+    std::filesystem::path temporary = path;
+    temporary += L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                 std::to_wstring(GetCurrentThreadId()) + L"." +
+                std::to_wstring(GetTickCount64());
+    std::ofstream stream(temporary, std::ios::out | std::ios::trunc);
     if (!stream) {
         SetError(error, "cannot open config path for writing: " +
                             path.string());
@@ -524,6 +537,13 @@ bool SaveManagerConfig(const WorkspaceManagerConfig& config,
     stream << "tray " << (config.tray_icon ? "on" : "off") << "\n";
     if (!stream) {
         SetError(error, "failed while writing config: " + path.string());
+        return false;
+    }
+    stream.flush();
+    stream.close();
+    if (!::MoveFileExW(temporary.c_str(), path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        SetError(error, "cannot replace config path: " + path.string());
         return false;
     }
     return true;

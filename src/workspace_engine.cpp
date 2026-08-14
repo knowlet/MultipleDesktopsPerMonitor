@@ -15,6 +15,10 @@
 namespace vd {
 namespace {
 
+// Closed-window history is bounded: it exists for diagnostics, not as an
+// unbounded accumulation of every window that ever closed.
+constexpr std::size_t kMaxClosedHistory = 256;
+
 std::string IdentityText(const WindowIdentity& identity) {
     std::ostringstream out;
     out << "0x" << std::hex
@@ -612,8 +616,13 @@ bool WorkspaceEngine::AddMonitor(MonitorId monitor, WorkspaceId active,
         if (error) *error = "monitor already exists";
         return false;
     }
+    // Validate the whole batch before inserting anything so same-batch
+    // duplicates are caught (the per-id lookup below would otherwise only
+    // see ids that were already committed).
+    std::unordered_set<WorkspaceId> batch;
     for (WorkspaceId workspace : workspaces) {
-        if (workspace == 0 || MutableWorkspace(workspace) != nullptr) {
+        if (workspace == 0 || MutableWorkspace(workspace) != nullptr ||
+            !batch.insert(workspace).second) {
             if (error) *error = "workspace id is duplicated or invalid";
             return false;
         }
@@ -809,6 +818,9 @@ bool WorkspaceEngine::CloseWindow(const WindowIdentity& identity,
     closed.present = false;
     closed.disposition = WindowDisposition::Closed;
     closed_windows_.push_back(closed);
+    if (closed_windows_.size() > kMaxClosedHistory) {
+        closed_windows_.erase(closed_windows_.begin());
+    }
     RemoveIdentityFromWorkspace(it->second.identity, it->second.workspace);
     hwnd_index_.erase(reinterpret_cast<std::uintptr_t>(identity.hwnd));
     windows_.erase(it);
@@ -1786,6 +1798,17 @@ int CmdWorkspaceEngineTest() {
               engine.AddMonitor(2, 3, {3, 4}, &error);
     Field("two-monitor model", ok ? "PASS" : "FAIL");
 
+    // A same-batch duplicate workspace id must be rejected before any
+    // monitor state is inserted.
+    WorkspaceEngine duplicate_batch_engine(carrier, parking);
+    std::string duplicate_error;
+    const bool duplicate_batch_rejected =
+        !duplicate_batch_engine.AddMonitor(90, 91, {91, 91},
+                                          &duplicate_error);
+    ok = ok && duplicate_batch_rejected &&
+         duplicate_batch_engine.Monitor(90) == nullptr;
+    Field("same-batch duplicate workspace id rejected",
+          duplicate_batch_rejected ? "PASS" : "FAIL");
     auto identity = [](std::uintptr_t hwnd, DWORD pid,
                        DWORD high) -> WindowIdentity {
         WindowIdentity result;

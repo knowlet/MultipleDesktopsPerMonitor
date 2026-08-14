@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(per-monitor-vd
         VERSION 0.1.0
-        DESCRIPTION "Read-only feasibility probe for native per-monitor virtual desktops on Windows 11"
+        DESCRIPTION "Capability-driven per-monitor workspace manager for Windows 11 (Carrier/Parking engine, production host, and probe/test binaries)"
         LANGUAGES CXX)
 
 if(NOT WIN32)
