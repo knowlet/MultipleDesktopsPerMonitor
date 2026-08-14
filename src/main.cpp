@@ -108,6 +108,10 @@ void Usage() {
         "                      assignment, lifecycle, journaled coordinator, and\n"
         "                      one monitor-local A1 -> A2 -> A1 round-trip;\n"
         "                      requires --confirm-mutate\n"
+        "  workspace-live-focus-restore-test\n"
+        "                      live identity-checked placement/Z-order restore of\n"
+        "                      probe-owned windows across an A1 -> A2 -> A1 switch;\n"
+        "                      requires --confirm-mutate\n"
         "  workspace-live-focus-test\n"
         "                      deterministic injected per-workspace focus/Z-order\n"
         "                      capture, switch, and identity-checked presentation\n"
@@ -254,6 +258,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveReadOnlyHostTest();
     } else if (cmd == "workspace-live-manager-test") {
         rc = vd::CmdWorkspaceLiveManagerTest(confirm_mutate);
+    } else if (cmd == "workspace-live-focus-restore-test") {
+        rc = vd::CmdWorkspaceLiveFocusRestoreTest(confirm_mutate);
     } else if (cmd == "workspace-live-lifecycle-test") {
         rc = vd::CmdWorkspaceLiveLifecycleTest();
     } else if (cmd == "workspace-live-focus-test") {

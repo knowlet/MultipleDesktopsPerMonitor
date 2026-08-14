@@ -118,6 +118,13 @@ int CmdWorkspaceLiveReadOnlyHostTest();
 // removes a native desktop.
 int CmdWorkspaceLiveManagerTest(bool confirm_mutate);
 
+// Confirmation-gated live focus restore milestone. Spawns four vdprobe-owned
+// windows (A1 top/bottom, A2, B1), switches monitor A A1 -> A2 -> A1 through
+// the coordinator, and executes identity-checked placement/Z-order restore
+// (foreground best-effort) on the real probe HWNDs after each switch. Never
+// calls SwitchDesktop or creates/removes a native desktop.
+int CmdWorkspaceLiveFocusRestoreTest(bool confirm_mutate);
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();
