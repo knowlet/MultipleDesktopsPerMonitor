@@ -178,6 +178,13 @@ struct TransactionResult {
     bool rollback_attempted = false;
     bool rollback_succeeded = true;
     bool recovery_required = false;
+    // When a specific window can be proven to have violated native
+    // semantics (a move callback failure or a post-move verify mismatch),
+    // the culprit is identified so auto-quarantine never punishes the whole
+    // plan. Transient noise, pre-commit invalidation, and journal I/O
+    // failures leave culprit_identified false.
+    bool culprit_identified = false;
+    WindowIdentity culprit{};
     std::string error;
 };
 
@@ -351,7 +358,8 @@ class WorkspaceEngine {
                          const MoveCallback& move,
                          const ObserveCallback& observe,
                          std::vector<SwitchOperation>& applied,
-                         std::string* error);
+                         std::string* error,
+                         std::size_t* failed_index = nullptr);
     bool RestoreOperations(const std::vector<SwitchOperation>& applied,
                            const MoveCallback& move,
                            const ObserveCallback& observe,

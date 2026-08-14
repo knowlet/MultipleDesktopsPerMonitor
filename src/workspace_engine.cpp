@@ -129,6 +129,30 @@ bool WriteHandle(HANDLE file, const std::string& contents,
     return true;
 }
 
+// Presentation membership is deliberately narrower than workspace
+// membership: quarantined, unsupported, or unobservable windows stay in the
+// workspace model (ownership is preserved) but cannot participate in
+// placement/Z-order/foreground restore. A single quarantined window must
+// never make the whole workspace's presentation plan unsatisfiable.
+bool IsPresentationEligible(const WindowRecord& window) noexcept {
+    return window.present &&
+           window.disposition == WindowDisposition::Managed &&
+           window.capabilities.Manageable() &&
+           window.capabilities.owner_state_observable;
+}
+
+std::size_t PresentationEligibleCount(
+    const WorkspaceEngine& engine, const WorkspaceDefinition& definition) {
+    std::size_t count = 0;
+    for (const WindowIdentity& identity : definition.windows) {
+        const WindowRecord* window = engine.FindWindow(identity);
+        if (window != nullptr && IsPresentationEligible(*window)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 }  // namespace
 
 bool WindowIdentity::IsValid() const noexcept {
@@ -649,8 +673,14 @@ bool WorkspaceEngine::SetZOrder(MonitorId monitor, WorkspaceId workspace,
         if (error) *error = "workspace does not belong to monitor";
         return false;
     }
-    if (top_to_bottom.size() != definition->windows.size()) {
-        if (error) *error = "Z-order snapshot must contain every workspace window";
+    // Only presentation-eligible members (present, Managed, Manageable,
+    // owner-state-observable) are required: quarantined or otherwise
+    // excluded windows stay in the workspace model but are not part of
+    // any Z-order snapshot.
+    if (top_to_bottom.size() != PresentationEligibleCount(*this, *definition)) {
+        if (error) *error =
+            "Z-order snapshot must contain every presentation-eligible "
+            "workspace window";
         return false;
     }
     std::unordered_set<WindowIdentity, WindowIdentityHash> seen;
@@ -795,6 +825,21 @@ bool WorkspaceEngine::QuarantineWindow(const WindowIdentity& identity,
     }
     if (it->second.disposition == WindowDisposition::Managed) {
         it->second.disposition = WindowDisposition::Quarantined;
+        // A quarantined window can no longer participate in presentation
+        // restore; dropping it from Z-order and the foreground slot keeps
+        // the workspace's presentation plan satisfiable.
+        WorkspaceDefinition* definition =
+            MutableWorkspace(it->second.workspace);
+        if (definition != nullptr) {
+            definition->z_order.erase(
+                std::remove(definition->z_order.begin(),
+                            definition->z_order.end(), identity),
+                definition->z_order.end());
+            if (definition->last_foreground &&
+                *definition->last_foreground == identity) {
+                definition->last_foreground.reset();
+            }
+        }
     }
     if (std::none_of(quarantine_log_.begin(), quarantine_log_.end(),
                      [&](const QuarantineEntry& entry) {
@@ -1040,7 +1085,8 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
         if (error) *error = "presentation restore requires the active workspace";
         return std::nullopt;
     }
-    if (definition->z_order.size() != definition->windows.size()) {
+    if (definition->z_order.size() !=
+        PresentationEligibleCount(*this, *definition)) {
         if (error) *error = "workspace has no complete Z-order snapshot";
         return std::nullopt;
     }
@@ -1062,10 +1108,15 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
             return std::nullopt;
         }
     }
-    if (definition->last_foreground &&
-        !seen.contains(*definition->last_foreground)) {
-        if (error) *error = "foreground snapshot is stale or unsafe";
-        return std::nullopt;
+    if (definition->last_foreground) {
+        const WindowRecord* foreground =
+            FindWindow(*definition->last_foreground);
+        if (foreground != nullptr &&
+            IsPresentationEligible(*foreground) &&
+            !seen.contains(*definition->last_foreground)) {
+            if (error) *error = "foreground snapshot is stale or unsafe";
+            return std::nullopt;
+        }
     }
 
     PresentationPlan plan{monitor, workspace, {}};
@@ -1086,11 +1137,15 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
     if (definition->last_foreground) {
         const WindowRecord* foreground =
             FindWindow(*definition->last_foreground);
-        PresentationOperation foreground_operation{
-            PresentationOperationKind::RestoreForeground,
-            *definition->last_foreground, foreground->presentation};
-        foreground_operation.best_effort = true;
-        plan.operations.push_back(foreground_operation);
+        // Foreground restore is skipped (not fatal) when the recorded
+        // foreground is no longer presentation-eligible.
+        if (foreground != nullptr && IsPresentationEligible(*foreground)) {
+            PresentationOperation foreground_operation{
+                PresentationOperationKind::RestoreForeground,
+                *definition->last_foreground, foreground->presentation};
+            foreground_operation.best_effort = true;
+            plan.operations.push_back(foreground_operation);
+        }
     }
     return plan;
 }
@@ -1190,15 +1245,17 @@ bool WorkspaceEngine::RolesMatch(const SwitchOperation& operation,
 bool WorkspaceEngine::ApplyOperations(
     const std::vector<SwitchOperation>& operations, const MoveCallback& move,
     const ObserveCallback& observe, std::vector<SwitchOperation>& applied,
-    std::string* error) {
+    std::string* error, std::size_t* failed_index) {
     if (!move || !observe) {
         if (error) *error = "move and observation callbacks are required";
         return false;
     }
-    for (const SwitchOperation& operation : operations) {
+    for (std::size_t index = 0; index < operations.size(); ++index) {
+        const SwitchOperation& operation = operations[index];
         const WindowRecord* window = FindWindow(operation.identity);
         if (window == nullptr || window->disposition != WindowDisposition::Managed) {
             if (error) *error = "operation references an unmanaged window";
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         }
         NativeDesktopRole current = NativeDesktopRole::Unknown;
@@ -1206,13 +1263,16 @@ bool WorkspaceEngine::ApplyOperations(
             current = observe(*window);
         } catch (const std::exception& exception) {
             if (error) *error = CallbackException("observe", exception);
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         } catch (...) {
             if (error) *error = CallbackException("observe");
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         }
         if (current != operation.from) {
             if (error) *error = "native state changed before operation";
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         }
         // Record the attempted operation before invoking the native callback.
@@ -1225,9 +1285,11 @@ bool WorkspaceEngine::ApplyOperations(
             move_ok = move(*window, operation.to);
         } catch (const std::exception& exception) {
             if (error) *error = CallbackException("move", exception);
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         } catch (...) {
             if (error) *error = CallbackException("move");
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         }
         if (!move_ok || !RolesMatch(operation, observe)) {
@@ -1235,6 +1297,7 @@ bool WorkspaceEngine::ApplyOperations(
                 *error = move_ok ? "native move verification failed"
                                  : "native move reported failure";
             }
+            if (failed_index != nullptr) *failed_index = index;
             return false;
         }
     }
@@ -1327,7 +1390,9 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     }
     std::vector<SwitchOperation> applied;
     std::string error;
-    if (!ApplyOperations(plan.operations, move, observe, applied, &error)) {
+    std::size_t failed_index = plan.operations.size();
+    if (!ApplyOperations(plan.operations, move, observe, applied, &error,
+                         &failed_index)) {
         result.rollback_attempted = !applied.empty();
         const std::string operation_error = error;
         // Verify the entire recorded baseline before declaring the transaction
@@ -1349,11 +1414,14 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         }
         result.recovery_required =
             result.recovery_required || !result.rollback_succeeded;
-        if (auto_quarantine_) {
-            for (const SwitchOperation& operation : plan.operations) {
-                QuarantineWindow(operation.identity,
-                                 "switch rolled back: " + operation_error);
-            }
+        if (auto_quarantine_ && failed_index < plan.operations.size()) {
+            // Only the operation whose move/verify failed is quarantined.
+            // Transient noise on unrelated windows must not punish the
+            // whole plan.
+            result.culprit = plan.operations[failed_index].identity;
+            result.culprit_identified = true;
+            QuarantineWindow(result.culprit,
+                             "switch rolled back: " + operation_error);
         }
         result.error = error;
         return result;
@@ -1366,25 +1434,31 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
     const std::optional<SwitchPlan> current =
         PrepareSwitch(plan.monitor, plan.to_workspace, &expected_error);
     bool post_state_matches = current && PlansMatch(*current, plan);
+    std::size_t mismatch_index = plan.operations.size();
     if (post_state_matches) {
-        for (const SwitchOperation& operation : plan.operations) {
+        for (std::size_t index = 0; index < plan.operations.size(); ++index) {
+            const SwitchOperation& operation = plan.operations[index];
             const WindowRecord* window = FindWindow(operation.identity);
             if (window == nullptr) {
                 post_state_matches = false;
+                mismatch_index = index;
                 break;
             }
             try {
                 if (observe(*window) != operation.to) {
                     post_state_matches = false;
+                    mismatch_index = index;
                     break;
                 }
             } catch (const std::exception& exception) {
                 error = CallbackException("observe", exception);
                 post_state_matches = false;
+                mismatch_index = index;
                 break;
             } catch (...) {
                 error = CallbackException("observe");
                 post_state_matches = false;
+                mismatch_index = index;
                 break;
             }
         }
@@ -1404,11 +1478,14 @@ TransactionResult WorkspaceEngine::ExecuteSwitch(
         }
     }
     if (!post_state_matches) {
-        if (auto_quarantine_) {
-            for (const SwitchOperation& operation : plan.operations) {
-                QuarantineWindow(operation.identity,
-                                 "switch invalidated before commit");
-            }
+        if (auto_quarantine_ && mismatch_index < plan.operations.size()) {
+            // A pre-commit invalidation has no window-level culprit and is
+            // treated as transient noise; only a proven per-window native
+            // mismatch is quarantined.
+            result.culprit = plan.operations[mismatch_index].identity;
+            result.culprit_identified = true;
+            QuarantineWindow(result.culprit,
+                             "switch invalidated before commit");
         }
         result.rollback_attempted = !applied.empty();
         if (error.empty()) error = "switch state changed during execution";
@@ -2445,10 +2522,11 @@ int CmdWorkspaceEngineTest() {
         rollback_quarantine_engine.FindWindow(rq1_id)->disposition ==
             WindowDisposition::Quarantined &&
         rollback_quarantine_engine.FindWindow(rq2_id)->disposition ==
-            WindowDisposition::Quarantined &&
-        rollback_quarantine_engine.QuarantineLog().size() == 2;
+            WindowDisposition::Managed &&
+        rollback_quarantine_engine.QuarantineLog().size() == 1 &&
+        rq_result.culprit_identified && rq_result.culprit == rq1_id;
     ok = ok && rollback_quarantine_ok;
-    Field("rolled-back switch auto-quarantines windows",
+    Field("rolled-back switch quarantines only the culprit",
           rollback_quarantine_ok ? "PASS" : "FAIL");
 
     WorkspaceEngine no_auto_quarantine(carrier, parking);
@@ -2506,6 +2584,143 @@ int CmdWorkspaceEngineTest() {
     ok = ok && sticky_ok;
     Field("quarantine persists across reconciliation",
           sticky_ok ? "PASS" : "FAIL");
+
+    // A post-move verification mismatch is attributed to exactly the
+    // mismatched window: observe is called 4x during apply (per op:
+    // pre-observe + post-move verify) and once per op during post-state
+    // validation, so call 6 is the second window's post-state read.
+    WorkspaceEngine mismatch_engine(carrier, parking);
+    bool mismatch_ok = mismatch_engine.AddMonitor(40, 41, {41, 42}, &error);
+    const WindowIdentity m1_id = identity(0x6001, 701, 7);
+    const WindowIdentity m2_id = identity(0x6002, 702, 7);
+    if (mismatch_ok) {
+        mismatch_ok =
+            mismatch_engine.UpsertWindow(
+                {m1_id, 40, 41, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added &&
+            mismatch_engine.UpsertWindow(
+                {m2_id, 40, 41, NativeDesktopRole::Carrier, manageable, {},
+                 {}, true},
+                &error) == UpsertResult::Added;
+    }
+    int mismatch_observe_calls = 0;
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        m_roles{{m1_id, NativeDesktopRole::Carrier},
+                {m2_id, NativeDesktopRole::Carrier}};
+    const auto m_move = [&](const WindowRecord& window,
+                            NativeDesktopRole target) {
+        m_roles[window.identity] = target;
+        return true;
+    };
+    const auto m_observe = [&](const WindowRecord& window) {
+        ++mismatch_observe_calls;
+        if (window.identity == m2_id && mismatch_observe_calls == 6) {
+            // Simulate a concurrent external change after the move: only
+            // the post-state validation sees the lie.
+            return NativeDesktopRole::Carrier;
+        }
+        return m_roles.at(window.identity);
+    };
+    std::optional<SwitchPlan> m_plan = std::nullopt;
+    TransactionResult m_result;
+    if (mismatch_ok) {
+        m_plan = mismatch_engine.PrepareSwitch(40, 42, &error);
+        m_result = m_plan
+            ? mismatch_engine.ExecuteSwitch(*m_plan, m_move, m_observe)
+            : TransactionResult{};
+    }
+    mismatch_ok = mismatch_ok && m_plan.has_value() &&
+                  !m_result.committed && m_result.rollback_succeeded &&
+                  m_result.culprit_identified && m_result.culprit == m2_id &&
+                  mismatch_engine.FindWindow(m1_id)->disposition ==
+                      WindowDisposition::Managed &&
+                  mismatch_engine.FindWindow(m2_id)->disposition ==
+                      WindowDisposition::Quarantined &&
+                  mismatch_engine.QuarantineLog().size() == 1;
+    ok = ok && mismatch_ok;
+    Field("post-state mismatch quarantines only the culprit",
+          mismatch_ok ? "PASS" : "FAIL");
+
+    // A pre-commit invalidation has no window-level culprit: transient
+    // external noise must not quarantine any window.
+    WorkspaceEngine precommit_engine(carrier, parking);
+    bool precommit_ok =
+        precommit_engine.AddMonitor(50, 51, {51, 52}, &error);
+    const WindowIdentity pc1_id = identity(0x6003, 703, 7);
+    if (precommit_ok) {
+        precommit_ok = precommit_engine.UpsertWindow(
+            {pc1_id, 50, 51, NativeDesktopRole::Carrier, manageable, {}, {},
+             true},
+            &error) == UpsertResult::Added;
+    }
+    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
+        pc_roles{{pc1_id, NativeDesktopRole::Carrier}};
+    const auto pc_move = [&](const WindowRecord& window,
+                             NativeDesktopRole target) {
+        pc_roles[window.identity] = target;
+        return true;
+    };
+    const auto pc_observe = [&](const WindowRecord& window) {
+        return pc_roles.at(window.identity);
+    };
+    std::optional<SwitchPlan> pc_plan = std::nullopt;
+    TransactionResult pc_result;
+    if (precommit_ok) {
+        pc_plan = precommit_engine.PrepareSwitch(50, 52, &error);
+        pc_result = pc_plan
+            ? precommit_engine.ExecuteSwitch(*pc_plan, pc_move, pc_observe,
+                                            nullptr,
+                                            []() { return false; })
+            : TransactionResult{};
+    }
+    precommit_ok = precommit_ok && pc_plan.has_value() &&
+                   !pc_result.committed && pc_result.rollback_succeeded &&
+                   !pc_result.culprit_identified &&
+                   precommit_engine.FindWindow(pc1_id)->disposition ==
+                       WindowDisposition::Managed &&
+                   precommit_engine.QuarantineLog().empty();
+    ok = ok && precommit_ok;
+    Field("pre-commit invalidation quarantines nothing",
+          precommit_ok ? "PASS" : "FAIL");
+
+    // A quarantined window must not make the workspace presentation model
+    // unsatisfiable: Z-order and restore operate on eligible members only.
+    WorkspaceEngine qp_engine(carrier, parking);
+    bool qp_ok = qp_engine.AddMonitor(70, 71, {71, 72}, &error);
+    const WindowIdentity qp1_id = identity(0x8001, 901, 9);
+    const WindowIdentity qp2_id = identity(0x8002, 902, 9);
+    WindowPresentation qp_presentation{};
+    qp_presentation.placement.length = sizeof(WINDOWPLACEMENT);
+    qp_presentation.placement_valid = true;
+    if (qp_ok) {
+        qp_ok = qp_engine.UpsertWindow(
+                   {qp1_id, 70, 71, NativeDesktopRole::Carrier, manageable,
+                    qp_presentation, {}, true},
+                   &error) == UpsertResult::Added &&
+               qp_engine.UpsertWindow(
+                   {qp2_id, 70, 71, NativeDesktopRole::Carrier, manageable,
+                    qp_presentation, {}, true},
+                   &error) == UpsertResult::Added;
+    }
+    if (qp_ok) {
+        qp_ok = qp_engine.QuarantineWindow(qp2_id, "test") &&
+                qp_engine.SetZOrder(70, 71, {qp1_id}, &error) &&
+                qp_engine.SetLastForeground(70, 71, qp1_id, &error);
+    }
+    const std::optional<PresentationPlan> qp_plan = qp_ok
+        ? qp_engine.PreparePresentationRestore(70, 71, &error)
+        : std::nullopt;
+    qp_ok = qp_ok && qp_plan.has_value() &&
+            qp_plan->operations.size() == 3 &&
+            qp_plan->operations[0].identity == qp1_id &&
+            qp_plan->operations[1].identity == qp1_id &&
+            qp_plan->operations[2].identity == qp1_id &&
+            qp_engine.FindWindow(qp2_id)->disposition ==
+                WindowDisposition::Quarantined;
+    ok = ok && qp_ok;
+    Field("quarantined window keeps presentation satisfiable",
+          qp_ok ? "PASS" : "FAIL");
 
     WorkspaceEngine reconcile_engine(carrier, parking);
     bool bounded_rollback_ok =

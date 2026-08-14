@@ -8762,6 +8762,7 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
                     if (record != nullptr &&
                         record->disposition == WindowDisposition::Managed &&
                         record->capabilities.Manageable() &&
+                        record->capabilities.owner_state_observable &&
                         record->presentation.placement_valid) {
                         ordered.push_back(
                             {record->presentation.z_order, identity});
