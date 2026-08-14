@@ -213,7 +213,10 @@ runtime `WindowCapabilities`, rejects unsupported/ambiguous affected windows,
 and provides a callback-based switch transaction with rollback and optional
 journal recovery. The production window assignment policy (new-window,
 owned-window inheritance, monitor migration, and recreated-window semantics)
-is documented in [docs/assignment-policy.md](docs/assignment-policy.md). Run
+is documented in [docs/assignment-policy.md](docs/assignment-policy.md). The
+versioned manager configuration (monitors, workspace names, hotkeys,
+assignment policy, log level, journal, tray) is documented in
+[docs/configuration.md](docs/configuration.md). Run
 `workspace-engine-test` for deterministic, non-mutating
 evidence. The controlled `logical-workspace-test` is now the first live use of
 that engine: it discovers three vdprobe-owned HWNDs, performs generation-safe
