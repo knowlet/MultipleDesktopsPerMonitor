@@ -10,15 +10,15 @@ matrix. The tested representatives are:
 |---|---|---|
 | Classic Win32 | controlled vdprobe child | `GO-WITH-LIMITATIONS` |
 | Shell-hosted/shared process | Explorer | `GO-WITH-LIMITATIONS` |
-| Chromium multi-process | Microsoft Edge, isolated profile | `GO-WITH-LIMITATIONS` (cleanup rerun pending) |
+| Chromium multi-process | Microsoft Edge, isolated profile | `GO-WITH-LIMITATIONS` |
 | Packaged/modern Windows app | Windows Terminal | `GO-WITH-LIMITATIONS` |
 
-The top-level semantics evidence is sufficient to continue engineering the
-Carrier/Parking engine, but the strict representative gate is still pending:
-the latest Edge run must prove complete temporary-profile process drain and
-removal before this document can claim `GO-PRODUCTIZATION`. These results do
-not create an application whitelist and do not claim that every application
-has identical owner, popup, or grouping behavior.
+The representative compatibility gate is complete:
+`GO-PRODUCTIZATION`. The post-hardening Edge rerun proved complete
+temporary-profile process drain and removal, while Windows Terminal also
+completed its probe-owned cleanup contract. These results do not create an
+application whitelist and do not claim that every application has identical
+owner, popup, or grouping behavior.
 The production path is capability-driven:
 
 ```text
@@ -72,17 +72,19 @@ observation, the canonical Edge executable path, and the profile-bearing
 process command line. It never uses an existing profile, closes an
 unattributed browser HWND, or terminates an Edge process.
 
-The interactive run on August 12, 2026 observed:
+The post-hardening interactive rerun on August 14, 2026 observed:
 
 ```text
 target Carrier -> Parking     S_OK
 target on current             false
-ViewVirtualDesktopChanged     observed (32.434 ms)
+ViewVirtualDesktopChanged     observed (36.855 ms)
 sibling top-level moved       no
 CurrentVirtualDesktopChanged  0
 restore                       PASS
 Unregister                    S_OK
 probe-owned roots cleanup     passed
+temporary profile process drain passed
+temporary profile cleanup     passed
 ```
 
 Nine internal/popup HWNDs were not sufficiently observable and remained
@@ -90,16 +92,13 @@ observation-only. The parked target reported `IsWindowVisible = true` while
 DWM reported `cloaked = 2`; product visibility decisions must therefore use
 desktop assignment and cloaking, not `IsWindowVisible` alone.
 
-The original interactive run left the unique temporary profile retained after
-safe window cleanup. The probe now retains launch-process handles and combines
-that scoped tree with a pre-launch Edge baseline before retrying profile
-removal. Only unchanged PID + valid process-creation identities from the
-baseline are ignored; new, reused, or opaque Edge identities keep the profile
-retained. This is read-only process observation: no `taskkill`,
-`TerminateProcess`, or existing-profile mutation is allowed. The Edge
-semantics result is valid, while a clean profile-removal PASS must still be
-confirmed by a rerun after this hardening. Until then the overall Phase 4C
-decision remains pending rather than `GO-PRODUCTIZATION`.
+The post-hardening run retained launch-process handles, combined the scoped
+launch tree with a pre-launch Edge baseline, waited for attributed profile
+windows to quiesce, and then removed the temporary profile. Only unchanged
+baseline identities are ignored; new, reused, or opaque Edge identities remain
+fail-closed. No `taskkill`, `TerminateProcess`, or existing-profile mutation is
+allowed. The Edge result is therefore `GO-WITH-LIMITATIONS` with cleanup
+complete.
 
 ## Windows Terminal evidence
 
@@ -109,13 +108,13 @@ The command is:
 .\build\vdprobe.exe terminal-semantics-test --confirm-mutate
 ```
 
-The interactive run on August 12, 2026 observed:
+The interactive run on August 14, 2026 observed:
 
 ```text
 Carrier -> Parking                  S_OK
 target desktop                      Parking
 target on_current                   false
-ViewVirtualDesktopChanged           observed (37.804 ms)
+ViewVirtualDesktopChanged           observed (34.606 ms)
 sibling top-level moved             no
 CurrentVirtualDesktopChanged        0
 target restore                      PASS

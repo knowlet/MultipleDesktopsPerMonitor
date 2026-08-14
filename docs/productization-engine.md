@@ -2,10 +2,10 @@
 
 ## Decision
 
-The representative compatibility gate is not yet complete. Windows Terminal
-and the Edge semantics contract have been observed, but the latest Edge run
-must still prove that the isolated temporary profile fully drains and is
-removed before the strict gate can be promoted:
+The representative compatibility gate is complete as
+`GO-PRODUCTIZATION`. The post-hardening Edge rerun proved that the isolated
+temporary profile fully drains and is removed, and Windows Terminal completed
+its probe-owned cleanup contract:
 
 | Behavior type | Representative | Result |
 |---|---|---|
@@ -14,11 +14,11 @@ removed before the strict gate can be promoted:
 | Chromium multi-process | isolated Microsoft Edge | `GO-WITH-LIMITATIONS` |
 | Packaged/modern Windows app | Windows Terminal | `GO-WITH-LIMITATIONS` |
 
-This is a **pending `GO-PRODUCTIZATION` checkpoint**, not a completed
-decision. The Edge top-level semantics are valid, but the last evidence still
-ends in `INCONCLUSIVE-CLEANUP`; a clean interactive rerun is required before
-claiming the strict gate. The engine must remain capability-driven; it must not
-grow an executable whitelist.
+This is a completed representative decision, not an application whitelist.
+Edge and Terminal prove the top-level Carrier/Parking contract for their
+representative application architectures, with internal/owned windows kept
+observation-only. The engine must remain capability-driven; it must not grow
+an executable whitelist.
 
 ## Engine milestone
 

@@ -95,22 +95,24 @@ creation:
   exit = 77
 ```
 
-## Interactive Edge evidence (August 12, 2026)
+## Interactive Edge evidence (August 14, 2026)
 
-Two interactive runs completed the semantics observation on the tested
-Windows 11 host. The second run measured a 32.434 ms callback latency:
+The post-hardening interactive rerun completed the semantics and cleanup
+contract on the tested Windows 11 host. It measured a 36.855 ms callback
+latency:
 
 ```text
 target Carrier -> Parking     S_OK
 target desktop                Parking
 target on current             false
-ViewVirtualDesktopChanged     observed (32.434 ms)
+ViewVirtualDesktopChanged     observed (36.855 ms)
 sibling top-level moved       no
 CurrentVirtualDesktopChanged  0
 restore                       PASS
 Unregister                    S_OK
 probe-owned roots cleanup     passed
-temporary profile cleanup     incomplete (retained)
+temporary profile process drain passed
+temporary profile cleanup     passed
 ```
 
 The evidence-bearing semantics result is:
@@ -118,7 +120,7 @@ The evidence-bearing semantics result is:
 ```text
 result                        CHROMIUM-SEMANTICS-OBSERVED
 GO/NO-GO                      GO-WITH-LIMITATIONS
-overall command               INCONCLUSIVE-CLEANUP
+exit                          0
 ```
 
 The target and sibling were two top-level `Chrome_WidgetWin_1` windows from
@@ -129,19 +131,13 @@ The parked target reported `IsWindowVisible = true` while DWM reported
 `cloaked = 2`, so product visibility decisions must use virtual-desktop
 assignment and cloaking state rather than `IsWindowVisible` alone.
 
-The temporary profile remained on disk after both the original one-shot cleanup
-and the bounded process-drain/profile-removal retry. The probe now also launches
-the isolated instance with `--disable-background-mode`, retains launch-process
-handles, and uses a pre-launch Edge baseline to avoid treating unrelated
-long-lived Edge processes as probe-owned. Cleanup output distinguishes an
-attributed probe process that is still present from an inconclusive process
-scan; in either case the profile is retained and no process is terminated.
-Opaque or PID-reused Edge identities are deliberately fail-closed rather than
-exempted. These safeguards are limited to the unique probe profile; the probe
-never terminates Edge or touches an existing profile. Phase 4B-2A should be
-rerun once after this hardening; until that rerun, the overall command remains
-`INCONCLUSIVE-CLEANUP`, not a clean PASS.
+The successful cleanup used `--disable-background-mode`, retained launch-process
+handles, a pre-launch Edge baseline, and a bounded profile-window quiescence
+wait. The process drain completed and the unique temporary profile was removed.
+Opaque or PID-reused Edge identities remain fail-closed; the probe never
+terminates Edge or touches an existing profile. This completes the
+representative Chromium gate as `GO-WITH-LIMITATIONS`.
 
-This milestone does not claim Chrome equivalence, browser lifecycle support,
-focus/Z-order recovery, existing-profile safety beyond the stated attribution
-boundary, or a complete Phase 4B real-application matrix.
+The remaining limitations are unchanged: internal, popup, and utility windows
+are observation-only, and the result does not claim Chrome equivalence, browser
+lifecycle support, focus/Z-order recovery, or a complete browser matrix.

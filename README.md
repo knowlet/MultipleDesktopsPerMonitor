@@ -170,8 +170,10 @@ research/
 Phase 4C is the representative compatibility gate. Controlled Win32,
 Explorer, isolated Edge, and Windows Terminal probes have reached
 `GO-WITH-LIMITATIONS` for the tested top-level Carrier/Parking semantics.
-The strict gate remains pending until Edge also proves complete temporary
-profile process drain and cleanup. Evidence and limitations are recorded in
+The representative gate is now complete as `GO-PRODUCTIZATION`: the
+post-hardening Edge rerun proved temporary-profile process drain and profile
+removal, and the Windows Terminal cleanup contract also passed. Evidence and
+limitations are recorded in
 [`docs/phase4c-results.md`](docs/phase4c-results.md).
 
 The project now moves from app-by-app compatibility research to productization
