@@ -110,6 +110,14 @@ int CmdWorkspaceLiveCoordinatorBootstrapTest();
 // native move/observe/recovery callbacks and never mutates windows or desktops.
 int CmdWorkspaceLiveReadOnlyHostTest();
 
+// Confirmation-gated mutable composition milestone. Creates exactly three
+// vdprobe-owned top-level windows, assigns A1/A2 on one monitor and B1 on a
+// second monitor, and executes one A1 -> A2 -> A1 coordinator round-trip.
+// Discovery is system-backed but capability promotion is restricted to the
+// exact probe HWND generations. It never calls SwitchDesktop or creates or
+// removes a native desktop.
+int CmdWorkspaceLiveManagerTest(bool confirm_mutate);
+
 // Productization milestone: deterministic, non-mutating capability-driven
 // workspace state/transaction engine test.
 int CmdWorkspaceEngineTest();
