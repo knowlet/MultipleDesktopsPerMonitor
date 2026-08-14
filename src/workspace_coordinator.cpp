@@ -1,11 +1,13 @@
 #include "workspace_coordinator.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "util.h"
@@ -41,7 +43,8 @@ WorkspaceCoordinator::WorkspaceCoordinator(
     WinEventLifecycleSource& source, DiscoverCompleteSnapshot discover,
     WorkspaceEngine::MoveCallback move,
     WorkspaceEngine::ObserveCallback observe,
-    const WorkspaceJournal* journal, std::size_t max_discovery_attempts)
+    const WorkspaceJournal* journal, std::size_t max_discovery_attempts,
+    std::size_t max_switch_attempts)
     : engine_(engine),
       lifecycle_(lifecycle),
       source_(source),
@@ -51,6 +54,7 @@ WorkspaceCoordinator::WorkspaceCoordinator(
       journal_(journal),
       max_discovery_attempts_(std::max<std::size_t>(1,
                                                     max_discovery_attempts)),
+      max_switch_attempts_(std::max<std::size_t>(1, max_switch_attempts)),
       owner_thread_id_(GetCurrentThreadId()) {}
 
 bool WorkspaceCoordinator::CheckEntry(CoordinatorResult& result) {
@@ -175,83 +179,128 @@ CoordinatorResult WorkspaceCoordinator::Switch(MonitorId monitor,
     if (!CheckEntry(result)) return result;
     OperationScope operation(*this);
 
-    try {
-        result = ReconcileDiscoveryLocked();
-    } catch (const std::exception& exception) {
-        result.code = CoordinatorResultCode::DiscoveryFailed;
-        result.error = ExceptionError("discovery", exception);
-        return result;
-    } catch (...) {
-        result.code = CoordinatorResultCode::DiscoveryFailed;
-        result.error = ExceptionError("discovery");
-        return result;
-    }
-    if (!result.succeeded()) return result;
-
-    std::string error;
-    std::optional<SwitchPlan> plan;
-    try {
-        plan = engine_.PrepareSwitch(monitor, target_workspace, &error);
-    } catch (const std::exception& exception) {
-        result.code = CoordinatorResultCode::PlanRejected;
-        result.error = ExceptionError("switch planning", exception);
-        return result;
-    } catch (...) {
-        result.code = CoordinatorResultCode::PlanRejected;
-        result.error = ExceptionError("switch planning");
-        return result;
-    }
-    if (!plan) {
-        result.code = CoordinatorResultCode::PlanRejected;
-        result.error = error.empty() ? "switch plan was rejected" : error;
-        return result;
-    }
-
-    // A hint after the authoritative snapshot makes this plan suspect. Leave
-    // it queued for the next bounded reconciliation and fail without mutation.
-    WindowLifecycleBatch late;
-    try {
-        late = source_.DrainBatch();
-        for (WindowLifecycleEvent& event : late.events) {
-            source_.Collect(std::move(event));
+    // A hint after the authoritative snapshot makes a plan suspect, but the
+    // switch's own native moves can emit window-object events (for example
+    // SHOW) for the very windows the plan moves.  Those self-inflicted events
+    // are tolerated; an event for any other window means the snapshot may be
+    // stale.  A clean rollback is retried with a fresh snapshot because live
+    // sessions routinely emit transient window-object events for unrelated
+    // windows; only a bounded number of attempts is allowed, and a failure
+    // that could not be rolled back stops immediately.
+    for (std::size_t attempt = 1; attempt <= max_switch_attempts_; ++attempt) {
+        result.switch_attempts = attempt;
+        CoordinatorResult attempt_result;
+        try {
+            attempt_result = ReconcileDiscoveryLocked();
+        } catch (const std::exception& exception) {
+            attempt_result.code = CoordinatorResultCode::DiscoveryFailed;
+            attempt_result.error = ExceptionError("discovery", exception);
+            return attempt_result;
+        } catch (...) {
+            attempt_result.code = CoordinatorResultCode::DiscoveryFailed;
+            attempt_result.error = ExceptionError("discovery");
+            return attempt_result;
         }
-    } catch (const std::exception& exception) {
-        result.code = CoordinatorResultCode::DiscoveryUnstable;
-        result.error = ExceptionError("lifecycle validation", exception);
-        return result;
-    } catch (...) {
-        result.code = CoordinatorResultCode::DiscoveryUnstable;
-        result.error = ExceptionError("lifecycle validation");
-        return result;
-    }
-    if (late.overflowed || !late.events.empty()) {
-        result.code = CoordinatorResultCode::DiscoveryUnstable;
-        result.error = "lifecycle changed after switch planning";
-        return result;
+        attempt_result.switch_attempts = attempt;
+        if (!attempt_result.succeeded()) return attempt_result;
+
+        std::string error;
+        std::optional<SwitchPlan> plan;
+        try {
+            plan = engine_.PrepareSwitch(monitor, target_workspace, &error);
+        } catch (const std::exception& exception) {
+            attempt_result.code = CoordinatorResultCode::PlanRejected;
+            attempt_result.error = ExceptionError("switch planning", exception);
+            return attempt_result;
+        } catch (...) {
+            attempt_result.code = CoordinatorResultCode::PlanRejected;
+            attempt_result.error = ExceptionError("switch planning");
+            return attempt_result;
+        }
+        if (!plan) {
+            attempt_result.code = CoordinatorResultCode::PlanRejected;
+            attempt_result.error =
+                error.empty() ? "switch plan was rejected" : error;
+            return attempt_result;
+        }
+
+        const std::unordered_set<std::uintptr_t> affected_hwnds = [&]() {
+            std::unordered_set<std::uintptr_t> hwnds;
+            for (const SwitchOperation& operation : plan->operations) {
+                hwnds.insert(reinterpret_cast<std::uintptr_t>(
+                    operation.identity.hwnd));
+            }
+            return hwnds;
+        }();
+        auto events_benign =
+            [&affected_hwnds](const WindowLifecycleBatch& batch) {
+                if (batch.overflowed) return false;
+                for (const WindowLifecycleEvent& event : batch.events) {
+                    if (event.hwnd == nullptr ||
+                        !affected_hwnds.contains(
+                            reinterpret_cast<std::uintptr_t>(event.hwnd))) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+        WindowLifecycleBatch late;
+        try {
+            late = source_.DrainBatch();
+            for (WindowLifecycleEvent& event : late.events) {
+                source_.Collect(std::move(event));
+            }
+        } catch (const std::exception& exception) {
+            attempt_result.code = CoordinatorResultCode::DiscoveryUnstable;
+            attempt_result.error = ExceptionError("lifecycle validation",
+                                                  exception);
+            return attempt_result;
+        } catch (...) {
+            attempt_result.code = CoordinatorResultCode::DiscoveryUnstable;
+            attempt_result.error = ExceptionError("lifecycle validation");
+            return attempt_result;
+        }
+        if (!events_benign(late)) {
+            if (attempt < max_switch_attempts_) continue;
+            attempt_result.code = CoordinatorResultCode::DiscoveryUnstable;
+            attempt_result.error = "lifecycle changed after switch planning";
+            return attempt_result;
+        }
+
+        try {
+            attempt_result.transaction =
+                engine_.ExecuteSwitch(*plan, move_, observe_, journal_, [&] {
+                    if (!source_.healthy()) return false;
+                    WindowLifecycleBatch post = source_.DrainBatch();
+                    for (WindowLifecycleEvent& event : post.events) {
+                        source_.Collect(std::move(event));
+                    }
+                    return events_benign(post);
+                });
+        } catch (const std::exception& exception) {
+            attempt_result.code = CoordinatorResultCode::TransactionFailed;
+            attempt_result.error =
+                ExceptionError("switch transaction", exception);
+            return attempt_result;
+        } catch (...) {
+            attempt_result.code = CoordinatorResultCode::TransactionFailed;
+            attempt_result.error = ExceptionError("switch transaction");
+            return attempt_result;
+        }
+        if (attempt_result.transaction.committed) return attempt_result;
+
+        attempt_result.code = CoordinatorResultCode::TransactionFailed;
+        attempt_result.error = attempt_result.transaction.error;
+        if (!attempt_result.transaction.rollback_succeeded ||
+            attempt_result.transaction.recovery_required ||
+            attempt >= max_switch_attempts_) {
+            return attempt_result;
+        }
     }
 
-    // DrainBatch captures its epoch under the same queue lock. Any hint after
-    // that quiet boundary therefore changes the epoch before pre-commit.
-    const std::uint64_t lifecycle_epoch = late.event_epoch;
-    try {
-        result.transaction =
-            engine_.ExecuteSwitch(*plan, move_, observe_, journal_, [&] {
-                return source_.healthy() &&
-                       source_.event_epoch() == lifecycle_epoch;
-            });
-    } catch (const std::exception& exception) {
-        result.code = CoordinatorResultCode::TransactionFailed;
-        result.error = ExceptionError("switch transaction", exception);
-        return result;
-    } catch (...) {
-        result.code = CoordinatorResultCode::TransactionFailed;
-        result.error = ExceptionError("switch transaction");
-        return result;
-    }
-    if (!result.transaction.committed) {
-        result.code = CoordinatorResultCode::TransactionFailed;
-        result.error = result.transaction.error;
-    }
+    result.code = CoordinatorResultCode::TransactionFailed;
+    result.error = "switch did not stabilize within the attempt bound";
     return result;
 }
 
@@ -510,52 +559,164 @@ int CmdWorkspaceCoordinatorTest() {
     epoch_carrier.Data1 = 5;
     GUID epoch_parking{};
     epoch_parking.Data1 = 6;
-    WorkspaceEngine epoch_engine(epoch_carrier, epoch_parking);
-    bool epoch_ok = epoch_engine.AddMonitor(3, 30, {30, 31}, &error);
-    WindowIdentity e{reinterpret_cast<HWND>(5), 104, {5, 5}, true};
-    WindowIdentity f{reinterpret_cast<HWND>(6), 105, {6, 6}, true};
-    std::vector<WindowRecord> epoch_snapshot{
+    const WindowIdentity e{reinterpret_cast<HWND>(5), 104, {5, 5}, true};
+    const WindowIdentity f{reinterpret_cast<HWND>(6), 105, {6, 6}, true};
+    const std::vector<WindowRecord> epoch_snapshot{
         {e, 3, 30, NativeDesktopRole::Carrier, capabilities},
         {f, 3, 31, NativeDesktopRole::Parking, capabilities}};
-    std::unordered_map<WindowIdentity, NativeDesktopRole, WindowIdentityHash>
-        epoch_roles{{e, NativeDesktopRole::Carrier},
-                    {f, NativeDesktopRole::Parking}};
-    WinEventLifecycleSource epoch_source(
-        [&](DWORD, DWORD, WINEVENTPROC) {
-            return reinterpret_cast<HWINEVENTHOOK>(fake_hook_value++);
-        },
-        [](HWINEVENTHOOK) { return true; });
-    epoch_ok = epoch_ok && epoch_source.Start(&error);
-    WindowLifecycleAdapter epoch_lifecycle(epoch_engine, {});
-    bool injected_late_hint = false;
-    WorkspaceCoordinator epoch_coordinator(
-        epoch_engine, epoch_lifecycle, epoch_source,
-        [&](std::vector<WindowRecord>& observed, std::string*) {
-            observed = epoch_snapshot;
-            return true;
-        },
-        [&](const WindowRecord& window, NativeDesktopRole target) {
-            epoch_roles[window.identity] = target;
-            if (!injected_late_hint) {
-                injected_late_hint = true;
-                epoch_source.Collect(
-                    {WindowLifecycleEventKind::Appeared, e.hwnd, e});
-            }
-            return true;
-        },
-        [&](const WindowRecord& window) {
-            return epoch_roles.at(window.identity);
-        });
-    const CoordinatorResult epoch_switch = epoch_coordinator.Switch(3, 31);
-    epoch_ok = epoch_ok &&
-               epoch_switch.code == CoordinatorResultCode::TransactionFailed &&
-               !epoch_switch.transaction.committed &&
-               epoch_switch.transaction.rollback_attempted &&
-               epoch_switch.transaction.rollback_succeeded &&
-               epoch_engine.Monitor(3)->active == 30 &&
-               epoch_roles[e] == NativeDesktopRole::Carrier &&
-               epoch_roles[f] == NativeDesktopRole::Parking;
-    ok = ok && epoch_ok;
+    bool epoch_ok = true;
+
+    // A lifecycle hint for a window the switch itself moves is self-inflicted
+    // noise (the native move emits window-object events for the moved window)
+    // and must be tolerated: the plan is still valid and commits.
+    {
+        WorkspaceEngine tolerant_engine(epoch_carrier, epoch_parking);
+        bool tolerant_ok =
+            tolerant_engine.AddMonitor(3, 30, {30, 31}, &error);
+        std::unordered_map<WindowIdentity, NativeDesktopRole,
+                           WindowIdentityHash>
+            tolerant_roles{{e, NativeDesktopRole::Carrier},
+                           {f, NativeDesktopRole::Parking}};
+        WinEventLifecycleSource tolerant_source(
+            [&](DWORD, DWORD, WINEVENTPROC) {
+                return reinterpret_cast<HWINEVENTHOOK>(fake_hook_value++);
+            },
+            [](HWINEVENTHOOK) { return true; });
+        tolerant_ok = tolerant_ok && tolerant_source.Start(&error);
+        WindowLifecycleAdapter tolerant_lifecycle(tolerant_engine, {});
+        bool injected_self_hint = false;
+        WorkspaceCoordinator tolerant_coordinator(
+            tolerant_engine, tolerant_lifecycle, tolerant_source,
+            [&](std::vector<WindowRecord>& observed, std::string*) {
+                observed = epoch_snapshot;
+                return true;
+            },
+            [&](const WindowRecord& window, NativeDesktopRole target) {
+                tolerant_roles[window.identity] = target;
+                if (!injected_self_hint) {
+                    injected_self_hint = true;
+                    tolerant_source.Collect(
+                        {WindowLifecycleEventKind::Appeared, e.hwnd, e});
+                }
+                return true;
+            },
+            [&](const WindowRecord& window) {
+                return tolerant_roles.at(window.identity);
+            });
+        const CoordinatorResult tolerant_switch =
+            tolerant_coordinator.Switch(3, 31);
+        tolerant_ok = tolerant_ok &&
+                      tolerant_switch.succeeded() &&
+                      tolerant_switch.transaction.committed &&
+                      tolerant_engine.Monitor(3)->active == 31 &&
+                      tolerant_roles[e] == NativeDesktopRole::Parking &&
+                      tolerant_roles[f] == NativeDesktopRole::Carrier;
+        tolerant_source.Stop();
+        Field("self-inflicted plan-window hint tolerated",
+              tolerant_ok ? "PASS" : "FAIL");
+        epoch_ok = epoch_ok && tolerant_ok;
+        ok = ok && tolerant_ok;
+    }
+
+    // A lifecycle hint for a window outside the switch plan means the
+    // authoritative snapshot may be stale.  A transient hint is retried with
+    // a fresh snapshot; only a persistent hint exhausts the bounded attempts.
+    {
+        WorkspaceEngine strict_engine(epoch_carrier, epoch_parking);
+        bool strict_ok = strict_engine.AddMonitor(3, 30, {30, 31}, &error);
+        const WindowIdentity z{reinterpret_cast<HWND>(9), 109, {9, 9}, true};
+        std::unordered_map<WindowIdentity, NativeDesktopRole,
+                           WindowIdentityHash>
+            strict_roles{{e, NativeDesktopRole::Carrier},
+                         {f, NativeDesktopRole::Parking}};
+        WinEventLifecycleSource strict_source(
+            [&](DWORD, DWORD, WINEVENTPROC) {
+                return reinterpret_cast<HWINEVENTHOOK>(fake_hook_value++);
+            },
+            [](HWINEVENTHOOK) { return true; });
+        strict_ok = strict_ok && strict_source.Start(&error);
+        WindowLifecycleAdapter strict_lifecycle(strict_engine, {});
+        bool injected_unrelated_hint = false;
+        WorkspaceCoordinator strict_coordinator(
+            strict_engine, strict_lifecycle, strict_source,
+            [&](std::vector<WindowRecord>& observed, std::string*) {
+                observed = epoch_snapshot;
+                return true;
+            },
+            [&](const WindowRecord& window, NativeDesktopRole target) {
+                strict_roles[window.identity] = target;
+                if (!injected_unrelated_hint) {
+                    injected_unrelated_hint = true;
+                    strict_source.Collect(
+                        {WindowLifecycleEventKind::Appeared, z.hwnd, z});
+                }
+                return true;
+            },
+            [&](const WindowRecord& window) {
+                return strict_roles.at(window.identity);
+            });
+        const CoordinatorResult strict_switch = strict_coordinator.Switch(3, 31);
+        strict_ok = strict_ok &&
+                    strict_switch.succeeded() &&
+                    strict_switch.transaction.committed &&
+                    strict_switch.switch_attempts == 2 &&
+                    strict_engine.Monitor(3)->active == 31 &&
+                    strict_roles[e] == NativeDesktopRole::Parking &&
+                    strict_roles[f] == NativeDesktopRole::Carrier;
+        strict_source.Stop();
+        Field("transient unrelated-window hint retried and committed",
+              strict_ok ? "PASS" : "FAIL");
+        epoch_ok = epoch_ok && strict_ok;
+        ok = ok && strict_ok;
+    }
+
+    {
+        WorkspaceEngine noisy_engine(epoch_carrier, epoch_parking);
+        bool noisy_ok = noisy_engine.AddMonitor(3, 30, {30, 31}, &error);
+        const WindowIdentity z{reinterpret_cast<HWND>(9), 109, {9, 9}, true};
+        std::unordered_map<WindowIdentity, NativeDesktopRole,
+                           WindowIdentityHash>
+            noisy_roles{{e, NativeDesktopRole::Carrier},
+                        {f, NativeDesktopRole::Parking}};
+        WinEventLifecycleSource noisy_source(
+            [&](DWORD, DWORD, WINEVENTPROC) {
+                return reinterpret_cast<HWINEVENTHOOK>(fake_hook_value++);
+            },
+            [](HWINEVENTHOOK) { return true; });
+        noisy_ok = noisy_ok && noisy_source.Start(&error);
+        WindowLifecycleAdapter noisy_lifecycle(noisy_engine, {});
+        WorkspaceCoordinator noisy_coordinator(
+            noisy_engine, noisy_lifecycle, noisy_source,
+            [&](std::vector<WindowRecord>& observed, std::string*) {
+                observed = epoch_snapshot;
+                return true;
+            },
+            [&](const WindowRecord& window, NativeDesktopRole target) {
+                noisy_roles[window.identity] = target;
+                // Noise on every attempt: the switch can never stabilize.
+                noisy_source.Collect(
+                    {WindowLifecycleEventKind::Appeared, z.hwnd, z});
+                return true;
+            },
+            [&](const WindowRecord& window) {
+                return noisy_roles.at(window.identity);
+            },
+            nullptr, 3, 3);
+        const CoordinatorResult noisy_switch = noisy_coordinator.Switch(3, 31);
+        noisy_ok = noisy_ok &&
+                   noisy_switch.code ==
+                       CoordinatorResultCode::TransactionFailed &&
+                   !noisy_switch.transaction.committed &&
+                   noisy_switch.switch_attempts == 3 &&
+                   noisy_engine.Monitor(3)->active == 30 &&
+                   noisy_roles[e] == NativeDesktopRole::Carrier &&
+                   noisy_roles[f] == NativeDesktopRole::Parking;
+        noisy_source.Stop();
+        Field("persistent unrelated-window hint bounded after retries",
+              noisy_ok ? "PASS" : "FAIL");
+        epoch_ok = epoch_ok && noisy_ok;
+        ok = ok && noisy_ok;
+    }
 
     // A journal must be sufficient to hand a pending operation to a newly
     // constructed coordinator.  This simulates a bounded restart without
@@ -709,7 +870,7 @@ int CmdWorkspaceCoordinatorTest() {
     Field("serialized stale-safe switch", switched.succeeded() ? "PASS" : "FAIL");
     Field("callback exception containment",
           exception_tests_ok ? "PASS" : "FAIL");
-    Field("execution-time lifecycle epoch rollback",
+    Field("pre-commit lifecycle validation",
           epoch_ok ? "PASS" : "FAIL");
     Field("fresh coordinator recovery and complete lifecycle reconciliation",
           fresh_recovery_ok ? "PASS" : "FAIL");

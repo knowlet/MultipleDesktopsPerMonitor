@@ -29,6 +29,7 @@ enum class CoordinatorResultCode {
 struct CoordinatorResult {
     CoordinatorResultCode code = CoordinatorResultCode::Succeeded;
     std::size_t discovery_attempts = 0;
+    std::size_t switch_attempts = 0;
     LifecycleReconcileResult lifecycle{};
     TransactionResult transaction{};
     RecoveryResult recovery{};
@@ -52,7 +53,8 @@ class WorkspaceCoordinator {
                          WorkspaceEngine::MoveCallback move,
                          WorkspaceEngine::ObserveCallback observe,
                          const WorkspaceJournal* journal = nullptr,
-                         std::size_t max_discovery_attempts = 3);
+                         std::size_t max_discovery_attempts = 3,
+                         std::size_t max_switch_attempts = 3);
 
     CoordinatorResult ReconcileDiscovery();
     CoordinatorResult Switch(MonitorId monitor, WorkspaceId target_workspace);
@@ -72,6 +74,7 @@ class WorkspaceCoordinator {
     WorkspaceEngine::ObserveCallback observe_;
     const WorkspaceJournal* journal_ = nullptr;
     std::size_t max_discovery_attempts_ = 3;
+    std::size_t max_switch_attempts_ = 3;
     DWORD owner_thread_id_ = 0;
     bool operation_active_ = false;
 };
