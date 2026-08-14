@@ -886,9 +886,11 @@ std::optional<PresentationPlan> WorkspaceEngine::PreparePresentationRestore(
     if (definition->last_foreground) {
         const WindowRecord* foreground =
             FindWindow(*definition->last_foreground);
-        plan.operations.push_back({
+        PresentationOperation foreground_operation{
             PresentationOperationKind::RestoreForeground,
-            *definition->last_foreground, foreground->presentation});
+            *definition->last_foreground, foreground->presentation};
+        foreground_operation.best_effort = true;
+        plan.operations.push_back(foreground_operation);
     }
     return plan;
 }
@@ -955,6 +957,13 @@ PresentationResult WorkspaceEngine::ExecutePresentationRestore(
             return result;
         }
         if (!applied) {
+            if (operation.best_effort) {
+                // Foreground activation can legitimately be denied by the
+                // foreground lock; record it and continue so placement and
+                // Z-order restore are not lost.
+                ++result.best_effort_failed;
+                continue;
+            }
             result.error = "presentation operation failed";
             return result;
         }
@@ -1979,7 +1988,10 @@ int CmdWorkspaceEngineTest() {
         presentation_plan->operations[3].identity == p1_id &&
         presentation_plan->operations[4].kind ==
             PresentationOperationKind::RestoreForeground &&
-        presentation_plan->operations[4].identity == p1_id;
+        presentation_plan->operations[4].identity == p1_id &&
+        presentation_plan->operations[4].best_effort &&
+        !presentation_plan->operations[0].best_effort &&
+        !presentation_plan->operations[2].best_effort;
     ok = ok && presentation_ok;
     Field("presentation plan is complete, ordered, and fail-closed",
           presentation_ok ? "PASS" : "FAIL");
@@ -2024,6 +2036,29 @@ int CmdWorkspaceEngineTest() {
     ok = ok && presentation_execution_ok;
     Field("presentation executor applies deterministic native order",
           presentation_execution_ok ? "PASS" : "FAIL");
+
+    const PresentationResult foreground_denied =
+        presentation_plan
+            ? presentation_engine.ExecutePresentationRestore(
+                  *presentation_plan,
+                  [](const WindowRecord& window) {
+                      return window.identity.IsValid() &&
+                             window.capabilities.Manageable() &&
+                             window.capabilities.owner_state_observable;
+                  },
+                  [](const WindowRecord&,
+                     const PresentationOperation& operation) {
+                      return operation.kind !=
+                             PresentationOperationKind::RestoreForeground;
+                  })
+            : PresentationResult{};
+    const bool foreground_denied_ok =
+        foreground_denied.completed && foreground_denied.applied == 4 &&
+        foreground_denied.best_effort_failed == 1 &&
+        foreground_denied.error.empty();
+    ok = ok && foreground_denied_ok;
+    Field("foreground-lock denial is best-effort",
+          foreground_denied_ok ? "PASS" : "FAIL");
 
     int rejected_presentation_apply_calls = 0;
     const PresentationResult identity_rejected =

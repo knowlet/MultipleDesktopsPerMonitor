@@ -130,6 +130,11 @@ struct PresentationOperation {
         PresentationOperationKind::RestorePlacement;
     WindowIdentity identity;
     WindowPresentation presentation{};
+    // Foreground activation is best-effort: Windows foreground-lock can deny
+    // SetForegroundWindow even for an owned window, and that denial is
+    // recorded instead of failing the whole restore.  Placement and Z-order
+    // operations are never best-effort.
+    bool best_effort = false;
 };
 
 struct PresentationPlan {
@@ -144,6 +149,7 @@ struct PresentationPlan {
 struct PresentationResult {
     bool completed = false;
     std::size_t applied = 0;
+    std::size_t best_effort_failed = 0;
     std::string error;
 };
 

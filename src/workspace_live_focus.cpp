@@ -367,7 +367,8 @@ int CmdWorkspaceLiveFocusTest() {
         plan_a2->operations[3].identity == a2_top &&
         plan_a2->operations[4].kind ==
             PresentationOperationKind::RestoreForeground &&
-        plan_a2->operations[4].identity == a2_top;
+        plan_a2->operations[4].identity == a2_top &&
+        plan_a2->operations[4].best_effort;
     ReportCheck("A2 restore plan ordered placement/Z-order/foreground",
                 plan_shape_ok, ok);
 
@@ -420,6 +421,7 @@ int CmdWorkspaceLiveFocusTest() {
         : PresentationResult{};
     const bool restore_a1_ok =
         plan_a1.has_value() && restore_a1.completed && restore_a1.applied == 5 &&
+        plan_a1->operations[4].best_effort &&
         applied_order.size() == 5 &&
         applied_order[0] == "placement:0x101" &&
         applied_order[1] == "placement:0x102" &&

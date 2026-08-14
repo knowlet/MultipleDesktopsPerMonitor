@@ -5769,6 +5769,8 @@ int CmdLogicalWorkspaceTest(bool confirm_mutate) {
                                   presentation_plan
                                       ? presentation_plan->operations.size()
                                       : 0));
+                Field("    foreground best-effort failures",
+                      std::format("{}", presentation.best_effort_failed));
                 if (!presentation_error.empty()) {
                     Field("    presentation preparation error", presentation_error);
                 }
