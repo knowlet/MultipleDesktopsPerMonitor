@@ -9,6 +9,9 @@
 #include "util.h"
 
 namespace vd {
+
+bool RunWorkspaceStateSeedTests();
+
 namespace {
 
 WindowIdentity TestIdentity(std::uintptr_t hwnd, DWORD pid, DWORD high,
@@ -51,7 +54,7 @@ bool SameGuid(const GUID& a, const GUID& b) {
     return IsEqualGUID(a, b) != FALSE;
 }
 
-bool SameState(const WorkspaceState& a, const WorkspaceState& b) {
+bool SameDurableState(const WorkspaceState& a, const WorkspaceState& b) {
     if (a.schema_version != b.schema_version ||
         !SameGuid(a.carrier, b.carrier) || !SameGuid(a.parking, b.parking) ||
         a.monitors.size() != b.monitors.size() ||
@@ -61,7 +64,8 @@ bool SameState(const WorkspaceState& a, const WorkspaceState& b) {
     for (std::size_t i = 0; i < a.monitors.size(); ++i) {
         const auto& left = a.monitors[i];
         const auto& right = b.monitors[i];
-        if (left.monitor != right.monitor || left.active != right.active ||
+        if (left.stable_key != right.stable_key ||
+            left.active != right.active ||
             left.workspaces != right.workspaces) {
             return false;
         }
@@ -82,6 +86,8 @@ int CmdWorkspaceStateTest() {
     Field("scope", "deterministic durable logical checkpoint");
     Field("native desktop mutation", "none");
 
+    bool ok = RunWorkspaceStateSeedTests();
+
     const GUID carrier{0x10203040, 0x5060, 0x7080,
                        {0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01}};
     const GUID parking{0xfedcba98, 0x7654, 0x3210,
@@ -89,8 +95,8 @@ int CmdWorkspaceStateTest() {
 
     WorkspaceEngine engine(carrier, parking);
     std::string error;
-    bool ok = engine.AddMonitor(20, 201, {201, 202}, &error) &&
-              engine.AddMonitor(10, 101, {101, 102}, &error);
+    ok = engine.AddMonitor(20, 201, {201, 202}, &error) &&
+         engine.AddMonitor(10, 101, {101, 102}, &error) && ok;
 
     WindowRecord second;
     second.identity = TestIdentity(0x2002, 200, 22, 2);
@@ -108,8 +114,11 @@ int CmdWorkspaceStateTest() {
     first.capabilities = {true, true, true, true, true};
     ok = ok && engine.UpsertWindow(first, &error) != UpsertResult::Rejected;
 
+    const std::vector<StableMonitorBinding> initial_bindings = {
+        {"display-target-B", 20}, {"display-target-A", 10}};
     WorkspaceState captured;
-    ok = ok && CaptureWorkspaceState(engine, captured, &error);
+    ok = ok &&
+         CaptureWorkspaceState(engine, initial_bindings, captured, &error);
     Field("engine snapshot", ok ? "PASS" : "FAIL");
 
     const auto directory = std::filesystem::temp_directory_path() /
@@ -123,18 +132,92 @@ int CmdWorkspaceStateTest() {
     ok = ok && SaveWorkspaceState(captured, first_path, &error);
     WorkspaceState loaded;
     ok = ok && LoadWorkspaceState(first_path, loaded, &error) &&
-         SameState(captured, loaded);
+         SameDurableState(captured, loaded) &&
+         std::all_of(loaded.monitors.begin(), loaded.monitors.end(),
+                     [](const WorkspaceStateMonitor& monitor) {
+                         return monitor.runtime_monitor == 0;
+                     });
     Field("atomic save/load round trip", ok ? "PASS" : "FAIL");
+
+    const std::vector<StableMonitorBinding> restarted_bindings = {
+        {"display-target-B", 0xb002},
+        {"unmanaged-extra-display", 0xc003},
+        {"display-target-A", 0xa001}};
+    WorkspaceState remapped;
+    ok = ok && RemapWorkspaceStateTopology(
+                   loaded, restarted_bindings, remapped, &error);
+    const auto monitor_a = std::find_if(
+        remapped.monitors.begin(), remapped.monitors.end(),
+        [](const WorkspaceStateMonitor& monitor) {
+            return monitor.stable_key == "display-target-A";
+        });
+    const auto monitor_b = std::find_if(
+        remapped.monitors.begin(), remapped.monitors.end(),
+        [](const WorkspaceStateMonitor& monitor) {
+            return monitor.stable_key == "display-target-B";
+        });
+    const bool restart_remap_ok =
+        monitor_a != remapped.monitors.end() &&
+        monitor_a->runtime_monitor == 0xa001 &&
+        monitor_b != remapped.monitors.end() &&
+        monitor_b->runtime_monitor == 0xb002;
+    ok = ok && restart_remap_ok;
+    Field("stable keys remap changed runtime handles",
+          restart_remap_ok ? "PASS" : "FAIL");
 
     WorkspaceState reordered = captured;
     std::reverse(reordered.monitors.begin(), reordered.monitors.end());
-    for (MonitorWorkspaceState& monitor : reordered.monitors) {
+    for (WorkspaceStateMonitor& monitor : reordered.monitors) {
         std::reverse(monitor.workspaces.begin(), monitor.workspaces.end());
+        monitor.runtime_monitor += 0x10000;
     }
     std::reverse(reordered.ownership.begin(), reordered.ownership.end());
     ok = ok && SaveWorkspaceState(reordered, second_path, &error) &&
          ReadBytes(first_path) == ReadBytes(second_path);
     Field("canonical byte order", ok ? "PASS" : "FAIL");
+
+    WorkspaceState remap_sentinel;
+    remap_sentinel.schema_version = 999;
+    std::string missing_key_error;
+    const std::vector<StableMonitorBinding> missing_bindings = {
+        {"display-target-A", 0xa001}};
+    const bool missing_key_rejected =
+        !RemapWorkspaceStateTopology(
+            loaded, missing_bindings, remap_sentinel, &missing_key_error) &&
+        remap_sentinel.schema_version == 999;
+    ok = ok && missing_key_rejected;
+    Field("missing stable key fails atomically",
+          missing_key_rejected ? "PASS" : "FAIL");
+
+    std::string duplicate_binding_error;
+    const std::vector<StableMonitorBinding> duplicate_key_bindings = {
+        {"display-target-A", 0xa001},
+        {"display-target-A", 0xa002},
+        {"display-target-B", 0xb002}};
+    const std::vector<StableMonitorBinding> duplicate_runtime_bindings = {
+        {"display-target-A", 0xa001},
+        {"display-target-B", 0xa001}};
+    const bool duplicate_bindings_rejected =
+        !RemapWorkspaceStateTopology(
+            loaded, duplicate_key_bindings,
+            remap_sentinel, &duplicate_binding_error) &&
+        !RemapWorkspaceStateTopology(
+            loaded, duplicate_runtime_bindings,
+            remap_sentinel, &duplicate_binding_error);
+    ok = ok && duplicate_bindings_rejected;
+    Field("duplicate key/runtime bindings rejected",
+          duplicate_bindings_rejected ? "PASS" : "FAIL");
+
+    WorkspaceState duplicate_stable_key = captured;
+    duplicate_stable_key.monitors[1].stable_key =
+        duplicate_stable_key.monitors[0].stable_key;
+    std::string duplicate_stable_key_error;
+    const bool duplicate_stable_key_rejected =
+        !SaveWorkspaceState(duplicate_stable_key, second_path,
+                            &duplicate_stable_key_error);
+    ok = ok && duplicate_stable_key_rejected;
+    Field("duplicate persisted stable key rejected",
+          duplicate_stable_key_rejected ? "PASS" : "FAIL");
 
     WorkspaceState invalid = captured;
     invalid.monitors[0].active = 999999;
@@ -180,6 +263,30 @@ int CmdWorkspaceStateTest() {
     ok = ok && excessive_count_rejected;
     Field("input count preflight preserves checkpoint",
           excessive_count_rejected ? "PASS" : "FAIL");
+
+    // Schema 2 intentionally replaces schema 1 because v1 persisted raw
+    // HMONITOR values. A v1 header with a valid checksum must fail closed.
+    std::vector<char> old_schema = valid_bytes;
+    SetU32(old_schema, 8, 1);
+    const std::uint32_t old_schema_crc =
+        TestCrc32(old_schema.data(), old_schema.size() - 4);
+    SetU32(old_schema, old_schema.size() - 4, old_schema_crc);
+    {
+        std::ofstream output(second_path,
+                             std::ios::binary | std::ios::trunc);
+        output.write(old_schema.data(),
+                     static_cast<std::streamsize>(old_schema.size()));
+    }
+    WorkspaceState old_schema_sentinel;
+    old_schema_sentinel.schema_version = 666;
+    std::string old_schema_error;
+    const bool old_schema_rejected =
+        !LoadWorkspaceState(second_path, old_schema_sentinel,
+                            &old_schema_error) &&
+        old_schema_sentinel.schema_version == 666;
+    ok = ok && old_schema_rejected;
+    Field("raw-monitor schema 1 rejected",
+          old_schema_rejected ? "PASS" : "FAIL");
 
     // The monitor count lives at byte 44. Keep the checksum valid so load
     // must reject the impossible count from the remaining-byte preflight,

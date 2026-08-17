@@ -16,6 +16,7 @@ constexpr std::uint64_t kMaximumFileBytes = 64ull * 1024ull * 1024ull;
 constexpr std::uint32_t kMaximumMonitors = 4096;
 constexpr std::uint32_t kMaximumWorkspacesPerMonitor = 65536;
 constexpr std::uint32_t kMaximumOwnershipRecords = 1000000;
+constexpr std::uint32_t kMaximumStableMonitorKeyBytes = 4096;
 
 void SetError(std::string* error, std::string message) {
     if (error) *error = std::move(message);
@@ -50,6 +51,27 @@ bool IdentityLess(const WorkspaceOwnership& left,
 bool EncodedSize(const WorkspaceState& state, std::size_t& size,
                  std::string* error);
 
+bool ValidStableKey(const std::string& key) noexcept {
+    return !key.empty() && key.size() <= kMaximumStableMonitorKeyBytes &&
+           key.find('\0') == std::string::npos;
+}
+
+bool ValidateBindings(const std::vector<StableMonitorBinding>& bindings,
+                      std::string* error) {
+    std::unordered_set<std::string> keys;
+    std::unordered_set<MonitorId> runtime_monitors;
+    for (const StableMonitorBinding& binding : bindings) {
+        if (!ValidStableKey(binding.stable_key) ||
+            binding.runtime_monitor == 0 ||
+            !keys.insert(binding.stable_key).second ||
+            !runtime_monitors.insert(binding.runtime_monitor).second) {
+            SetError(error, "invalid or duplicate stable monitor binding");
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ValidateAndCanonicalize(const WorkspaceState& state,
                              WorkspaceState& canonical,
                              std::string* error) {
@@ -69,8 +91,9 @@ bool ValidateAndCanonicalize(const WorkspaceState& state,
         SetError(error, "workspace-state count exceeds format limit");
         return false;
     }
-    for (const MonitorWorkspaceState& monitor : state.monitors) {
-        if (monitor.workspaces.empty() ||
+    for (const WorkspaceStateMonitor& monitor : state.monitors) {
+        if (!ValidStableKey(monitor.stable_key) ||
+            monitor.workspaces.empty() ||
             monitor.workspaces.size() > kMaximumWorkspacesPerMonitor) {
             SetError(error, "workspace-state count exceeds format limit");
             return false;
@@ -81,17 +104,21 @@ bool ValidateAndCanonicalize(const WorkspaceState& state,
 
     canonical = state;
     std::sort(canonical.monitors.begin(), canonical.monitors.end(),
-              [](const MonitorWorkspaceState& left,
-                 const MonitorWorkspaceState& right) {
-                  return left.monitor < right.monitor;
+              [](const WorkspaceStateMonitor& left,
+                 const WorkspaceStateMonitor& right) {
+                  return left.stable_key < right.stable_key;
               });
     std::sort(canonical.ownership.begin(), canonical.ownership.end(),
               IdentityLess);
 
-    std::unordered_set<MonitorId> monitors;
+    std::unordered_set<std::string> stable_keys;
+    std::unordered_set<MonitorId> runtime_monitors;
     std::unordered_set<WorkspaceId> workspaces;
-    for (MonitorWorkspaceState& monitor : canonical.monitors) {
-        if (monitor.monitor == 0 || !monitors.insert(monitor.monitor).second ||
+    for (WorkspaceStateMonitor& monitor : canonical.monitors) {
+        if (!ValidStableKey(monitor.stable_key) ||
+            !stable_keys.insert(monitor.stable_key).second ||
+            (monitor.runtime_monitor != 0 &&
+             !runtime_monitors.insert(monitor.runtime_monitor).second) ||
             monitor.workspaces.empty() ||
             monitor.workspaces.size() > kMaximumWorkspacesPerMonitor ||
             std::find(monitor.workspaces.begin(), monitor.workspaces.end(),
@@ -133,10 +160,14 @@ bool EncodedSize(const WorkspaceState& state, std::size_t& size,
                  std::string* error) {
     // magic + version + two GUIDs + monitor count + ownership count + CRC
     size = 8 + 4 + 16 + 16 + 4 + 4 + 4;
-    for (const MonitorWorkspaceState& monitor : state.monitors) {
+    for (const WorkspaceStateMonitor& monitor : state.monitors) {
         if (monitor.workspaces.size() >
-            (std::numeric_limits<std::size_t>::max() - 20) / 8 ||
-            !AddEncodedSize(20 + monitor.workspaces.size() * 8, size)) {
+                (std::numeric_limits<std::size_t>::max() - 16 -
+                 monitor.stable_key.size()) /
+                    8 ||
+            !AddEncodedSize(16 + monitor.stable_key.size() +
+                                monitor.workspaces.size() * 8,
+                            size)) {
             SetError(error, "workspace-state encoded size exceeds limit");
             return false;
         }
@@ -196,8 +227,11 @@ std::vector<std::uint8_t> Serialize(const WorkspaceState& state,
     AppendGuid(bytes, state.carrier);
     AppendGuid(bytes, state.parking);
     AppendU32(bytes, static_cast<std::uint32_t>(state.monitors.size()));
-    for (const MonitorWorkspaceState& monitor : state.monitors) {
-        AppendU64(bytes, static_cast<std::uint64_t>(monitor.monitor));
+    for (const WorkspaceStateMonitor& monitor : state.monitors) {
+        AppendU32(bytes,
+                  static_cast<std::uint32_t>(monitor.stable_key.size()));
+        bytes.insert(bytes.end(), monitor.stable_key.begin(),
+                     monitor.stable_key.end());
         AppendU64(bytes, monitor.active);
         AppendU32(bytes,
                   static_cast<std::uint32_t>(monitor.workspaces.size()));
@@ -275,6 +309,14 @@ class Reader {
         return true;
     }
 
+    bool String(std::uint32_t length, std::string& value) {
+        if (length > end_ - offset_) return false;
+        value.assign(
+            reinterpret_cast<const char*>(bytes_.data() + offset_), length);
+        offset_ += length;
+        return true;
+    }
+
     bool AtEnd() const noexcept { return offset_ == end_; }
     std::size_t Remaining() const noexcept { return end_ - offset_; }
 
@@ -311,24 +353,26 @@ bool Deserialize(const std::vector<std::uint8_t>& bytes, WorkspaceState& out,
         return false;
     }
     if (reader.Remaining() < 4 ||
-        monitor_count > (reader.Remaining() - 4) / 28) {
+        monitor_count > (reader.Remaining() - 4) / 25) {
         SetError(error, "monitor count exceeds remaining encoded bytes");
         return false;
     }
     candidate.monitors.reserve(monitor_count);
     for (std::uint32_t i = 0; i < monitor_count; ++i) {
-        std::uint64_t monitor_value = 0;
-        MonitorWorkspaceState monitor;
+        WorkspaceStateMonitor monitor;
+        std::uint32_t stable_key_size = 0;
         std::uint32_t workspace_count = 0;
-        if (!reader.U64(monitor_value) || !reader.U64(monitor.active) ||
+        if (!reader.U32(stable_key_size) || stable_key_size == 0 ||
+            stable_key_size > kMaximumStableMonitorKeyBytes ||
+            stable_key_size > reader.Remaining() ||
+            !reader.String(stable_key_size, monitor.stable_key) ||
+            !reader.U64(monitor.active) ||
             !reader.U32(workspace_count) || workspace_count == 0 ||
             workspace_count > kMaximumWorkspacesPerMonitor ||
-            workspace_count > reader.Remaining() / sizeof(WorkspaceId) ||
-            monitor_value > std::numeric_limits<MonitorId>::max()) {
+            workspace_count > reader.Remaining() / sizeof(WorkspaceId)) {
             SetError(error, "invalid monitor record");
             return false;
         }
-        monitor.monitor = static_cast<MonitorId>(monitor_value);
         monitor.workspaces.reserve(workspace_count);
         for (std::uint32_t j = 0; j < workspace_count; ++j) {
             WorkspaceId workspace = 0;
@@ -407,18 +451,33 @@ bool WriteAll(HANDLE file, const std::vector<std::uint8_t>& bytes,
 
 }  // namespace
 
-bool CaptureWorkspaceState(const WorkspaceEngine& engine, WorkspaceState& out,
-                           std::string* error) {
+bool CaptureWorkspaceState(const WorkspaceEngine& engine,
+                           const std::vector<StableMonitorBinding>& bindings,
+                           WorkspaceState& out, std::string* error) {
     std::string invariant_error;
     if (!engine.CheckInvariant(&invariant_error)) {
         SetError(error, "cannot checkpoint invalid workspace engine: " +
                             invariant_error);
         return false;
     }
+    if (!ValidateBindings(bindings, error)) return false;
     WorkspaceState candidate;
     candidate.carrier = engine.carrier();
     candidate.parking = engine.parking();
-    candidate.monitors = engine.Monitors();
+    for (const MonitorWorkspaceState& monitor : engine.Monitors()) {
+        const auto binding = std::find_if(
+            bindings.begin(), bindings.end(),
+            [&](const StableMonitorBinding& candidate_binding) {
+                return candidate_binding.runtime_monitor == monitor.monitor;
+            });
+        if (binding == bindings.end()) {
+            SetError(error,
+                     "engine monitor has no stable monitor binding");
+            return false;
+        }
+        candidate.monitors.push_back({binding->stable_key, monitor.monitor,
+                                      monitor.active, monitor.workspaces});
+    }
     for (const WindowRecord* window : engine.Windows()) {
         candidate.ownership.push_back({window->identity, window->workspace});
     }
@@ -426,6 +485,36 @@ bool CaptureWorkspaceState(const WorkspaceEngine& engine, WorkspaceState& out,
     if (!ValidateAndCanonicalize(candidate, canonical, error)) return false;
     out = std::move(canonical);
     return true;
+}
+
+bool RemapWorkspaceStateTopology(
+    const WorkspaceState& persisted,
+    const std::vector<StableMonitorBinding>& current, WorkspaceState& out,
+    std::string* error) {
+    WorkspaceState candidate;
+    if (!ValidateAndCanonicalize(persisted, candidate, error) ||
+        !ValidateBindings(current, error)) {
+        return false;
+    }
+    for (WorkspaceStateMonitor& monitor : candidate.monitors) {
+        const auto binding = std::find_if(
+            current.begin(), current.end(),
+            [&](const StableMonitorBinding& candidate_binding) {
+                return candidate_binding.stable_key == monitor.stable_key;
+            });
+        if (binding == current.end()) {
+            SetError(error, "persisted stable monitor key is not present");
+            return false;
+        }
+        monitor.runtime_monitor = binding->runtime_monitor;
+    }
+    out = std::move(candidate);
+    return true;
+}
+
+bool ValidateWorkspaceState(const WorkspaceState& state, std::string* error) {
+    WorkspaceState canonical;
+    return ValidateAndCanonicalize(state, canonical, error);
 }
 
 bool SaveWorkspaceState(const WorkspaceState& state,
