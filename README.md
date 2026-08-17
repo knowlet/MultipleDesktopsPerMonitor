@@ -69,6 +69,7 @@ Gated feasibility tests:
 | `vdprobe workspace-live-coordinator-bootstrap-test` | starts the read-only WinEvent source and reconciles bounded complete live discovery through `WorkspaceCoordinator`; assignment remains synthetic/in-memory and no move callback is installed |
 | `vdprobe workspace-live-lifecycle-test` | deterministic read-only integration of injected discovery, an explicit generation-keyed assignment registry, owner-thread lifecycle hints, and bounded authoritative coordinator snapshots; no real HWND or move callback is used |
 | `vdprobe workspace-engine-test` | productization core: deterministic, non-mutating capability-driven monitor/workspace state, lifecycle, rollback, and journal-recovery checks |
+| `vdprobe workspace-state-test` | deterministic, non-mutating durable logical checkpoint capture, canonical atomic save/load, validation, and corruption checks |
 | `vdprobe workspace-assignment-test` | productization boundary: deterministic, non-mutating discovery-to-workspace assignment with identity preservation and fail-closed Carrier/Parking checks |
 | `vdprobe workspace-coordinator-test` | productization boundary: deterministic, non-mutating serialized discovery, lifecycle quiet-boundary, stale-safe switching, and recovery checks |
 | `vdprobe workspace-startup-test` | productization boundary: deterministic, non-mutating fail-closed lifecycle/journal startup ordering and fresh-model pending recovery |

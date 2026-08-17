@@ -311,6 +311,11 @@ class WorkspaceEngine {
     std::vector<const WindowRecord*> WindowsForMonitor(MonitorId monitor) const;
 
     const MonitorWorkspaceState* Monitor(MonitorId monitor) const;
+    // Read-only topology view for diagnostics and durable logical snapshots.
+    // Mutations remain constrained to AddMonitor and committed switch plans.
+    const std::vector<MonitorWorkspaceState>& Monitors() const noexcept {
+        return monitors_;
+    }
     const WorkspaceDefinition* Workspace(WorkspaceId workspace) const;
 
     bool CheckInvariant(std::string* error = nullptr) const;

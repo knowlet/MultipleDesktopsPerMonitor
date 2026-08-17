@@ -27,6 +27,7 @@
 #include "workspace_live_lifecycle.h"
 #include "workspace_readonly_host.h"
 #include "workspace_startup.h"
+#include "workspace_state.h"
 
 namespace {
 
@@ -139,6 +140,9 @@ void Usage() {
         "                      exercise capability-driven monitor/workspace\n"
         "                      ownership, lifecycle, rollback, and journal\n"
         "                      recovery without touching COM or native desktops\n"
+        "  workspace-state-test\n"
+        "                      deterministic atomic logical workspace checkpoint\n"
+        "                      save/load and corruption rejection; read-only\n"
         "  workspace-assignment-test\n"
         "                      exercise read-only discovery-to-workspace policy,\n"
         "                      identity preservation, and fail-closed mismatch\n"
@@ -369,6 +373,8 @@ int main(int argc, char** argv) {
         rc = vd::CmdWorkspaceLiveFocusTest();
     } else if (cmd == "workspace-engine-test") {
         rc = vd::CmdWorkspaceEngineTest();
+    } else if (cmd == "workspace-state-test") {
+        rc = vd::CmdWorkspaceStateTest();
     } else if (cmd == "workspace-assignment-test") {
         rc = vd::CmdWorkspaceAssignmentTest();
     } else if (cmd == "workspace-coordinator-test") {
