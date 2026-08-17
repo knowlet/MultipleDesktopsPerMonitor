@@ -150,7 +150,7 @@ int CmdWorkspaceManagerStop();
 int CmdWorkspaceManagerReload();
 
 // Installs or removes the per-user HKCU Run startup entry that launches
-// `workspace-manager --run` at sign-in.
+// `workspace-manager --run --confirm-mutate` at sign-in.
 int CmdWorkspaceManagerInstallStartup(bool remove,
                                       const char* config_path = nullptr);
 

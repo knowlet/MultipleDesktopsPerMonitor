@@ -8,10 +8,12 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    env:
+      BUILD_CONFIG: RelWithDebInfo
     steps:
       - uses: actions/checkout@v4
       - name: Configure and build
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Msvc
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Msvc -Config $env:BUILD_CONFIG
       - name: Run deterministic suites
         shell: pwsh
         run: |
@@ -29,8 +31,9 @@ jobs:
             'workspace-stress-test',
             'layout-gate-test'
           )
+          $exe = ".\build\$env:BUILD_CONFIG\vdprobe.exe"
           foreach ($t in $tests) {
-            .\build\vdprobe.exe $t
+            & $exe $t
             if ($LASTEXITCODE -ne 0) { throw "$t failed ($LASTEXITCODE)" }
           }
           Write-Output 'ALL DETERMINISTIC SUITES PASS'

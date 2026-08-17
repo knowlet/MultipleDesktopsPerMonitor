@@ -28,9 +28,10 @@ administrator privileges:
 vdprobe.exe workspace-manager --install-startup [--config PATH]
 ```
 
-This adds the HKCU Run value that launches `workspace-manager --run` at
-sign-in. The optional config path is embedded in the startup command; the
-default config is `%APPDATA%\vdprobe\workspace-manager.conf`.
+This adds the HKCU Run value that launches
+`workspace-manager --run --confirm-mutate` at sign-in. The optional config path
+is embedded in the startup command; the default config is
+`%APPDATA%\vdprobe\workspace-manager.conf`.
 
 ## Configure
 

@@ -25,7 +25,7 @@ $cmakeLocal = Join-Path $tc 'cmake-4.4.2-windows-x86_64\bin\cmake.exe'
 $cmake = if (Test-Path $cmakeLocal) { $cmakeLocal } else { 'cmake' }
 
 if ($Msvc) {
-    & $cmake -S $root -B $build -DCMAKE_BUILD_TYPE=$Config
+    & $cmake -S $root -B $build
 } else {
     $mingwBin = Join-Path $tc 'mingw64\bin'
     if (-not (Test-Path (Join-Path $mingwBin 'g++.exe'))) {
@@ -41,9 +41,15 @@ if ($Msvc) {
 }
 if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
-& $cmake --build $build --parallel
+$buildArgs = @('--build', $build, '--parallel')
+if ($Msvc) { $buildArgs += @('--config', $Config) }
+& $cmake @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
-$exe = Join-Path $build 'vdprobe.exe'
+$exe = if ($Msvc) {
+    Join-Path $build "$Config\vdprobe.exe"
+} else {
+    Join-Path $build 'vdprobe.exe'
+}
 if (-not (Test-Path $exe)) { throw "vdprobe.exe not produced" }
 Write-Host "built: $exe" -ForegroundColor Green

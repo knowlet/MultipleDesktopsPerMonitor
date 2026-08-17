@@ -30,8 +30,9 @@ vdprobe.exe workspace-manager --install-startup [--config PATH]
 vdprobe.exe workspace-manager --remove-startup
 ```
 
-The installed command launches `workspace-manager --run` (optionally with the
-same `--config`) at sign-in. No administrator privileges are required.
+The installed command launches `workspace-manager --run --confirm-mutate`
+(optionally with the same `--config`) at sign-in. No administrator privileges
+are required.
 
 ## Single instance
 

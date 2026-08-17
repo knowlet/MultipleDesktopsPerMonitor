@@ -7929,7 +7929,7 @@ int CmdWorkspaceManagerInstallStartup(bool remove,
         return 1;
     }
     std::wstring command = L"\"" + std::wstring(module) +
-                           L"\" workspace-manager --run";
+                           L"\" workspace-manager --run --confirm-mutate";
     if (config_path != nullptr && *config_path != '\0') {
         command += L" --config \"" + ToWide(config_path) + L"\"";
     }
