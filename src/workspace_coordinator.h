@@ -45,6 +45,9 @@ class WorkspaceCoordinator {
     using DiscoverCompleteSnapshot =
         std::function<bool(std::vector<WindowRecord>& observed,
                            std::string* error)>;
+    using DiscoverCompleteSnapshotWithHints = std::function<bool(
+        const std::vector<WindowLifecycleEvent>& hints,
+        std::vector<WindowRecord>& observed, std::string* error)>;
 
     WorkspaceCoordinator(WorkspaceEngine& engine,
                          WindowLifecycleAdapter& lifecycle,
@@ -54,7 +57,8 @@ class WorkspaceCoordinator {
                          WorkspaceEngine::ObserveCallback observe,
                          const WorkspaceJournal* journal = nullptr,
                          std::size_t max_discovery_attempts = 3,
-                         std::size_t max_switch_attempts = 3);
+                         std::size_t max_switch_attempts = 3,
+                         DiscoverCompleteSnapshotWithHints hinted_discover = {});
 
     CoordinatorResult ReconcileDiscovery();
     CoordinatorResult Switch(MonitorId monitor, WorkspaceId target_workspace);
@@ -70,6 +74,7 @@ class WorkspaceCoordinator {
     WindowLifecycleAdapter& lifecycle_;
     WinEventLifecycleSource& source_;
     DiscoverCompleteSnapshot discover_;
+    DiscoverCompleteSnapshotWithHints hinted_discover_;
     WorkspaceEngine::MoveCallback move_;
     WorkspaceEngine::ObserveCallback observe_;
     const WorkspaceJournal* journal_ = nullptr;

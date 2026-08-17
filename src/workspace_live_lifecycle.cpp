@@ -10,6 +10,7 @@
 
 #include "util.h"
 #include "window_discovery.h"
+#include "workspace_assignment.h"
 #include "workspace_coordinator.h"
 
 namespace vd {
@@ -365,6 +366,65 @@ int CmdWorkspaceLiveLifecycleTest() {
     result = coordinator.ReconcileDiscovery();
     ReportCheck("stable recovery reconciliation",
                 result.succeeded() && engine.CheckInvariant(&error), ok);
+
+    // Same-process HWND reuse must be resolved before assignment conversion.
+    // The identity tuple cannot distinguish the old parked window from the
+    // newly created Carrier window, so the drained destroy hint is the only
+    // evidence that the new observation must join the active workspace.
+    WorkspaceEngine ordered_engine(carrier, parking);
+    bool ordered_reuse =
+        ordered_engine.AddMonitor(kMonitor, kWorkspace,
+                                  {kWorkspace, kOtherWorkspace}, &error);
+    const WindowIdentity reused = TestIdentity(0x103, 1003, 1);
+    WindowCapabilities manageable{true, true, true, true, true};
+    ordered_reuse =
+        ordered_reuse &&
+        ordered_engine.UpsertWindow(
+            {reused, kMonitor, kOtherWorkspace,
+             NativeDesktopRole::Parking, manageable},
+            &error) == UpsertResult::Added;
+    WorkspaceAssignmentAdapter ordered_assignment(ordered_engine);
+    ordered_reuse =
+        ordered_reuse &&
+        ordered_assignment.ConfigureMonitor(
+            kMonitor, kWorkspace, {kWorkspace, kOtherWorkspace}, &error);
+    WinEventLifecycleSource ordered_source(
+        [](DWORD, DWORD, WINEVENTPROC) {
+            return reinterpret_cast<HWINEVENTHOOK>(0x6000);
+        },
+        [](HWINEVENTHOOK) { return true; });
+    ordered_reuse = ordered_reuse && ordered_source.Start(&error);
+    WindowLifecycleAdapter ordered_lifecycle(ordered_engine, {});
+    DiscoveredWindow reused_observation;
+    reused_observation.identity = reused;
+    reused_observation.monitor = reinterpret_cast<HMONITOR>(kMonitor);
+    reused_observation.native_role = NativeDesktopRole::Carrier;
+    reused_observation.capabilities = manageable;
+    reused_observation.disposition = WindowDisposition::Managed;
+    WorkspaceCoordinator ordered_coordinator(
+        ordered_engine, ordered_lifecycle, ordered_source, {}, {}, {}, nullptr,
+        2, 3,
+        [&](const std::vector<WindowLifecycleEvent>& hints,
+            std::vector<WindowRecord>& observed, std::string* local_error) {
+            return ordered_assignment.ConvertCompleteSnapshot(
+                {reused_observation}, hints, observed, local_error);
+        });
+    ordered_source.Collect(
+        {WindowLifecycleEventKind::Closed, reused.hwnd, std::nullopt});
+    const CoordinatorResult ordered_result =
+        ordered_coordinator.ReconcileDiscovery();
+    const WindowRecord* ordered_record = ordered_engine.FindWindow(reused);
+    ordered_reuse =
+        ordered_reuse && ordered_result.succeeded() &&
+        ordered_result.lifecycle.discovery.added == 1 &&
+        ordered_record != nullptr && ordered_record->workspace == kWorkspace &&
+        ordered_record->native_role == NativeDesktopRole::Carrier &&
+        ordered_engine.Workspace(kOtherWorkspace)->z_order.empty() &&
+        !ordered_engine.Workspace(kOtherWorkspace)->last_foreground.has_value();
+    ordered_source.Stop();
+    ordered_reuse = ordered_reuse && ordered_source.shutdown_ok();
+    ReportCheck("same-process reuse ordered before assignment", ordered_reuse,
+                ok);
 
     source.Stop();
     ReportCheck("owner-thread lifecycle shutdown", source.shutdown_ok(), ok);

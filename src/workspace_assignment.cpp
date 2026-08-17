@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "util.h"
+#include "window_lifecycle.h"
 
 namespace vd {
 namespace {
@@ -88,6 +89,14 @@ bool WorkspaceAssignmentAdapter::ConfigureMonitor(
 bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
     const std::vector<DiscoveredWindow>& discovered,
     std::vector<WindowRecord>& out, std::string* error) const {
+    static const std::vector<WindowLifecycleEvent> no_lifecycle_hints;
+    return ConvertCompleteSnapshot(discovered, no_lifecycle_hints, out, error);
+}
+
+bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
+    const std::vector<DiscoveredWindow>& discovered,
+    const std::vector<WindowLifecycleEvent>& lifecycle_hints,
+    std::vector<WindowRecord>& out, std::string* error) const {
     if (error != nullptr) error->clear();
 
     std::unordered_set<WindowIdentity, WindowIdentityHash> identities;
@@ -145,6 +154,18 @@ bool WorkspaceAssignmentAdapter::ConvertCompleteSnapshot(
             SetError(error, "managed discovery window lacks required capabilities");
             return false;
         }
+        const bool destroyed_before_snapshot =
+            tracked != nullptr &&
+            std::any_of(lifecycle_hints.begin(), lifecycle_hints.end(),
+                        [&](const WindowLifecycleEvent& event) {
+                            return event.kind ==
+                                       WindowLifecycleEventKind::Closed &&
+                                   event.hwnd == window.identity.hwnd &&
+                                   (!event.identity ||
+                                    (event.identity->IsValid() &&
+                                     event.identity->hwnd == event.hwnd));
+                        });
+        if (destroyed_before_snapshot) tracked = nullptr;
 
         const MonitorId observed_monitor =
             reinterpret_cast<MonitorId>(window.monitor);

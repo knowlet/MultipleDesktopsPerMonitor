@@ -8469,6 +8469,17 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         }
         return true;
     };
+    auto discover_assigned_with_hints =
+        [&](const std::vector<WindowLifecycleEvent>& hints,
+            std::vector<WindowRecord>& records, std::string* local_error) {
+            std::vector<DiscoveredWindow> complete;
+            if (!discovery.Discover(complete, local_error) ||
+                !assignment.ConvertCompleteSnapshot(complete, hints, records,
+                                                    local_error)) {
+                return false;
+            }
+            return true;
+        };
     // Recovery snapshots must prove journal identities regardless of their
     // current native role: the assignment adapter deliberately drops
     // untracked Parking-native windows, which would make a partially-moved
@@ -8525,9 +8536,15 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
         if (!source.PumpOwnerThreadMessages(local_error)) return false;
         return discover_assigned(records, local_error);
     };
+    auto coordinator_hinted_discovery =
+        [&](const std::vector<WindowLifecycleEvent>& hints,
+            std::vector<WindowRecord>& records, std::string* local_error) {
+            if (!source.PumpOwnerThreadMessages(local_error)) return false;
+            return discover_assigned_with_hints(hints, records, local_error);
+        };
     WorkspaceCoordinator coordinator(
         engine, lifecycle, source, coordinator_discovery, move_to_role,
-        observe_role, &journal, 10, 5);
+        observe_role, &journal, 10, 5, coordinator_hinted_discovery);
 
     // Pending journal transactions are rolled back and committed journal
     // transactions are replayed by WorkspaceStartup before the host loop
@@ -8643,10 +8660,24 @@ int CmdWorkspaceManagerRun(const char* config_path, int seconds,
                 }
                 return recovered_discover(records, local_error);
             };
+        auto recovered_hinted_discovery =
+            [runtime_ptr, &source](
+                const std::vector<WindowLifecycleEvent>& hints,
+                std::vector<WindowRecord>& records,
+                std::string* local_error) {
+                if (!source.PumpOwnerThreadMessages(local_error)) {
+                    return false;
+                }
+                std::vector<DiscoveredWindow> complete;
+                return runtime_ptr->discovery->Discover(complete,
+                                                        local_error) &&
+                       runtime_ptr->assignment->ConvertCompleteSnapshot(
+                           complete, hints, records, local_error);
+            };
         runtime->coordinator = std::make_unique<WorkspaceCoordinator>(
             *runtime->engine, *runtime->lifecycle, source,
             recovered_coordinator_discovery, move_to_role, observe_role,
-            &recovery_journal, 10, 5);
+            &recovery_journal, 10, 5, recovered_hinted_discovery);
         return runtime;
     };
     WorkspaceStartup startup(engine, coordinator, source,

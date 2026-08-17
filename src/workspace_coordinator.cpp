@@ -44,11 +44,13 @@ WorkspaceCoordinator::WorkspaceCoordinator(
     WorkspaceEngine::MoveCallback move,
     WorkspaceEngine::ObserveCallback observe,
     const WorkspaceJournal* journal, std::size_t max_discovery_attempts,
-    std::size_t max_switch_attempts)
+    std::size_t max_switch_attempts,
+    DiscoverCompleteSnapshotWithHints hinted_discover)
     : engine_(engine),
       lifecycle_(lifecycle),
       source_(source),
       discover_(std::move(discover)),
+      hinted_discover_(std::move(hinted_discover)),
       move_(std::move(move)),
       observe_(std::move(observe)),
       journal_(journal),
@@ -110,7 +112,7 @@ bool WorkspaceCoordinator::CheckNoPendingJournal(
 CoordinatorResult WorkspaceCoordinator::ReconcileDiscoveryLocked() {
     CoordinatorResult result;
     if (!CheckNoPendingJournal(result)) return result;
-    if (!discover_) {
+    if (!discover_ && !hinted_discover_) {
         result.code = CoordinatorResultCode::DiscoveryFailed;
         result.error = "complete discovery callback is unavailable";
         return result;
@@ -127,7 +129,10 @@ CoordinatorResult WorkspaceCoordinator::ReconcileDiscoveryLocked() {
 
         std::vector<WindowRecord> observed;
         std::string error;
-        if (!discover_(observed, &error)) {
+        const bool discovered = hinted_discover_
+                                    ? hinted_discover_(hints, observed, &error)
+                                    : discover_(observed, &error);
+        if (!discovered) {
             result.code = CoordinatorResultCode::DiscoveryFailed;
             result.error = error.empty() ? "complete discovery failed" : error;
             return result;

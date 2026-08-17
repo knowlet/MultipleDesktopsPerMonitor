@@ -10,6 +10,8 @@
 
 namespace vd {
 
+struct WindowLifecycleEvent;
+
 // Policy for a tracked window observed on a different configured monitor
 // (for example a window dragged from monitor A to monitor B).
 enum class MonitorMigrationPolicy {
@@ -62,6 +64,14 @@ class WorkspaceAssignmentAdapter {
     // `out` is replaced only when the complete candidate is valid.
     bool ConvertCompleteSnapshot(
         const std::vector<DiscoveredWindow>& discovered,
+        std::vector<WindowRecord>& out, std::string* error = nullptr) const;
+    // Lifecycle-aware variant used at the coordinator's quiet snapshot
+    // boundary. A destroy hint lets exact same-process HWND reuse be treated
+    // as a new assignment candidate before lifecycle reconciliation retires
+    // the old record.
+    bool ConvertCompleteSnapshot(
+        const std::vector<DiscoveredWindow>& discovered,
+        const std::vector<WindowLifecycleEvent>& lifecycle_hints,
         std::vector<WindowRecord>& out, std::string* error = nullptr) const;
 
    private:
